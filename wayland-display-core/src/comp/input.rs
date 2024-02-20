@@ -115,6 +115,8 @@ impl State {
                     .space
                     .element_under(self.pointer_location)
                     .map(|(w, pos)| (w.clone().into(), pos));
+
+                tracing::debug!("pointer location: {:?}, under: {:?}", self.pointer_location, under);
                 pointer.motion(
                     self,
                     under.clone(),
@@ -228,8 +230,8 @@ impl State {
         if let Some(output) = self.output.as_ref() {
             if let Some(mode) = output.current_mode() {
                 return (
-                    pos.x.max(0.0).min(mode.size.w as f64),
-                    pos.y.max(0.0).min(mode.size.h as f64),
+                    pos.x.max(0.0).min((mode.size.w - 2) as f64),
+                    pos.y.max(0.0).min((mode.size.h - 2) as f64),
                 )
                     .into();
             }

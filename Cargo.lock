@@ -90,11 +90,12 @@ dependencies = [
 
 [[package]]
 name = "c-bindings"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gstreamer",
  "gstreamer-video",
  "tracing",
+ "tracing-subscriber",
  "wayland-display-core",
 ]
 
@@ -426,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "gst-plugin-wayland-display"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gst-plugin-version-helper",
  "gstreamer",
@@ -1394,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "wayland-display-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gstreamer",
  "gstreamer-video",

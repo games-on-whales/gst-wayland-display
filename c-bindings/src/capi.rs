@@ -5,6 +5,7 @@ use gst::glib::translate::FromGlibPtrNone;
 use std::ffi::{c_char, c_uint, CStr};
 use std::ptr;
 use waylanddisplaycore::WaylandDisplay;
+use tracing_subscriber;
 
 #[no_mangle]
 pub extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDisplay {
@@ -17,6 +18,8 @@ pub extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDispla
     } else {
         None
     };
+
+    tracing_subscriber::fmt::try_init().ok();
 
     match WaylandDisplay::new(render_node) {
         Ok(dpy) => Box::into_raw(Box::new(dpy)),

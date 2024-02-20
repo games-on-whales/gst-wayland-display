@@ -1,7 +1,7 @@
 [package]
 name = "c-bindings"
 authors = ["Victoria Brekenfeld <git@drakulix.de>", "Alessandro Beltramo <github.com/ABeltramo>"]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Wayland Compositor producing GStreamer buffers"
@@ -19,6 +19,7 @@ gst.workspace = true
 gst-video.workspace = true
 tracing.workspace = true
 wayland-display-core = { path = "../wayland-display-core" }
+tracing-subscriber = "0.3"
 
 [package.metadata.capi]
 min_version = "0.9.21"
