@@ -14,6 +14,8 @@ use smithay::{
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
 };
+use smithay::reexports::wayland_server::Client;
+use smithay::wayland::compositor::CompositorClientState;
 
 use crate::comp::{FocusTarget, State};
 
@@ -24,6 +26,10 @@ impl BufferHandler for State {
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        todo!()
     }
 
     fn commit(&mut self, surface: &WlSurface) {

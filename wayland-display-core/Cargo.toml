@@ -1,11 +1,11 @@
 [package]
 name = "wayland-display-core"
 authors = ["Victoria Brekenfeld <git@drakulix.de>", "Alessandro Beltramo <github.com/ABeltramo>"]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Wayland Compositor producing GStreamer buffers"
-rust-version = "1.70"
+rust-version = "1.72"
 
 [lib]
 name = "waylanddisplaycore"
@@ -17,12 +17,12 @@ gst.workspace = true
 gst-video.workspace = true
 tracing.workspace = true
 once_cell.workspace = true
-wayland-backend = "0.1.0"
-wayland-scanner = "0.30.0"
+wayland-backend = "0.3.3"
+wayland-scanner = "0.31.1"
 
 [dependencies.smithay]
 git = "https://github.com/smithay/Smithay"
-rev = "b1c682742a"
+rev = "7f9e6d5"
 default-features = false
 features = [
     "backend_drm",

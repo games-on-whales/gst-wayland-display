@@ -1,3 +1,4 @@
+use gst_video::prelude::VideoDecoderExtManual;
 use smithay::{
     backend::input::KeyState,
     desktop::{PopupKind, Window},
@@ -10,6 +11,8 @@ use smithay::{
     utils::{IsAlive, Serial},
     wayland::seat::WaylandFocus,
 };
+use smithay::input::pointer::{GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent};
+use crate::comp::State;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FocusTarget {
@@ -128,6 +131,69 @@ impl PointerTarget<super::State> for FocusTarget {
         match self {
             FocusTarget::Wayland(w) => w.axis(seat, data, frame),
             FocusTarget::Popup(p) => p.wl_surface().axis(seat, data, frame),
+        }
+    }
+
+    fn frame(&self, seat: &Seat<State>, data: &mut State) {
+        match self {
+            FocusTarget::Wayland(w) => w.frame(seat, data),
+            FocusTarget::Popup(p) => {todo!()},
+        }
+    }
+
+    fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_swipe_begin(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_swipe_begin(seat, data, event),
+        }
+    }
+
+    fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_swipe_update(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_swipe_update(seat, data, event),
+        }
+    }
+
+    fn gesture_swipe_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeEndEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_swipe_end(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_swipe_end(seat, data, event),
+        }
+    }
+
+    fn gesture_pinch_begin(&self, seat: &Seat<State>, data: &mut State, event: &GesturePinchBeginEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_pinch_begin(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_pinch_begin(seat, data, event),
+        }
+    }
+
+    fn gesture_pinch_update(&self, seat: &Seat<State>, data: &mut State, event: &GesturePinchUpdateEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_pinch_update(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_pinch_update(seat, data, event),
+        }
+    }
+
+    fn gesture_pinch_end(&self, seat: &Seat<State>, data: &mut State, event: &GesturePinchEndEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_pinch_end(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_pinch_end(seat, data, event),
+        }
+    }
+
+    fn gesture_hold_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureHoldBeginEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_hold_begin(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_hold_begin(seat, data, event),
+        }
+    }
+
+    fn gesture_hold_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureHoldEndEvent) {
+        match self {
+            FocusTarget::Wayland(w) => w.gesture_hold_end(seat, data, event),
+            FocusTarget::Popup(p) => p.wl_surface().gesture_hold_end(seat, data, event),
         }
     }
 

@@ -16,9 +16,9 @@ use smithay::{
         egl::{EGLContext, EGLDevice, EGLDisplay},
         libinput::LibinputInputBackend,
         renderer::{
-            damage::{DamageTrackedRenderer, DamageTrackedRendererError as DTRError},
             element::memory::MemoryRenderBuffer,
-            gles2::{Gles2Renderbuffer, Gles2Renderer},
+            damage::{OutputDamageTracker, Error as DTRError},
+            gles::{GlesRenderbuffer, GlesRenderer},
             Bind, Offscreen,
         },
     },
@@ -49,7 +49,6 @@ use smithay::{
     utils::{Clock, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
     wayland::{
         compositor::{with_states, CompositorState},
-        data_device::DataDeviceState,
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         presentation::PresentationState,
@@ -60,7 +59,8 @@ use smithay::{
         relative_pointer::RelativePointerManagerState,
     },
 };
-use wayland_backend::server::GlobalId;
+use smithay::reexports::wayland_server::backend::GlobalId;
+use smithay::wayland::selection::data_device::DataDeviceState;
 
 mod focus;
 mod input;
@@ -75,6 +75,7 @@ static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 struct ClientState;
+
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
@@ -92,9 +93,9 @@ pub(crate) struct State {
     clock: Clock<Monotonic>,
 
     // render
-    dtr: Option<DamageTrackedRenderer>,
-    renderbuffer: Option<Gles2Renderbuffer>,
-    pub renderer: Gles2Renderer,
+    dtr: Option<OutputDamageTracker>,
+    renderbuffer: Option<GlesRenderbuffer>,
+    pub renderer: GlesRenderer,
     egl_display_ref: Arc<EGLDisplay>,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
@@ -144,7 +145,7 @@ pub(crate) fn init(
     devices_tx: Sender<Vec<CString>>,
     envs_tx: Sender<Vec<CString>>,
 ) {
-    let clock = Clock::new().expect("Failed to initialize clock");
+    let clock = Clock::new();
     let mut display = Display::<State>::new().unwrap();
     let dh = display.handle();
 
@@ -193,7 +194,7 @@ pub(crate) fn init(
         let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
         (egl, context)
     };
-    let renderer = unsafe { Gles2Renderer::new(context) }.expect("Failed to initialize renderer");
+    let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
     let _ = devices_tx.send(render_target.as_devices());
 
     let shm_state = ShmState::new::<State>(&dh, vec![]);
@@ -219,7 +220,7 @@ pub(crate) fn init(
     };
 
     let cursor_element =
-        MemoryRenderBuffer::from_memory(CURSOR_DATA_BYTES, (64, 64), 1, Transform::Normal, None);
+        MemoryRenderBuffer::from_memory(CURSOR_DATA_BYTES, 1, Transform::Normal, None);
 
     // init input backend
     let libinput_context = Libinput::new_from_path(NixInterface);
@@ -234,7 +235,7 @@ pub(crate) fn init(
     seat.add_pointer();
 
     let mut event_loop =
-        EventLoop::<Data>::try_new_high_precision().expect("Unable to create event_loop");
+        EventLoop::<Data>::try_new().expect("Unable to create event_loop");
     let state = State {
         handle: event_loop.handle(),
         should_quit: false,
@@ -255,7 +256,7 @@ pub(crate) fn init(
         pointer_location: (0., 0.).into(),
         last_pointer_movement: Instant::now(),
         cursor_element,
-        cursor_state: CursorImageStatus::Default,
+        cursor_state: CursorImageStatus::default_named(),
         surpressed_keys: HashSet::new(),
         pending_windows: Vec::new(),
         input_context,
@@ -313,7 +314,7 @@ pub(crate) fn init(
                     };
                     output.change_current_state(Some(mode), None, None, None);
                     output.set_preferred(mode);
-                    let dtr = DamageTrackedRenderer::from_output(&output);
+                    let dtr = OutputDamageTracker::from_output(&output);
 
                     data.state.space.map_output(&output, (0, 0));
                     data.state.dtr = Some(dtr);
@@ -340,7 +341,7 @@ pub(crate) fn init(
                                     .get::<XdgToplevelSurfaceData>()
                                     .map(|attrs| attrs.lock().unwrap().max_size)
                             })
-                            .unwrap_or(new_size),
+                                .unwrap_or(new_size),
                         );
 
                         let new_size = max_size

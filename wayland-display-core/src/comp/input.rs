@@ -3,7 +3,7 @@ use smithay::{
     backend::{
         input::{
             Axis, AxisSource, Event, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent,
-            PointerButtonEvent, PointerMotionEvent,
+            PointerButtonEvent, PointerMotionEvent, ButtonState,
         },
         libinput::LibinputInputBackend,
     },
@@ -13,8 +13,9 @@ use smithay::{
     },
     reexports::{
         input::LibinputInterface,
-        nix::{fcntl, fcntl::OFlag, sys::stat},
-        wayland_server::protocol::wl_pointer,
+        rustix::{
+            fs::{open, OFlags, Mode}
+        },
     },
     utils::{Logical, Point, Serial, SERIAL_COUNTER},
 };
@@ -23,14 +24,14 @@ use std::{
     path::Path,
     time::Instant,
 };
+use smithay::input::keyboard::Keysym;
 
 pub struct NixInterface;
 
 impl LibinputInterface for NixInterface {
     fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        fcntl::open(path, OFlag::from_bits_truncate(flags), stat::Mode::empty())
-            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-            .map_err(|err| err as i32)
+        open(path, OFlags::from_bits_truncate(flags as u32), Mode::empty())
+            .map_err(|err| todo!("Convert Errno to i32?"))
     }
     fn close_restricted(&mut self, fd: OwnedFd) {
         let _ = fd;
@@ -60,7 +61,7 @@ impl State {
                                 && !modifiers.alt
                                 && !modifiers.logo
                             {
-                                match handle.modified_sym() {
+                                match u32::from(handle.modified_sym()) {
                                     keysyms::KEY_Tab => {
                                         if let Some(element) = data.space.elements().last().cloned()
                                         {
@@ -82,7 +83,7 @@ impl State {
                                         {
                                             match target {
                                                 FocusTarget::Wayland(window) => {
-                                                    window.toplevel().send_close();
+                                                    window.toplevel().unwrap().send_close();
                                                 }
                                                 _ => return FilterResult::Forward,
                                             };
@@ -94,7 +95,7 @@ impl State {
                                 }
                             }
                         } else {
-                            if data.surpressed_keys.remove(&handle.modified_sym()) {
+                            if data.surpressed_keys.remove(&(u32::from(handle.modified_sym()))) {
                                 return FilterResult::Intercept(());
                             }
                         }
@@ -174,8 +175,8 @@ impl State {
                 let serial = SERIAL_COUNTER.next_serial();
                 let button = event.button_code();
 
-                let state = wl_pointer::ButtonState::from(event.state());
-                if wl_pointer::ButtonState::Pressed == state {
+                let state = ButtonState::from(event.state());
+                if ButtonState::Pressed == state {
                     self.update_keyboard_focus(serial);
                 };
                 self.seat.get_pointer().unwrap().button(
@@ -192,21 +193,21 @@ impl State {
                 self.last_pointer_movement = Instant::now();
                 let horizontal_amount = event
                     .amount(Axis::Horizontal)
-                    .or_else(|| event.amount_discrete(Axis::Horizontal).map(|x| x * 2.0))
+                    .or_else(|| event.amount_v120(Axis::Horizontal).map(|x| x * 2.0))
                     .unwrap_or(0.0);
                 let vertical_amount = event
                     .amount(Axis::Vertical)
-                    .or_else(|| event.amount_discrete(Axis::Vertical).map(|y| y * 2.0))
+                    .or_else(|| event.amount_v120(Axis::Vertical).map(|y| y * 2.0))
                     .unwrap_or(0.0);
-                let horizontal_amount_discrete = event.amount_discrete(Axis::Horizontal);
-                let vertical_amount_discrete = event.amount_discrete(Axis::Vertical);
+                let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
+                let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
 
                 {
                     let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
                     if horizontal_amount != 0.0 {
                         frame = frame.value(Axis::Horizontal, horizontal_amount);
                         if let Some(discrete) = horizontal_amount_discrete {
-                            frame = frame.discrete(Axis::Horizontal, discrete as i32);
+                            frame = frame.v120(Axis::Horizontal, discrete as i32);
                         }
                     } else if event.source() == AxisSource::Finger {
                         frame = frame.stop(Axis::Horizontal);
@@ -214,7 +215,7 @@ impl State {
                     if vertical_amount != 0.0 {
                         frame = frame.value(Axis::Vertical, vertical_amount);
                         if let Some(discrete) = vertical_amount_discrete {
-                            frame = frame.discrete(Axis::Vertical, discrete as i32);
+                            frame = frame.v120(Axis::Vertical, discrete as i32);
                         }
                     } else if event.source() == AxisSource::Finger {
                         frame = frame.stop(Axis::Vertical);

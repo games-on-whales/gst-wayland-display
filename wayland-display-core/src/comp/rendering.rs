@@ -1,24 +1,32 @@
 use std::time::{Duration, Instant};
 
 use smithay::{
+    desktop::space::render_output,
     backend::renderer::{
-        damage::DamageTrackedRendererError as DTRError,
+        damage::Error as DTRError,
         element::{
             memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
             RenderElementStates,
         },
-        gles2::Gles2Renderer,
+        gles::GlesRenderer,
         Bind, ExportMem, ImportAll, ImportMem, Renderer, Unbind,
     },
-    desktop::space::render_output,
     input::pointer::CursorImageStatus,
     render_elements,
     utils::{Physical, Rectangle},
 };
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::memory::MemoryBuffer;
+use smithay::reexports::drm::buffer::DrmFourcc;
+use smithay::utils::Size;
 
 use super::State;
 
-pub const CURSOR_DATA_BYTES: &[u8] = include_bytes!("../../resources/cursor.rgba");
+pub const CURSOR_DATA_BYTES: MemoryBuffer = MemoryBuffer::from_slice(
+    include_bytes!("../../resources/cursor.rgba"),
+    Fourcc::Rgba4444, // TODO: Format???
+    Size::from((64, 64)));
 
 render_elements! {
     CursorElement<R> where R: Renderer + ImportAll + ImportMem;
@@ -35,7 +43,7 @@ impl State {
             Option<Vec<Rectangle<i32, Physical>>>,
             RenderElementStates,
         ),
-        DTRError<Gles2Renderer>,
+        DTRError<GlesRenderer>,
     > {
         assert!(self.output.is_some());
         assert!(self.dtr.is_some());
@@ -45,27 +53,31 @@ impl State {
         let elements =
             if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
                 match &self.cursor_state {
-                CursorImageStatus::Default => vec![CursorElement::Memory(
-                    MemoryRenderBufferRenderElement::from_buffer(
-                        &mut self.renderer,
-                        self.pointer_location.to_physical_precise_round(1),
-                        &self.cursor_element,
-                        None,
-                        None,
-                        None,
-                    )
-                    .map_err(DTRError::Rendering)?,
-                )],
-                CursorImageStatus::Surface(wl_surface) => {
-                    smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
-                        &mut self.renderer,
-                        wl_surface,
-                        self.pointer_location.to_physical_precise_round(1),
-                        1.,
-                    )
+                    CursorImageStatus::Named(cursor_icon) => vec![CursorElement::Memory(
+                        // TODO: icon?
+                        MemoryRenderBufferRenderElement::from_buffer(
+                            &mut self.renderer,
+                            self.pointer_location.to_physical_precise_round(1),
+                            &self.cursor_element,
+                            None,
+                            None,
+                            None,
+                            Kind::Cursor,
+                        )
+                            .map_err(DTRError::Rendering)?,
+                    )],
+                    CursorImageStatus::Surface(wl_surface) => {
+                        smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                            &mut self.renderer,
+                            wl_surface,
+                            self.pointer_location.to_physical_precise_round(1),
+                            1.,
+                            1.,
+                            Kind::Cursor,
+                        )
+                    }
+                    CursorImageStatus::Hidden => vec![],
                 }
-                CursorImageStatus::Hidden => vec![],
-            }
             } else {
                 vec![]
             };
@@ -73,10 +85,11 @@ impl State {
         self.renderer
             .bind(self.renderbuffer.clone().unwrap())
             .map_err(DTRError::Rendering)?;
-        let (damage, render_element_states) = render_output(
+        let render_element_states = render_output(
             self.output.as_ref().unwrap(),
             &mut self.renderer,
-            1,
+            1.0,
+            0,
             [&self.space],
             &*elements,
             self.dtr.as_mut().unwrap(),
@@ -91,7 +104,7 @@ impl State {
                     self.video_info.as_ref().unwrap().width() as i32,
                     self.video_info.as_ref().unwrap().height() as i32,
                 ),
-            ))
+            ), DrmFourcc::Rgba4444) // TODO: format???
             .expect("Failed to export framebuffer");
         let map = self
             .renderer
@@ -107,7 +120,7 @@ impl State {
                     buffer,
                     self.video_info.as_ref().unwrap(),
                 )
-                .unwrap();
+                    .unwrap();
                 let plane_data = vframe.plane_data_mut(0).unwrap();
                 plane_data.clone_from_slice(map);
             }
@@ -115,7 +128,7 @@ impl State {
             buffer
         };
         self.renderer.unbind().map_err(DTRError::Rendering)?;
-
-        Ok((buffer, damage, render_element_states))
+        todo!("Get damage!");
+        // Ok((buffer, [], render_element_states))
     }
 }
