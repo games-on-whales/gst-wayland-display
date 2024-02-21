@@ -1,7 +1,7 @@
 use smithay::{
     delegate_xdg_shell,
     desktop::{
-        find_popup_root_surface, PopupKeyboardGrab, PopupKind, PopupPointerGrab,
+        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupPointerGrab,
         PopupUngrabStrategy, Window,
     },
     input::{pointer::Focus, Seat},
@@ -27,15 +27,8 @@ impl XdgShellHandler for State {
         self.pending_windows.push(window);
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
-        // TODO: properly recompute the geometry with the whole of positioner state
-        surface.with_pending_state(|state| {
-            // NOTE: This is not really necessary as the default geometry
-            // is already set the same way, but for demonstrating how
-            // to set the initial popup geometry this code is left as
-            // an example
-            state.geometry = positioner.get_geometry();
-        });
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        self.unconstrain_popup(&surface);
         if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
             tracing::warn!(?err, "Failed to track popup.");
         }
@@ -56,7 +49,7 @@ impl XdgShellHandler for State {
                 if let Some(keyboard) = seat.get_keyboard() {
                     if keyboard.is_grabbed()
                         && !(keyboard.has_grab(serial)
-                            || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+                        || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
                     {
                         grab.ungrab(PopupUngrabStrategy::All);
                         return;
@@ -67,8 +60,8 @@ impl XdgShellHandler for State {
                 if let Some(pointer) = seat.get_pointer() {
                     if pointer.is_grabbed()
                         && !(pointer.has_grab(serial)
-                            || pointer
-                                .has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+                        || pointer
+                        .has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
                     {
                         grab.ungrab(PopupUngrabStrategy::All);
                         return;
@@ -80,8 +73,41 @@ impl XdgShellHandler for State {
     }
 
     fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
-        todo!()
+        surface.with_pending_state(|state| {
+            let geometry = positioner.get_geometry();
+            state.geometry = geometry;
+            state.positioner = positioner;
+        });
+        self.unconstrain_popup(&surface);
+        surface.send_repositioned(token);
     }
 }
+
+impl State{
+    fn unconstrain_popup(&self, popup: &PopupSurface) {
+        let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+            return;
+        };
+        let Some(window) = self.space.elements().find(|w| w.toplevel().unwrap().wl_surface() == &root) else {
+            return;
+        };
+
+        let output = self.space.outputs().next().unwrap();
+        let output_geo = self.space.output_geometry(output).unwrap();
+        let window_geo = self.space.element_geometry(window).unwrap();
+
+        // The target geometry for the positioner should be relative to its parent's geometry, so
+        // we will compute that here.
+        let mut target = output_geo;
+        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        target.loc -= window_geo.loc;
+
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+}
+
+
 
 delegate_xdg_shell!(State);
