@@ -63,8 +63,8 @@ impl State {
                                 && !modifiers.alt
                                 && !modifiers.logo
                             {
-                                match u32::from(handle.modified_sym()) {
-                                    keysyms::KEY_Tab => {
+                                match handle.modified_sym() {
+                                    Keysym::Tab => {
                                         if let Some(element) = data.space.elements().last().cloned()
                                         {
                                             data.surpressed_keys.insert(keysyms::KEY_Tab);
@@ -79,7 +79,7 @@ impl State {
                                             return FilterResult::Intercept(());
                                         }
                                     }
-                                    keysyms::KEY_Q => {
+                                    Keysym::Q => {
                                         if let Some(target) =
                                             data.seat.get_keyboard().unwrap().current_focus()
                                         {
@@ -97,7 +97,7 @@ impl State {
                                 }
                             }
                         } else {
-                            if data.surpressed_keys.remove(&(u32::from(handle.modified_sym()))) {
+                            if data.surpressed_keys.remove(&handle.modified_sym().raw()) {
                                 return FilterResult::Intercept(());
                             }
                         }
@@ -253,11 +253,11 @@ impl State {
                 self.last_pointer_movement = Instant::now();
                 let horizontal_amount = event
                     .amount(Axis::Horizontal)
-                    .or_else(|| event.amount_v120(Axis::Horizontal).map(|x| x * 2.0))
+                    .or_else(|| event.amount_v120(Axis::Horizontal).map(|x| x * 2.0 / 120.0))
                     .unwrap_or(0.0);
                 let vertical_amount = event
                     .amount(Axis::Vertical)
-                    .or_else(|| event.amount_v120(Axis::Vertical).map(|y| y * 2.0))
+                    .or_else(|| event.amount_v120(Axis::Vertical).map(|y| y * 2.0 / 120.0))
                     .unwrap_or(0.0);
                 let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
                 let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
