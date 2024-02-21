@@ -82,7 +82,7 @@ impl State {
         self.renderer
             .bind(self.renderbuffer.clone().unwrap())
             .map_err(DTRError::Rendering)?;
-        let render_element_states = render_output(
+        let render_output_result = render_output(
             self.output.as_ref().unwrap(),
             &mut self.renderer,
             1.0,
@@ -125,7 +125,6 @@ impl State {
             buffer
         };
         self.renderer.unbind().map_err(DTRError::Rendering)?;
-        todo!("Get damage!");
-        // Ok((buffer, [], render_element_states))
+        Ok((buffer, render_output_result.damage, render_output_result.states))
     }
 }

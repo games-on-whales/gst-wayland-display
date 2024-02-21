@@ -49,7 +49,7 @@ use smithay::{
     },
     utils::{Clock, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
     wayland::{
-        compositor::{with_states, CompositorState},
+        compositor::{with_states, CompositorState, CompositorClientState},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         presentation::PresentationState,
@@ -63,6 +63,7 @@ use smithay::{
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::reexports::wayland_server::backend::GlobalId;
+use smithay::reexports::wayland_server::Client;
 use smithay::wayland::selection::data_device::DataDeviceState;
 
 mod focus;
@@ -77,7 +78,10 @@ use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
 static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-struct ClientState;
+#[derive(Debug, Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
+}
 
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
@@ -483,7 +487,7 @@ pub(crate) fn init(
             if let Err(err) = data
                 .display
                 .handle()
-                .insert_client(client_stream, std::sync::Arc::new(ClientState))
+                .insert_client(client_stream, Arc::new(ClientState::default()))
             {
                 tracing::error!(?err, "Error adding wayland client.");
             };
@@ -491,21 +495,20 @@ pub(crate) fn init(
         .expect("Failed to init wayland socket source");
 
     let display_fd = todo!("display.backend().poll_fd().as_raw_fd() -> the trait `AsFd` is not implemented for `i32`");
-
-    event_loop
-        .handle()
-        .insert_source(
-            Generic::new(
-                display_fd,
-                Interest::READ,
-                Mode::Level,
-            ),
-            |_, _, data| {
-                data.display.dispatch_clients(&mut data.state).unwrap();
-                Ok(PostAction::Continue)
-            },
-        )
-        .expect("Failed to init wayland server source");
+    // event_loop
+    //     .handle()
+    //     .insert_source(
+    //         Generic::new(
+    //             display_fd,
+    //             Interest::READ,
+    //             Mode::Level,
+    //         ),
+    //         |_, _, data| {
+    //             data.display.dispatch_clients(&mut data.state).unwrap();
+    //             Ok(PostAction::Continue)
+    //         },
+    //     )
+    //     .expect("Failed to init wayland server source");
 
     let env_vars = vec![CString::new(format!("WAYLAND_DISPLAY={}", socket_name)).unwrap()];
     if let Err(err) = envs_tx.send(env_vars) {

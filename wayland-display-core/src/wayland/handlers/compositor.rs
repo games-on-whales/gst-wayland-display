@@ -16,7 +16,7 @@ use smithay::{
     },
 };
 
-use crate::comp::{FocusTarget, State};
+use crate::comp::{ClientState, FocusTarget, State};
 
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
@@ -28,7 +28,7 @@ impl CompositorHandler for State {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        todo!()
+        &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -128,7 +128,7 @@ impl CompositorHandler for State {
         }
 
         if let Some(popup) = self.popups.find_popup(surface) {
-            let PopupKind::Xdg(ref popup ) = popup else { todo!("refutable pattern in local binding") };
+            let PopupKind::Xdg(ref popup) = popup else { todo!("refutable pattern in local binding") };
             let initial_configure_sent = with_states(surface, |states| {
                 states
                     .data_map
