@@ -52,6 +52,18 @@ pub struct DrmInstanceData {
     dmabuf_global: DmabufGlobal,
 }
 
+pub enum ImportError {
+    Failed,
+    InvalidFormat,
+}
+
+pub trait DrmHandler<R: 'static> {
+    fn dmabuf_imported(&mut self, global: &DmabufGlobal, dmabuf: Dmabuf) -> Result<R, ImportError>;
+    fn buffer_created(&mut self, buffer: WlBuffer, result: R) {
+        let _ = (buffer, result);
+    }
+}
+
 impl<D> GlobalDispatch<wl_drm::WlDrm, DrmGlobalData, D> for WlDrmState
     where
         D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
@@ -97,6 +109,7 @@ impl<D> Dispatch<wl_drm::WlDrm, DrmInstanceData, D> for WlDrmState
         + Dispatch<WlBuffer, Dmabuf>
         + BufferHandler
         + DmabufHandler
+        + DrmHandler<D>
         + 'static,
 {
     fn request(
@@ -160,26 +173,25 @@ impl<D> Dispatch<wl_drm::WlDrm, DrmInstanceData, D> for WlDrmState
                 dma.add_plane(name, 0, offset0 as u32, stride0 as u32);
                 match dma.build() {
                     Some(dmabuf) => {
-                        todo!("How can I make a ImportNotifier? Constructor is private..");
-                        // match state.dmabuf_imported(&data.dmabuf_global, dmabuf.clone()) {
-                        //     Ok(_) => {
-                        //         // import was successful
-                        //         data_init.init(id, dmabuf);
-                        //     }
-                        //
-                        //     Err(ImportError::InvalidFormat) => {
-                        //         drm.post_error(
-                        //             wl_drm::Error::InvalidFormat,
-                        //             "format and plane combination are not valid",
-                        //         );
-                        //     }
-                        //
-                        //     Err(ImportError::Failed) => {
-                        //         // Buffer import failed. The protocol documentation heavily implies killing the
-                        //         // client is the right thing to do here.
-                        //         drm.post_error(wl_drm::Error::InvalidName, "buffer import failed");
-                        //     }
-                        // }
+                        match state.dmabuf_imported(&data.dmabuf_global, dmabuf.clone()) {
+                            Ok(_) => {
+                                // import was successful
+                                data_init.init(id, dmabuf);
+                            }
+
+                            Err(ImportError::InvalidFormat) => {
+                                drm.post_error(
+                                    wl_drm::Error::InvalidFormat,
+                                    "format and plane combination are not valid",
+                                );
+                            }
+
+                            Err(ImportError::Failed) => {
+                                // Buffer import failed. The protocol documentation heavily implies killing the
+                                // client is the right thing to do here.
+                                drm.post_error(wl_drm::Error::InvalidName, "buffer import failed");
+                            }
+                        }
                     }
                     None => {
                         // Buffer import failed. The protocol documentation heavily implies killing the
