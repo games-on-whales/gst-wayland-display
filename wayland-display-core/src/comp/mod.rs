@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
-    os::unix::prelude::AsRawFd,
+    os::fd::AsFd,
     sync::{mpsc::Sender, Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
+use std::os::fd::AsRawFd;
 
 use super::Command;
 use gst_video::VideoInfo;
@@ -59,6 +60,8 @@ use smithay::{
         relative_pointer::RelativePointerManagerState,
     },
 };
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::wayland::selection::data_device::DataDeviceState;
 
@@ -185,8 +188,8 @@ pub(crate) fn init(
                         })
                         .expect("Failed to find software device"),
                 };
-                let display =
-                    Arc::new(EGLDisplay::new(device).expect("Failed to initialize EGL display"));
+                let egl = unsafe { EGLDisplay::new(device).expect("Failed to create EGLDisplay") };
+                let display = Arc::new(egl);
                 displays.insert(render_node, Arc::downgrade(&display));
                 display
             }
@@ -220,7 +223,10 @@ pub(crate) fn init(
     };
 
     let cursor_element =
-        MemoryRenderBuffer::from_memory(CURSOR_DATA_BYTES, 1, Transform::Normal, None);
+        MemoryRenderBuffer::from_memory(MemoryBuffer::from_slice(
+            CURSOR_DATA_BYTES,
+            Fourcc::Rgba8888,
+            (64, 64)), 1, Transform::Normal, None);
 
     // init input backend
     let libinput_context = Libinput::new_from_path(NixInterface);
@@ -322,7 +328,7 @@ pub(crate) fn init(
                     data.state.renderbuffer = Some(
                         data.state
                             .renderer
-                            .create_buffer((info.width() as i32, info.height() as i32).into())
+                            .create_buffer(Fourcc::Abgr8888, (info.width() as i32, info.height() as i32).into())
                             .expect("Failed to create renderbuffer"),
                     );
                     data.state.video_info = Some(info);
@@ -332,14 +338,14 @@ pub(crate) fn init(
                         .to_logical(output.current_scale().fractional_scale())
                         .to_i32_round();
                     for window in data.state.space.elements() {
-                        let toplevel = window.toplevel();
+                        let toplevel = window.toplevel().unwrap();
                         let max_size = Rectangle::from_loc_and_size(
                             (0, 0),
                             with_states(toplevel.wl_surface(), |states| {
                                 states
                                     .data_map
                                     .get::<XdgToplevelSurfaceData>()
-                                    .map(|attrs| attrs.lock().unwrap().max_size)
+                                    .map(|attrs| todo!("Used to be attrs.lock().unwrap().max_size but max_size is now not present!"))
                             })
                                 .unwrap_or(new_size),
                         );
@@ -410,10 +416,10 @@ pub(crate) fn init(
                                     if damage.is_some() {
                                         output_presentation_feedback.presented(
                                             data.state.clock.now(),
-                                            output
+                                            Duration::from_millis(output
                                                 .current_mode()
-                                                .map(|mode| mode.refresh as u32)
-                                                .unwrap_or_default(),
+                                                .map(|mode| mode.refresh)
+                                                .unwrap_or_default() as u64),
                                             0,
                                             wp_presentation_feedback::Kind::Vsync,
                                         );
@@ -484,11 +490,13 @@ pub(crate) fn init(
         })
         .expect("Failed to init wayland socket source");
 
+    let display_fd = todo!("display.backend().poll_fd().as_raw_fd() -> the trait `AsFd` is not implemented for `i32`");
+
     event_loop
         .handle()
         .insert_source(
             Generic::new(
-                display.backend().poll_fd().as_raw_fd(),
+                display_fd,
                 Interest::READ,
                 Mode::Level,
             ),

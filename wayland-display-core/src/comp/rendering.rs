@@ -23,10 +23,7 @@ use smithay::utils::Size;
 
 use super::State;
 
-pub const CURSOR_DATA_BYTES: MemoryBuffer = MemoryBuffer::from_slice(
-    include_bytes!("../../resources/cursor.rgba"),
-    Fourcc::Rgba4444, // TODO: Format???
-    Size::from((64, 64)));
+pub const CURSOR_DATA_BYTES: &[u8] = include_bytes!("../../resources/cursor.rgba");
 
 render_elements! {
     CursorElement<R> where R: Renderer + ImportAll + ImportMem;

@@ -915,15 +915,6 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.28.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5e73202a820a31f8a0ee32ada5e21029c81fd9e3ebf668a40832e4219d9d1"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
@@ -1404,7 +1395,7 @@ dependencies = [
  "smithay",
  "tracing",
  "wayland-backend",
- "wayland-scanner 0.30.1",
+ "wayland-scanner",
 ]
 
 [[package]]
@@ -1415,7 +1406,7 @@ checksum = "8f81f365b8b4a97f422ac0e8737c438024b5951734506b0e1d775c73030561f4"
 dependencies = [
  "bitflags 2.4.1",
  "wayland-backend",
- "wayland-scanner 0.31.1",
+ "wayland-scanner",
  "wayland-server",
 ]
 
@@ -1428,7 +1419,7 @@ dependencies = [
  "bitflags 2.4.1",
  "wayland-backend",
  "wayland-protocols",
- "wayland-scanner 0.31.1",
+ "wayland-scanner",
  "wayland-server",
 ]
 
@@ -1441,19 +1432,8 @@ dependencies = [
  "bitflags 2.4.1",
  "wayland-backend",
  "wayland-protocols",
- "wayland-scanner 0.31.1",
+ "wayland-scanner",
  "wayland-server",
-]
-
-[[package]]
-name = "wayland-scanner"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9b873b257fbc32ec909c0eb80dea312076a67014e65e245f5eb69a6b8ab330e"
-dependencies = [
- "proc-macro2",
- "quick-xml 0.28.2",
- "quote",
 ]
 
 [[package]]
@@ -1463,7 +1443,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b3a62929287001986fb58c789dce9b67604a397c15c611ad9f747300b6c283"
 dependencies = [
  "proc-macro2",
- "quick-xml 0.31.0",
+ "quick-xml",
  "quote",
 ]
 
@@ -1478,7 +1458,7 @@ dependencies = [
  "io-lifetimes 2.0.3",
  "rustix",
  "wayland-backend",
- "wayland-scanner 0.31.1",
+ "wayland-scanner",
 ]
 
 [[package]]

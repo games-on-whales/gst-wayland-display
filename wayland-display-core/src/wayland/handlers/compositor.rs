@@ -4,18 +4,17 @@ use smithay::{
     desktop::PopupKind,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
-        wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+        wayland_server::{Client,
+                         protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface}},
     },
-    utils::{Size, SERIAL_COUNTER},
+    utils::{Size, Physical, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
-        compositor::{with_states, CompositorHandler, CompositorState},
+        compositor::{with_states, CompositorHandler, CompositorState, CompositorClientState},
         seat::WaylandFocus,
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
 };
-use smithay::reexports::wayland_server::Client;
-use smithay::wayland::compositor::CompositorClientState;
 
 use crate::comp::{FocusTarget, State};
 
@@ -33,7 +32,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        on_commit_buffer_handler(surface);
+        on_commit_buffer_handler::<Self>(surface);
 
         if let Some(window) = self
             .space
@@ -52,14 +51,14 @@ impl CompositorHandler for State {
         {
             let window = self.pending_windows.swap_remove(idx);
 
-            let toplevel = window.toplevel();
+            let toplevel = window.toplevel().unwrap();
             let (initial_configure_sent, max_size) = with_states(surface, |states| {
                 let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap();
                 let attributes_guard = attributes.lock().unwrap();
 
                 (
                     attributes_guard.initial_configure_sent,
-                    attributes_guard.max_size,
+                    todo!("Used to be attributes_guard.max_size but max_size is now not present!") as Size<i32, Physical>,
                 )
             });
 
@@ -129,7 +128,7 @@ impl CompositorHandler for State {
         }
 
         if let Some(popup) = self.popups.find_popup(surface) {
-            let PopupKind::Xdg(ref popup) = popup;
+            let PopupKind::Xdg(ref popup ) = popup else { todo!("refutable pattern in local binding") };
             let initial_configure_sent = with_states(surface, |states| {
                 states
                     .data_map
