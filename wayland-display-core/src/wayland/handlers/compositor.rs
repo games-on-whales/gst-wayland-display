@@ -128,7 +128,10 @@ impl CompositorHandler for State {
         }
 
         if let Some(popup) = self.popups.find_popup(surface) {
-            let PopupKind::Xdg(ref popup) = popup else { todo!("refutable pattern in local binding") };
+            let PopupKind::Xdg(ref popup) = popup else {
+                // Our compositor doesn't do input handling in the popup code
+                unreachable!()
+            };
             let initial_configure_sent = with_states(surface, |states| {
                 states
                     .data_map
