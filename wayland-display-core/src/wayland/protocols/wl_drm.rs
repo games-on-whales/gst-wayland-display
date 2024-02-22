@@ -109,7 +109,7 @@ impl<D> Dispatch<wl_drm::WlDrm, DrmInstanceData, D> for WlDrmState
         + Dispatch<WlBuffer, Dmabuf>
         + BufferHandler
         + DmabufHandler
-        + DrmHandler<D>
+        + DrmHandler<()>
         + 'static,
 {
     fn request(
@@ -173,7 +173,7 @@ impl<D> Dispatch<wl_drm::WlDrm, DrmInstanceData, D> for WlDrmState
                 dma.add_plane(name, 0, offset0 as u32, stride0 as u32);
                 match dma.build() {
                     Some(dmabuf) => {
-                        match state.dmabuf_imported(&data.dmabuf_global, dmabuf.clone()) {
+                        match DrmHandler::dmabuf_imported(state, &data.dmabuf_global, dmabuf.clone()) {
                             Ok(_) => {
                                 // import was successful
                                 data_init.init(id, dmabuf);

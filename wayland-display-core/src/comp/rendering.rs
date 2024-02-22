@@ -101,7 +101,7 @@ impl State {
                     self.video_info.as_ref().unwrap().width() as i32,
                     self.video_info.as_ref().unwrap().height() as i32,
                 ),
-            ), DrmFourcc::Abgr8888) // TODO: format???
+            ), DrmFourcc::Abgr8888)
             .expect("Failed to export framebuffer");
         let map = self
             .renderer

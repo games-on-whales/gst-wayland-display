@@ -6,19 +6,16 @@ use smithay::{
 };
 use smithay::backend::renderer::ImportDma;
 
-impl<D: 'static> DrmHandler<Option<D>> for State {
+impl DrmHandler<()> for State {
     fn dmabuf_imported(
         &mut self,
-        global: &DmabufGlobal,
+        _global: &DmabufGlobal,
         dmabuf: Dmabuf,
-    ) -> Result<Option<D>, ImportError> {
-        todo!("self.renderer.import_dmabuf(&dmabuf, None) ???");
-        Err(ImportError::Failed)
+    ) -> Result<(), ImportError> {
+        self.renderer.import_dmabuf(&dmabuf, None).map(|_| ()).map_err(|_| ImportError::Failed)
     }
 
-    fn buffer_created(&mut self, buffer: WlBuffer, result: Option<D>) {
-        todo!()
-    }
+    fn buffer_created(&mut self, buffer: WlBuffer, result: ()) {}
 }
 
 delegate_wl_drm!(State);

@@ -65,6 +65,7 @@ use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::wayland_server::Client;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 mod focus;
 mod input;
@@ -88,14 +89,9 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-pub(crate) struct Data {
-    pub(crate) display: Display<State>,
-    pub(crate) state: State,
-}
-
 #[allow(dead_code)]
 pub(crate) struct State {
-    handle: LoopHandle<'static, Data>,
+    handle: LoopHandle<'static, State>,
     should_quit: bool,
     clock: Clock<Monotonic>,
 
@@ -245,8 +241,9 @@ pub(crate) fn init(
     seat.add_pointer();
 
     let mut event_loop =
-        EventLoop::<Data>::try_new().expect("Unable to create event_loop");
-    let state = State {
+        EventLoop::<State>::try_new().expect("Unable to create event_loop");
+
+    let mut state = State {
         handle: event_loop.handle(),
         should_quit: false,
         clock,
@@ -287,14 +284,14 @@ pub(crate) fn init(
     // init event loop
     event_loop
         .handle()
-        .insert_source(libinput_backend, move |event, _, data| {
-            data.state.process_input_event(event)
+        .insert_source(libinput_backend, move |event, _, state| {
+            state.process_input_event(event)
         })
         .unwrap();
 
     event_loop
         .handle()
-        .insert_source(command_src, move |event, _, data| {
+        .insert_source(command_src, move |event, _, state| {
             match event {
                 Event::Msg(Command::VideoInfo(info)) => {
                     let size: Size<i32, Physical> =
@@ -305,7 +302,7 @@ pub(crate) fn init(
                     );
 
                     // init wayland objects
-                    let output = data.state.output.get_or_insert_with(|| {
+                    let output = state.output.get_or_insert_with(|| {
                         let output = Output::new(
                             "HEADLESS-1".into(),
                             PhysicalProperties {
@@ -315,7 +312,7 @@ pub(crate) fn init(
                                 subpixel: Subpixel::Unknown,
                             },
                         );
-                        output.create_global::<State>(&data.display.handle());
+                        output.create_global::<State>(&display.handle());
                         output
                     });
                     let mode = OutputMode {
@@ -326,22 +323,22 @@ pub(crate) fn init(
                     output.set_preferred(mode);
                     let dtr = OutputDamageTracker::from_output(&output);
 
-                    data.state.space.map_output(&output, (0, 0));
-                    data.state.dtr = Some(dtr);
-                    data.state.pointer_location = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-                    data.state.renderbuffer = Some(
-                        data.state
+                    state.space.map_output(&output, (0, 0));
+                    state.dtr = Some(dtr);
+                    state.pointer_location = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
+                    state.renderbuffer = Some(
+                        state
                             .renderer
                             .create_buffer(Fourcc::Abgr8888, (info.width() as i32, info.height() as i32).into())
                             .expect("Failed to create renderbuffer"),
                     );
-                    data.state.video_info = Some(info);
+                    state.video_info = Some(info);
 
                     let new_size = size
                         .to_f64()
                         .to_logical(output.current_scale().fractional_scale())
                         .to_i32_round();
-                    for window in data.state.space.elements() {
+                    for window in state.space.elements() {
                         let toplevel = window.toplevel().unwrap();
                         let max_size = Rectangle::from_loc_and_size(
                             (0, 0),
@@ -349,7 +346,7 @@ pub(crate) fn init(
                                 states
                                     .data_map
                                     .get::<XdgToplevelSurfaceData>()
-                                    .map(|attrs| todo!("Used to be attrs.lock().unwrap().max_size but max_size is now not present!"))
+                                    .map(|attrs| states.cached_state.current::<SurfaceCachedState>().max_size)
                             })
                                 .unwrap_or(new_size),
                         );
@@ -363,11 +360,11 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
-                    data.state.input_context.path_add_device(&path);
+                    state.input_context.path_add_device(&path);
                 }
                 Event::Msg(Command::Buffer(buffer_sender)) => {
-                    let wait = if let Some(last_render) = data.state.last_render {
-                        let framerate = data.state.video_info.as_ref().unwrap().fps();
+                    let wait = if let Some(last_render) = state.last_render {
+                        let framerate = state.video_info.as_ref().unwrap().fps();
                         let duration = Duration::from_secs_f64(
                             framerate.denom() as f64 / framerate.numer() as f64,
                         );
@@ -381,16 +378,16 @@ pub(crate) fn init(
                         None
                     };
 
-                    let render = move |data: &mut Data, now: Instant| {
-                        if let Err(_) = match data.state.create_frame() {
+                    let render = move |state: &mut State, now: Instant| {
+                        if let Err(_) = match state.create_frame() {
                             Ok((buf, damage, render_element_states)) => {
-                                data.state.last_render = Some(now);
+                                state.last_render = Some(now);
                                 let res = buffer_sender.send(Ok(buf));
 
-                                if let Some(output) = data.state.output.as_ref() {
+                                if let Some(output) = state.output.as_ref() {
                                     let mut output_presentation_feedback =
                                         OutputPresentationFeedback::new(output);
-                                    for window in data.state.space.elements() {
+                                    for window in state.space.elements() {
                                         window.with_surfaces(|surface, states| {
                                             update_surface_primary_scanout_output(
                                                 surface,
@@ -402,7 +399,7 @@ pub(crate) fn init(
                                         });
                                         window.send_frame(
                                             output,
-                                            data.state.clock.now(),
+                                            state.clock.now(),
                                             Some(Duration::ZERO),
                                             |_, _| Some(output.clone()),
                                         );
@@ -419,7 +416,7 @@ pub(crate) fn init(
                                     }
                                     if damage.is_some() {
                                         output_presentation_feedback.presented(
-                                            data.state.clock.now(),
+                                            state.clock.now(),
                                             Duration::from_millis(output
                                                 .current_mode()
                                                 .map(|mode| mode.refresh)
@@ -429,12 +426,12 @@ pub(crate) fn init(
                                         );
                                     }
                                     if let CursorImageStatus::Surface(wl_surface) =
-                                        &data.state.cursor_state
+                                        &state.cursor_state
                                     {
                                         send_frames_surface_tree(
                                             wl_surface,
                                             output,
-                                            data.state.clock.now(),
+                                            state.clock.now(),
                                             None,
                                             |_, _| Some(output.clone()),
                                         )
@@ -451,13 +448,13 @@ pub(crate) fn init(
                                 }))
                             }
                         } {
-                            data.state.should_quit = true;
+                            state.should_quit = true;
                         }
                     };
 
                     match wait {
                         Some(duration) => {
-                            if let Err(err) = data.state.handle.insert_source(
+                            if let Err(err) = state.handle.insert_source(
                                 Timer::from_duration(duration),
                                 move |now, _, data| {
                                     render(data, now);
@@ -465,14 +462,14 @@ pub(crate) fn init(
                                 },
                             ) {
                                 tracing::error!(?err, "Event loop error.");
-                                data.state.should_quit = true;
+                                state.should_quit = true;
                             };
                         }
-                        None => render(data, Instant::now()),
+                        None => render(state, Instant::now()),
                     };
                 }
                 Event::Msg(Command::Quit) | Event::Closed => {
-                    data.state.should_quit = true;
+                    state.should_quit = true;
                 }
             };
         })
@@ -483,10 +480,9 @@ pub(crate) fn init(
     tracing::info!(?socket_name, "Listening on wayland socket.");
     event_loop
         .handle()
-        .insert_source(source, |client_stream, _, data| {
-            if let Err(err) = data
-                .display
-                .handle()
+        .insert_source(source, |client_stream, _, state| {
+            if let Err(err) = state
+                .dh
                 .insert_client(client_stream, Arc::new(ClientState::default()))
             {
                 tracing::error!(?err, "Error adding wayland client.");
@@ -494,17 +490,18 @@ pub(crate) fn init(
         })
         .expect("Failed to init wayland socket source");
 
-    let display_fd = todo!("display.backend().poll_fd().as_raw_fd() -> the trait `AsFd` is not implemented for `i32`");
     // event_loop
     //     .handle()
     //     .insert_source(
     //         Generic::new(
-    //             display_fd,
+    //             display, // TODO: use of moved value: `display`
     //             Interest::READ,
     //             Mode::Level,
     //         ),
-    //         |_, _, data| {
-    //             data.display.dispatch_clients(&mut data.state).unwrap();
+    //         |_, _, state| {
+    //             // I can see that there's a dispatch_client defined for Display
+    //             // but it's missing from DisplayHandler.. What should I call here?
+    //             todo!("state.dispatch_clients(state).unwrap();");
     //             Ok(PostAction::Continue)
     //         },
     //     )
@@ -515,16 +512,15 @@ pub(crate) fn init(
         tracing::warn!(?err, "Failed to post environment to application.");
     }
 
-    let mut data = Data { display, state };
     let signal = event_loop.get_signal();
-    if let Err(err) = event_loop.run(None, &mut data, |data| {
-        data.display
+    if let Err(err) = event_loop.run(None, &mut state, |state| {
+        state.dh
             .flush_clients()
             .expect("Failed to flush clients");
-        data.state.space.refresh();
-        data.state.popups.cleanup();
+        state.space.refresh();
+        state.popups.cleanup();
 
-        if data.state.should_quit {
+        if state.should_quit {
             signal.stop();
         }
     }) {

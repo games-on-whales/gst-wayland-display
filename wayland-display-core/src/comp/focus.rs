@@ -137,7 +137,7 @@ impl PointerTarget<State> for FocusTarget {
     fn frame(&self, seat: &Seat<State>, data: &mut State) {
         match self {
             FocusTarget::Wayland(w) => w.frame(seat, data),
-            FocusTarget::Popup(p) => { todo!("the trait `PointerTarget<_>` is not implemented for `&WlSurface`") }
+            FocusTarget::Popup(p) => { PointerTarget::frame(p.wl_surface(), seat, data) }
         }
     }
 
