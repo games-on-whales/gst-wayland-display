@@ -81,6 +81,10 @@ impl XdgShellHandler for State {
         self.unconstrain_popup(&surface);
         surface.send_repositioned(token);
     }
+
+    fn unconstrain_popup(&self, popup: &PopupSurface) {
+        todo!()
+    }
 }
 
 impl State{

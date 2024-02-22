@@ -62,10 +62,13 @@ use smithay::{
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryBuffer;
+use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::wayland_server::Client;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
+use tracing::debug;
+use tracing::field::debug;
 
 mod focus;
 mod input;
@@ -225,7 +228,7 @@ pub(crate) fn init(
     let cursor_element =
         MemoryRenderBuffer::from_memory(MemoryBuffer::from_slice(
             CURSOR_DATA_BYTES,
-            Fourcc::Rgba8888,
+            Fourcc::Abgr8888,
             (64, 64)), 1, Transform::Normal, None);
 
     // init input backend
@@ -294,6 +297,7 @@ pub(crate) fn init(
         .insert_source(command_src, move |event, _, state| {
             match event {
                 Event::Msg(Command::VideoInfo(info)) => {
+                    debug!("Requested video format: {} .to_fourcc() = {}", info.format(), info.format().to_fourcc());
                     let size: Size<i32, Physical> =
                         (info.width() as i32, info.height() as i32).into();
                     let framerate = info.fps();
@@ -329,7 +333,8 @@ pub(crate) fn init(
                     state.renderbuffer = Some(
                         state
                             .renderer
-                            .create_buffer(Fourcc::Abgr8888, (info.width() as i32, info.height() as i32).into())
+                            .create_buffer(Fourcc::try_from(info.format().to_fourcc()).unwrap_or(Fourcc::Abgr8888),
+                                           (info.width() as i32, info.height() as i32).into())
                             .expect("Failed to create renderbuffer"),
                     );
                     state.video_info = Some(info);
@@ -380,8 +385,9 @@ pub(crate) fn init(
 
                     let render = move |state: &mut State, now: Instant| {
                         if let Err(_) = match state.create_frame() {
-                            Ok((buf, damage, render_element_states)) => {
+                            Ok((buf, render_result)) => {
                                 state.last_render = Some(now);
+                                render_result.sync.wait(); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
                                 let res = buffer_sender.send(Ok(buf));
 
                                 if let Some(output) = state.output.as_ref() {
@@ -393,7 +399,7 @@ pub(crate) fn init(
                                                 surface,
                                                 output,
                                                 states,
-                                                &render_element_states,
+                                                &render_result.states,
                                                 |next_output, _, _, _| next_output,
                                             );
                                         });
@@ -409,12 +415,12 @@ pub(crate) fn init(
                                             |surface, _| {
                                                 surface_presentation_feedback_flags_from_states(
                                                     surface,
-                                                    &render_element_states,
+                                                    &render_result.states,
                                                 )
                                             },
                                         );
                                     }
-                                    if damage.is_some() {
+                                    if render_result.damage.is_some() {
                                         output_presentation_feedback.presented(
                                             state.clock.now(),
                                             Duration::from_millis(output

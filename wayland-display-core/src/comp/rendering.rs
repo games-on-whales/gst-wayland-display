@@ -16,10 +16,12 @@ use smithay::{
     utils::{Physical, Rectangle},
 };
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::damage::RenderOutputResult;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::utils::Size;
+use tracing::debug;
 
 use super::State;
 
@@ -37,8 +39,7 @@ impl State {
     ) -> Result<
         (
             gst::Buffer,
-            Option<Vec<Rectangle<i32, Physical>>>,
-            RenderElementStates,
+            RenderOutputResult,
         ),
         DTRError<GlesRenderer>,
     > {
@@ -101,7 +102,7 @@ impl State {
                     self.video_info.as_ref().unwrap().width() as i32,
                     self.video_info.as_ref().unwrap().height() as i32,
                 ),
-            ), DrmFourcc::Abgr8888)
+            ), Fourcc::try_from(self.video_info.as_ref().unwrap().format().to_fourcc()).unwrap_or(Fourcc::Abgr8888))
             .expect("Failed to export framebuffer");
         let map = self
             .renderer
@@ -125,6 +126,6 @@ impl State {
             buffer
         };
         self.renderer.unbind().map_err(DTRError::Rendering)?;
-        Ok((buffer, render_output_result.damage, render_output_result.states))
+        Ok((buffer, render_output_result))
     }
 }
