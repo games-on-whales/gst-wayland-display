@@ -15,6 +15,7 @@ use smithay::{
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
 };
+use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use crate::comp::{ClientState, FocusTarget, State};
 
@@ -58,7 +59,7 @@ impl CompositorHandler for State {
 
                 (
                     attributes_guard.initial_configure_sent,
-                    todo!("Used to be attributes_guard.max_size but max_size is now not present!") as Size<i32, Physical>,
+                    states.cached_state.current::<SurfaceCachedState>().max_size
                 )
             });
 

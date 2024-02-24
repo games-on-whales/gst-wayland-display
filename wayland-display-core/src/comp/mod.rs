@@ -316,7 +316,7 @@ pub(crate) fn init(
                                 subpixel: Subpixel::Unknown,
                             },
                         );
-                        output.create_global::<State>(&display.handle());
+                        output.create_global::<State>(&state.dh);
                         output
                     });
                     let mode = OutputMode {
@@ -496,22 +496,19 @@ pub(crate) fn init(
         })
         .expect("Failed to init wayland socket source");
 
-    // event_loop
-    //     .handle()
-    //     .insert_source(
-    //         Generic::new(
-    //             display, // TODO: use of moved value: `display`
-    //             Interest::READ,
-    //             Mode::Level,
-    //         ),
-    //         |_, _, state| {
-    //             // I can see that there's a dispatch_client defined for Display
-    //             // but it's missing from DisplayHandler.. What should I call here?
-    //             todo!("state.dispatch_clients(state).unwrap();");
-    //             Ok(PostAction::Continue)
-    //         },
-    //     )
-    //     .expect("Failed to init wayland server source");
+    event_loop.
+        handle()
+        .insert_source(
+            Generic::new(display, Interest::READ, Mode::Level),
+            |_, display, state| {
+                // Safety: we don't drop the display
+                unsafe {
+                    display.get_mut().dispatch_clients(state).unwrap();
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .unwrap();
 
     let env_vars = vec![CString::new(format!("WAYLAND_DISPLAY={}", socket_name)).unwrap()];
     if let Err(err) = envs_tx.send(env_vars) {
