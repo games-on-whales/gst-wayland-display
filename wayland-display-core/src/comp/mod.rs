@@ -65,6 +65,7 @@ use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::wayland_server::Client;
+use smithay::wayland::pointer_constraints::PointerConstraintsState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::debug;
@@ -128,6 +129,7 @@ pub(crate) struct State {
     output_state: OutputManagerState,
     presentation_state: PresentationState,
     relative_ptr_state: RelativePointerManagerState,
+    pointer_constraints_state: PointerConstraintsState,
     pub seat_state: SeatState<Self>,
     pub shell_state: XdgShellState,
     pub shm_state: ShmState,
@@ -162,6 +164,7 @@ pub(crate) fn init(
     let output_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
     let presentation_state = PresentationState::new::<State>(&dh, clock.id() as _);
     let relative_ptr_state = RelativePointerManagerState::new::<State>(&dh);
+    let pointer_constraints_state = PointerConstraintsState::new::<State>(&dh);
     let mut seat_state = SeatState::new();
     let shell_state = XdgShellState::new::<State>(&dh);
     let viewporter_state = ViewporterState::new::<State>(&dh);
@@ -278,6 +281,7 @@ pub(crate) fn init(
         output_state,
         presentation_state,
         relative_ptr_state,
+        pointer_constraints_state,
         seat_state,
         shell_state,
         shm_state,
