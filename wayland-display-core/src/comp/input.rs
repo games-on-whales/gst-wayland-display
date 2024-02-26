@@ -253,11 +253,11 @@ impl State {
                 self.last_pointer_movement = Instant::now();
                 let horizontal_amount = event
                     .amount(Axis::Horizontal)
-                    .or_else(|| event.amount_v120(Axis::Horizontal).map(|x| x * 2.0 / 120.0))
+                    .or_else(|| event.amount_v120(Axis::Horizontal).map(|x| x * 3.0 / 120.0))
                     .unwrap_or(0.0);
                 let vertical_amount = event
                     .amount(Axis::Vertical)
-                    .or_else(|| event.amount_v120(Axis::Vertical).map(|y| y * 2.0 / 120.0))
+                    .or_else(|| event.amount_v120(Axis::Vertical).map(|y| y * 3.0 / 120.0))
                     .unwrap_or(0.0);
                 let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
                 let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
@@ -280,7 +280,9 @@ impl State {
                     } else if event.source() == AxisSource::Finger {
                         frame = frame.stop(Axis::Vertical);
                     }
-                    self.seat.get_pointer().unwrap().axis(self, frame);
+                    let pointer = self.seat.get_pointer().unwrap();
+                    pointer.axis(self, frame);
+                    pointer.frame(self);
                 }
             }
             _ => {}
