@@ -15,8 +15,8 @@ mod generated {
         use wayland_backend;
         wayland_scanner::generate_interfaces!("resources/protocols/wayland-drm.xml");
     }
-    use self::__interfaces::*;
 
+    use self::__interfaces::*;
     wayland_scanner::generate_server_code!("resources/protocols/wayland-drm.xml");
 }
 
@@ -31,7 +31,7 @@ use smithay::{
     },
     wayland::{
         buffer::BufferHandler,
-        dmabuf::{DmabufGlobal, DmabufHandler, ImportError},
+        dmabuf::{DmabufGlobal, DmabufHandler},
     },
 };
 
@@ -52,9 +52,20 @@ pub struct DrmInstanceData {
     dmabuf_global: DmabufGlobal,
 }
 
+pub enum ImportError {
+    Failed,
+}
+
+pub trait DrmHandler<R: 'static> {
+    fn dmabuf_imported(&mut self, global: &DmabufGlobal, dmabuf: Dmabuf) -> Result<R, ImportError>;
+    fn buffer_created(&mut self, buffer: WlBuffer, result: R) {
+        let _ = (buffer, result);
+    }
+}
+
 impl<D> GlobalDispatch<wl_drm::WlDrm, DrmGlobalData, D> for WlDrmState
-where
-    D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
+    where
+        D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
         + Dispatch<wl_drm::WlDrm, DrmInstanceData>
         + BufferHandler
         + DmabufHandler
@@ -91,12 +102,13 @@ where
 }
 
 impl<D> Dispatch<wl_drm::WlDrm, DrmInstanceData, D> for WlDrmState
-where
-    D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
+    where
+        D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
         + Dispatch<wl_drm::WlDrm, DrmInstanceData>
         + Dispatch<WlBuffer, Dmabuf>
         + BufferHandler
         + DmabufHandler
+        + DrmHandler<()>
         + 'static,
 {
     fn request(
@@ -156,21 +168,14 @@ where
                     return;
                 }
 
-                let mut dma = Dmabuf::builder((width, height), format, DmabufFlags::empty());
-                dma.add_plane(name, 0, offset0 as u32, stride0 as u32, Modifier::Invalid);
+                let mut dma = Dmabuf::builder((width, height), format, Modifier::Invalid, DmabufFlags::empty());
+                dma.add_plane(name, 0, offset0 as u32, stride0 as u32);
                 match dma.build() {
                     Some(dmabuf) => {
-                        match state.dmabuf_imported(&data.dmabuf_global, dmabuf.clone()) {
+                        match DrmHandler::dmabuf_imported(state, &data.dmabuf_global, dmabuf.clone()) {
                             Ok(_) => {
                                 // import was successful
                                 data_init.init(id, dmabuf);
-                            }
-
-                            Err(ImportError::InvalidFormat) => {
-                                drm.post_error(
-                                    wl_drm::Error::InvalidFormat,
-                                    "format and plane combination are not valid",
-                                );
                             }
 
                             Err(ImportError::Failed) => {
@@ -200,8 +205,8 @@ pub fn create_drm_global<D>(
     formats: Vec<Format>,
     dmabuf_global: &DmabufGlobal,
 ) -> GlobalId
-where
-    D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
+    where
+        D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
         + Dispatch<wl_drm::WlDrm, DrmInstanceData>
         + BufferHandler
         + DmabufHandler
@@ -217,13 +222,13 @@ pub fn create_drm_global_with_filter<D, F>(
     dmabuf_global: &DmabufGlobal,
     client_filter: F,
 ) -> GlobalId
-where
-    D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
+    where
+        D: GlobalDispatch<wl_drm::WlDrm, DrmGlobalData>
         + Dispatch<wl_drm::WlDrm, DrmInstanceData>
         + BufferHandler
         + DmabufHandler
         + 'static,
-    F: for<'a> Fn(&'a Client) -> bool + Send + Sync + 'static,
+        F: for<'a> Fn(&'a Client) -> bool + Send + Sync + 'static,
 {
     let formats = Arc::new(
         formats

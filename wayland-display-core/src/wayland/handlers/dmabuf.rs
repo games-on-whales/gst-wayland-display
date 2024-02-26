@@ -1,8 +1,9 @@
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::ImportDma},
     delegate_dmabuf,
-    wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportError},
+    wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
 };
+
 
 use crate::comp::State;
 
@@ -15,11 +16,12 @@ impl DmabufHandler for State {
         &mut self,
         _global: &DmabufGlobal,
         dmabuf: Dmabuf,
-    ) -> Result<(), ImportError> {
-        self.renderer
-            .import_dmabuf(&dmabuf, None)
-            .map(|_| ())
-            .map_err(|_| ImportError::Failed)
+        notifier: ImportNotifier) {
+        if self.renderer.import_dmabuf(&dmabuf, None).is_ok() {
+            let _ = notifier.successful::<State>();
+        } else {
+            notifier.failed();
+        }
     }
 }
 

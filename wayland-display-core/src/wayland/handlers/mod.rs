@@ -9,3 +9,4 @@ pub mod shm;
 pub mod viewporter;
 pub mod wl_drm;
 pub mod xdg;
+pub mod pointer_constraints;

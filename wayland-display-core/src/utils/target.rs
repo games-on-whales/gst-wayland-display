@@ -5,8 +5,8 @@ use smithay::{
         drm::{CreateDrmNodeError, DrmNode, NodeType},
         udev,
     },
-    reexports::nix::sys::stat::major,
 };
+use smithay::reexports::rustix::fs::major;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderTarget {
@@ -40,7 +40,7 @@ impl Into<RenderTarget> for DrmNode {
 }
 
 #[cfg(target_os = "linux")]
-const NVIDIA_MAJOR: u64 = 195;
+const NVIDIA_MAJOR: u32 = 195;
 
 // no clue how this number is on BSDs, feel free to contribute
 
