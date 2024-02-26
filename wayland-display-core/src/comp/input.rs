@@ -21,7 +21,7 @@ use smithay::{
     wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint},
 };
 use std::{
-    os::{fd::FromRawFd, unix::io::OwnedFd},
+    os::unix::io::OwnedFd,
     path::Path,
     time::Instant,
 };

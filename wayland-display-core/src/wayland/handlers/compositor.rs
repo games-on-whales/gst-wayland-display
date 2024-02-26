@@ -7,15 +7,14 @@ use smithay::{
         wayland_server::{Client,
                          protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface}},
     },
-    utils::{Size, Physical, SERIAL_COUNTER},
+    utils::{Size, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{with_states, CompositorHandler, CompositorState, CompositorClientState},
         seat::WaylandFocus,
-        shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
+        shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData, SurfaceCachedState},
     },
 };
-use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use crate::comp::{ClientState, FocusTarget, State};
 

@@ -1,23 +1,21 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
-    os::fd::AsFd,
     sync::{mpsc::Sender, Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
-use std::os::fd::AsRawFd;
 
 use super::Command;
 use gst_video::VideoInfo;
 use once_cell::sync::Lazy;
 use smithay::{
     backend::{
-        allocator::dmabuf::Dmabuf,
+        allocator::{Fourcc, dmabuf::Dmabuf},
         drm::{DrmNode, NodeType},
         egl::{EGLContext, EGLDevice, EGLDisplay},
         libinput::LibinputInputBackend,
         renderer::{
-            element::memory::MemoryRenderBuffer,
+            element::memory::{MemoryRenderBuffer, MemoryBuffer},
             damage::{OutputDamageTracker, Error as DTRError},
             gles::{GlesRenderbuffer, GlesRenderer},
             Bind, Offscreen,
@@ -43,7 +41,7 @@ use smithay::{
         input::Libinput,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{GlobalId, ClientData, ClientId, DisconnectReason},
             Display, DisplayHandle,
         },
     },
@@ -53,23 +51,16 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         presentation::PresentationState,
-        shell::xdg::{XdgShellState, XdgToplevelSurfaceData},
+        shell::xdg::{XdgShellState, XdgToplevelSurfaceData, SurfaceCachedState},
         shm::ShmState,
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
         relative_pointer::RelativePointerManagerState,
+        pointer_constraints::PointerConstraintsState,
+        selection::data_device::DataDeviceState,
     },
 };
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::MemoryBuffer;
-use smithay::reexports::drm::buffer::DrmFourcc;
-use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::reexports::wayland_server::Client;
-use smithay::wayland::pointer_constraints::PointerConstraintsState;
-use smithay::wayland::selection::data_device::DataDeviceState;
-use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::debug;
-use tracing::field::debug;
 
 mod focus;
 mod input;
@@ -154,7 +145,7 @@ pub(crate) fn init(
     envs_tx: Sender<Vec<CString>>,
 ) {
     let clock = Clock::new();
-    let mut display = Display::<State>::new().unwrap();
+    let display = Display::<State>::new().unwrap();
     let dh = display.handle();
 
     // init state
@@ -355,7 +346,7 @@ pub(crate) fn init(
                                 states
                                     .data_map
                                     .get::<XdgToplevelSurfaceData>()
-                                    .map(|attrs| states.cached_state.current::<SurfaceCachedState>().max_size)
+                                    .map(|_attrs| states.cached_state.current::<SurfaceCachedState>().max_size)
                             })
                                 .unwrap_or(new_size),
                         );

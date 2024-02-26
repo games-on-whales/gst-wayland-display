@@ -2,26 +2,20 @@ use std::time::{Duration, Instant};
 
 use smithay::{
     desktop::space::render_output,
+    backend::allocator::Fourcc,
     backend::renderer::{
         damage::Error as DTRError,
+        damage::RenderOutputResult,
         element::{
-            memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
-            RenderElementStates,
+            memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement, Kind,
         },
         gles::GlesRenderer,
         Bind, ExportMem, ImportAll, ImportMem, Renderer, Unbind,
     },
     input::pointer::CursorImageStatus,
     render_elements,
-    utils::{Physical, Rectangle},
+    utils::{Rectangle},
 };
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::damage::RenderOutputResult;
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::element::memory::MemoryBuffer;
-use smithay::reexports::drm::buffer::DrmFourcc;
-use smithay::utils::Size;
-use tracing::debug;
 
 use super::State;
 
@@ -51,7 +45,7 @@ impl State {
         let elements =
             if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
                 match &self.cursor_state {
-                    CursorImageStatus::Named(cursor_icon) => vec![CursorElement::Memory(
+                    CursorImageStatus::Named(_cursor_icon) => vec![CursorElement::Memory(
                         // TODO: icon?
                         MemoryRenderBufferRenderElement::from_buffer(
                             &mut self.renderer,

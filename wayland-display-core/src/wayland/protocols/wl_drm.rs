@@ -31,7 +31,7 @@ use smithay::{
     },
     wayland::{
         buffer::BufferHandler,
-        dmabuf::{DmabufGlobal, DmabufHandler, ImportNotifier},
+        dmabuf::{DmabufGlobal, DmabufHandler},
     },
 };
 
@@ -54,7 +54,6 @@ pub struct DrmInstanceData {
 
 pub enum ImportError {
     Failed,
-    InvalidFormat,
 }
 
 pub trait DrmHandler<R: 'static> {
@@ -177,13 +176,6 @@ impl<D> Dispatch<wl_drm::WlDrm, DrmInstanceData, D> for WlDrmState
                             Ok(_) => {
                                 // import was successful
                                 data_init.init(id, dmabuf);
-                            }
-
-                            Err(ImportError::InvalidFormat) => {
-                                drm.post_error(
-                                    wl_drm::Error::InvalidFormat,
-                                    "format and plane combination are not valid",
-                                );
                             }
 
                             Err(ImportError::Failed) => {

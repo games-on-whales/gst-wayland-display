@@ -23,7 +23,7 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let window = Window::new(surface);
+        let window = Window::new_wayland_window(surface);
         self.pending_windows.push(window);
     }
 
@@ -82,12 +82,12 @@ impl XdgShellHandler for State {
         surface.send_repositioned(token);
     }
 
-    fn unconstrain_popup(&self, popup: &PopupSurface) {
+    fn unconstrain_popup(&self, _popup: &PopupSurface) {
         todo!()
     }
 }
 
-impl State{
+impl State {
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
