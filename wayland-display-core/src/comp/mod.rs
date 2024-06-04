@@ -362,7 +362,7 @@ pub(crate) fn init(
                     tracing::info!(path, "Adding input device.");
                     state.input_context.path_add_device(&path);
                 }
-                Event::Msg(Command::Buffer(buffer_sender)) => {
+                Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
                     let wait = if let Some(last_render) = state.last_render {
                         let framerate = state.video_info.as_ref().unwrap().fps();
                         let duration = Duration::from_secs_f64(
@@ -379,6 +379,10 @@ pub(crate) fn init(
                     };
 
                     let render = move |state: &mut State, now: Instant| {
+                        let _span = match tracer {
+                            Some(ref tracer) => Some(tracer.trace("render")),
+                            None => None
+                        };
                         if let Err(_) = match state.create_frame() {
                             Ok((buf, render_result)) => {
                                 state.last_render = Some(now);

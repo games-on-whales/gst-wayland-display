@@ -2,9 +2,9 @@ use gst::ffi::GstBuffer;
 use gst_video::ffi::GstVideoInfo;
 use gst_video::VideoInfo;
 use gst::glib::translate::FromGlibPtrNone;
-use std::ffi::{c_char, c_uint, CStr};
+use std::ffi::{c_char, c_uint, c_void, CStr, CString};
 use std::ptr;
-use waylanddisplaycore::WaylandDisplay;
+use waylanddisplaycore::{Tracer, WaylandDisplay};
 use tracing_subscriber;
 
 #[no_mangle]
@@ -28,6 +28,12 @@ pub extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDispla
             ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn display_set_trace_fn(wd: *mut WaylandDisplay, trace_start: fn(*const c_char) -> *mut c_void, trace_end: fn(*mut c_void)) {
+    let display = unsafe { &mut *wd };
+    display.tracer = Some(Tracer::new(trace_start, trace_end));
 }
 
 #[no_mangle]
@@ -105,6 +111,10 @@ pub extern "C" fn display_set_video_info(dpy: *mut WaylandDisplay, info: *const 
 #[no_mangle]
 pub extern "C" fn display_get_frame(dpy: *mut WaylandDisplay) -> *mut GstBuffer {
     let display = unsafe { &mut *dpy };
+    let _span = match display.tracer.as_ref() {
+        Some(tracer) => Some(tracer.trace("display_get_frame")),
+        None => None
+    };
     match display.frame() {
         Ok(mut frame) => {
             let ptr = frame.make_mut().as_mut_ptr();
