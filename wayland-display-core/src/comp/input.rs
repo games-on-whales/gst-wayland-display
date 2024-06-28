@@ -160,6 +160,7 @@ impl State {
 
                 // If pointer is locked, only emit relative motion
                 if pointer_locked {
+                    pointer.frame(self);
                     return;
                 }
 
@@ -196,6 +197,7 @@ impl State {
                         _ => {}
                     });
                 }
+                pointer.frame(self);
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 self.last_pointer_movement = Instant::now();
@@ -228,6 +230,7 @@ impl State {
                             time: event.time_msec(),
                         },
                     );
+                    pointer.frame(self);
                 }
             }
             InputEvent::PointerButton { event, .. } => {
