@@ -2,7 +2,7 @@ use gst::ffi::GstBuffer;
 use gst_video::ffi::GstVideoInfo;
 use gst_video::VideoInfo;
 use gst::glib::translate::FromGlibPtrNone;
-use std::ffi::{c_char, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_uint, c_void, CStr};
 use std::ptr;
 use waylanddisplaycore::{Tracer, WaylandDisplay};
 use tracing_subscriber;

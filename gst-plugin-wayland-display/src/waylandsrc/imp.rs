@@ -38,6 +38,7 @@ impl Default for WaylandDisplaySrc {
 #[derive(Debug, Default)]
 pub struct Settings {
     render_node: Option<String>,
+    input_devices: Vec<String>,
 }
 
 pub struct State {
@@ -56,10 +57,21 @@ impl ObjectImpl for WaylandDisplaySrc {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
             vec![glib::ParamSpecString::builder("render-node")
-                .nick("DRM Render Node")
-                .blurb("DRM Render Node to use (e.g. /dev/dri/renderD128")
-                .construct()
-                .build()]
+                     .nick("DRM Render Node")
+                     .blurb("DRM Render Node to use (e.g. /dev/dri/renderD128")
+                     .construct()
+                     .build(),
+                 glib::ParamSpecString::builder("mouse")
+                     .nick("Input Device")
+                     .blurb("Input device to use (e.g. /dev/input/event0")
+                     .construct()
+                     .build(),
+                 glib::ParamSpecString::builder("keyboard")
+                     .nick("Input Device")
+                     .blurb("Input device to use (e.g. /dev/input/event0")
+                     .construct()
+                     .build(),
+            ]
         });
 
         PROPERTIES.as_ref()
@@ -73,6 +85,20 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .get::<Option<String>>()
                     .expect("Type checked upstream");
             }
+            "mouse" => {
+                let actual_val = value.get::<Option<String>>().expect("Type checked upstream");
+                if actual_val.is_some() {
+                    let mut settings = self.settings.lock().unwrap();
+                    settings.input_devices.push(actual_val.unwrap());
+                }
+            }
+            "keyboard" => {
+                let actual_val = value.get::<Option<String>>().expect("Type checked upstream");
+                if actual_val.is_some() {
+                    let mut settings = self.settings.lock().unwrap();
+                    settings.input_devices.push(actual_val.unwrap());
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -85,6 +111,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .render_node
                     .clone()
                     .unwrap_or_else(|| String::from("/dev/dri/renderD128"))
+                    .to_value()
+            }
+            "mouse" => {
+                let settings = self.settings.lock().unwrap();
+                settings.input_devices
+                    .join(",")
+                    .to_value()
+            }
+            "keyboard" => {
+                let settings = self.settings.lock().unwrap();
+                settings.input_devices
+                    .join(",")
                     .to_value()
             }
             _ => unreachable!(),
@@ -133,7 +171,7 @@ impl ElementImpl for WaylandDisplaySrc {
                 gst::PadPresence::Always,
                 &caps,
             )
-            .unwrap();
+                .unwrap();
 
             vec![src_pad_template]
         });
@@ -235,6 +273,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let Ok(mut display) = tracing::subscriber::with_default(subscriber, || WaylandDisplay::new(settings.render_node.clone())) else {
             return Err(gst::error_msg!(LibraryError::Failed, ("Failed to open drm node {}, if you want to utilize software rendering set `render-node=software`.", settings.render_node.as_deref().unwrap_or("/dev/dri/renderD128"))));
         };
+
+        for path in &settings.input_devices {
+            display.add_input_device(path);
+        }
 
         let mut structure = Structure::builder("wayland.src");
         for (key, var) in display.env_vars().flat_map(|var| var.split_once("=")) {
