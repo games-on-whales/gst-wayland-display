@@ -10,6 +10,7 @@ use crate::comp::{FocusTarget, State};
 impl SeatHandler for State {
     type KeyboardFocus = FocusTarget;
     type PointerFocus = FocusTarget;
+    type TouchFocus = FocusTarget;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state

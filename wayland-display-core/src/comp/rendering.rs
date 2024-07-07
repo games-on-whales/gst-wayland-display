@@ -16,7 +16,6 @@ use smithay::{
     render_elements,
     utils::{Rectangle},
 };
-use crate::Tracer;
 
 use super::State;
 

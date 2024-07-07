@@ -5,6 +5,7 @@ mod waylandsrc;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     waylandsrc::register(plugin)?;
+    tracing_subscriber::fmt::try_init().ok();
     Ok(())
 }
 
