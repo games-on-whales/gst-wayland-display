@@ -24,17 +24,17 @@ pub(crate) enum Command {
 
 #[derive(Clone)]
 pub struct Tracer {
-    start_fn: fn(*const c_char) -> *mut c_void,
-    end_fn: fn(*mut c_void),
+    start_fn: extern "C" fn(*const c_char) -> *mut c_void,
+    end_fn: extern "C" fn(*mut c_void),
 }
 
 pub struct Trace {
     ctx: *mut c_void,
-    end_fn: fn(*mut c_void),
+    end_fn: extern "C" fn(*mut c_void),
 }
 
 impl Tracer {
-    pub fn new(start_fn: fn(*const c_char) -> *mut c_void, end_fn: fn(*mut c_void)) -> Self {
+    pub fn new(start_fn: extern "C" fn(*const c_char) -> *mut c_void, end_fn: extern "C" fn(*mut c_void)) -> Self {
         Tracer {
             start_fn,
             end_fn,
@@ -49,7 +49,7 @@ impl Tracer {
 }
 
 impl Trace {
-    pub fn new(ctx: *mut c_void, end_fn: fn(*mut c_void)) -> Self {
+    pub fn new(ctx: *mut c_void, end_fn: extern "C" fn(*mut c_void)) -> Self {
         Trace { ctx, end_fn }
     }
 }

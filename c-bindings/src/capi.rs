@@ -31,7 +31,7 @@ pub extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDispla
 }
 
 #[no_mangle]
-pub extern "C" fn display_set_trace_fn(wd: *mut WaylandDisplay, trace_start: fn(*const c_char) -> *mut c_void, trace_end: fn(*mut c_void)) {
+pub extern "C" fn display_set_trace_fn(wd: *mut WaylandDisplay, trace_start: extern "C" fn(*const c_char) -> *mut c_void, trace_end: extern "C" fn(*mut c_void)) {
     let display = unsafe { &mut *wd };
     display.tracer = Some(Tracer::new(trace_start, trace_end));
 }
