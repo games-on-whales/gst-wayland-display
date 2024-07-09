@@ -4,7 +4,7 @@ use smithay::backend::drm::CreateDrmNodeError;
 use smithay::backend::SwapBuffersError;
 use smithay::reexports::calloop::channel::Sender;
 
-use std::ffi::{CString};
+use std::ffi::{c_char, c_void, CString};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
@@ -18,14 +18,53 @@ pub(crate) mod wayland;
 pub(crate) enum Command {
     InputDevice(String),
     VideoInfo(VideoInfo),
-    Buffer(SyncSender<Result<gst::Buffer, SwapBuffersError>>),
+    Buffer(SyncSender<Result<gst::Buffer, SwapBuffersError>>, Option<Tracer>),
     Quit,
+}
+
+#[derive(Clone)]
+pub struct Tracer {
+    start_fn: extern "C" fn(*const c_char) -> *mut c_void,
+    end_fn: extern "C" fn(*mut c_void),
+}
+
+pub struct Trace {
+    ctx: *mut c_void,
+    end_fn: extern "C" fn(*mut c_void),
+}
+
+impl Tracer {
+    pub fn new(start_fn: extern "C" fn(*const c_char) -> *mut c_void, end_fn: extern "C" fn(*mut c_void)) -> Self {
+        Tracer {
+            start_fn,
+            end_fn,
+        }
+    }
+
+    pub fn trace(&self, name: &str) -> Trace {
+        let trace_name = CString::new(name).unwrap();
+        let ctx = (self.start_fn)(trace_name.as_ptr());
+        Trace::new(ctx, self.end_fn)
+    }
+}
+
+impl Trace {
+    pub fn new(ctx: *mut c_void, end_fn: extern "C" fn(*mut c_void)) -> Self {
+        Trace { ctx, end_fn }
+    }
+}
+
+impl Drop for Trace {
+    fn drop(&mut self) {
+        (self.end_fn)(self.ctx);
+    }
 }
 
 pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
 
+    pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
     pub envs: MaybeRecv<Vec<CString>>,
 }
@@ -72,19 +111,20 @@ impl WaylandDisplay {
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
         })
     }
 
-    pub fn devices(&mut self) -> impl Iterator<Item = &str> {
+    pub fn devices(&mut self) -> impl Iterator<Item=&str> {
         self.devices
             .get()
             .iter()
             .map(|string| string.to_str().unwrap())
     }
 
-    pub fn env_vars(&mut self) -> impl Iterator<Item = &str> {
+    pub fn env_vars(&mut self) -> impl Iterator<Item=&str> {
         self.envs
             .get()
             .iter()
@@ -101,7 +141,7 @@ impl WaylandDisplay {
 
     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
-        if let Err(err) = self.command_tx.send(Command::Buffer(buffer_tx)) {
+        if let Err(err) = self.command_tx.send(Command::Buffer(buffer_tx, self.tracer.clone())) {
             tracing::warn!(?err, "Failed to send buffer command.");
             return Err(gst::FlowError::Eos);
         }

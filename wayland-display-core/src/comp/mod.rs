@@ -4,7 +4,6 @@ use std::{
     sync::{mpsc::Sender, Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
-
 use super::Command;
 use gst_video::VideoInfo;
 use once_cell::sync::Lazy;
@@ -125,6 +124,7 @@ pub(crate) struct State {
     pub shell_state: XdgShellState,
     pub shm_state: ShmState,
     viewporter_state: ViewporterState,
+    cursor_event_count: i32,
 }
 
 pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
@@ -261,6 +261,7 @@ pub(crate) fn init(
         last_pointer_movement: Instant::now(),
         cursor_element,
         cursor_state: CursorImageStatus::default_named(),
+        cursor_event_count: 0,
         surpressed_keys: HashSet::new(),
         pending_windows: Vec::new(),
         input_context,
@@ -362,7 +363,7 @@ pub(crate) fn init(
                     tracing::info!(path, "Adding input device.");
                     state.input_context.path_add_device(&path);
                 }
-                Event::Msg(Command::Buffer(buffer_sender)) => {
+                Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
                     let wait = if let Some(last_render) = state.last_render {
                         let framerate = state.video_info.as_ref().unwrap().fps();
                         let duration = Duration::from_secs_f64(
@@ -379,10 +380,14 @@ pub(crate) fn init(
                     };
 
                     let render = move |state: &mut State, now: Instant| {
+                        let _span = match tracer {
+                            Some(ref tracer) => Some(tracer.trace("render")),
+                            None => None
+                        };
                         if let Err(_) = match state.create_frame() {
                             Ok((buf, render_result)) => {
                                 state.last_render = Some(now);
-                                render_result.sync.wait(); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
+                                render_result.sync.wait().expect("Error during render_result.sync"); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
                                 let res = buffer_sender.send(Ok(buf));
 
                                 if let Some(output) = state.output.as_ref() {

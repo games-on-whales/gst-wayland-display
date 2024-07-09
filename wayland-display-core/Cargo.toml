@@ -22,7 +22,7 @@ wayland-scanner = "0.31.1"
 
 [dependencies.smithay]
 git = "https://github.com/smithay/Smithay"
-rev = "7f9e6d5"
+rev = "fe04633"
 default-features = false
 features = [
     "backend_drm",

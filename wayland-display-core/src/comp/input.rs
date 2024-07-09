@@ -26,6 +26,7 @@ use std::{
     time::Instant,
 };
 use smithay::input::keyboard::Keysym;
+use smithay::reexports::input::event::pointer::PointerEventTrait;
 use smithay::wayland::seat::WaylandFocus;
 
 pub struct NixInterface;
@@ -147,23 +148,6 @@ impl State {
                     });
                 }
 
-                /* Relative motion is always applied */
-                pointer.relative_motion(
-                    self,
-                    under,
-                    &RelativeMotionEvent {
-                        delta,
-                        delta_unaccel: event.delta_unaccel(),
-                        utime: event.time(),
-                    },
-                );
-
-                // If pointer is locked, only emit relative motion
-                if pointer_locked {
-                    pointer.frame(self);
-                    return;
-                }
-
                 self.pointer_location += delta;
                 self.pointer_location = self.clamp_coords(self.pointer_location);
                 let new_under = self
@@ -172,14 +156,27 @@ impl State {
                     .map(|(w, pos)| (w.clone().into(), pos));
 
 
-                // TODO: If confined, don't move pointer if it would go outside surface or region
-                pointer.motion(
+                // If pointer is locked, only emit relative motion
+                if !pointer_locked {
+                    pointer.motion(
+                        self,
+                        new_under.clone(),
+                        &MotionEvent {
+                            location: self.pointer_location,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                }
+
+                /* Relative motion is always applied */
+                pointer.relative_motion(
                     self,
-                    new_under.clone(),
-                    &MotionEvent {
-                        location: self.pointer_location,
-                        serial,
-                        time: event.time_msec(),
+                    under,
+                    &RelativeMotionEvent {
+                        delta,
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time_usec(),
                     },
                 );
 
@@ -197,6 +194,7 @@ impl State {
                         _ => {}
                     });
                 }
+
                 pointer.frame(self);
             }
             InputEvent::PointerMotionAbsolute { event } => {
@@ -210,11 +208,11 @@ impl State {
                         .to_f64()
                         .to_logical(output.current_scale().fractional_scale())
                         .to_i32_round();
-                    self.pointer_location = (
-                        event.absolute_x_transformed(output_size.w),
-                        event.absolute_y_transformed(output_size.h),
-                    )
-                        .into();
+
+                    let new_x = event.absolute_x_transformed(output_size.w);
+                    let new_y = event.absolute_y_transformed(output_size.h);
+                    let relative_movement = (new_x - self.pointer_location.x, new_y - self.pointer_location.y).into();
+                    self.pointer_location = (new_x, new_y).into();
 
                     let pointer = self.seat.get_pointer().unwrap();
                     let under = self
@@ -230,6 +228,17 @@ impl State {
                             time: event.time_msec(),
                         },
                     );
+
+                    pointer.relative_motion(
+                        self,
+                        under,
+                        &RelativeMotionEvent {
+                            delta: relative_movement,
+                            delta_unaccel: relative_movement,
+                            utime: event.time_usec(),
+                        },
+                    );
+
                     pointer.frame(self);
                 }
             }
