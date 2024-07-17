@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void, CString};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
-
+use smithay::backend::input::{ButtonState, KeyState};
+use smithay::utils::{Logical, Point};
 use utils::RenderTarget;
 
 pub(crate) mod comp;
@@ -19,6 +20,11 @@ pub(crate) enum Command {
     InputDevice(String),
     VideoInfo(VideoInfo),
     Buffer(SyncSender<Result<gst::Buffer, SwapBuffersError>>, Option<Tracer>),
+    KeyboardInput(u32, KeyState),
+    PointerMotion(Point<f64, Logical>),
+    PointerMotionAbsolute(Point<f64, Logical>),
+    PointerButton(u32, ButtonState),
+    PointerAxis(f64, f64),
     Quit,
 }
 
@@ -137,6 +143,28 @@ impl WaylandDisplay {
 
     pub fn set_video_info(&self, info: VideoInfo) {
         let _ = self.command_tx.send(Command::VideoInfo(info));
+    }
+
+    pub fn keyboard_input(&self, key: u32, pressed: bool) {
+        let state = if pressed { KeyState::Pressed } else { KeyState::Released };
+        let _ = self.command_tx.send(Command::KeyboardInput(key, state));
+    }
+
+    pub fn pointer_motion(&self, x: f64, y: f64) {
+        let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
+    }
+
+    pub fn pointer_motion_absolute(&self, x: f64, y: f64) {
+        let _ = self.command_tx.send(Command::PointerMotionAbsolute((x, y).into()));
+    }
+
+    pub fn pointer_button(&self, button: u32, pressed: bool) {
+        let state = if pressed { ButtonState::Pressed } else { ButtonState::Released };
+        let _ = self.command_tx.send(Command::PointerButton(button, state));
+    }
+
+    pub fn pointer_axis(&self, x: f64, y: f64) {
+        let _ = self.command_tx.send(Command::PointerAxis(x, y));
     }
 
     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {

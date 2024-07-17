@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "c-bindings"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "gstreamer",
  "gstreamer-video",

@@ -59,6 +59,7 @@ use smithay::{
         selection::data_device::DataDeviceState,
     },
 };
+use smithay::backend::input::AxisSource;
 use tracing::debug;
 
 mod focus;
@@ -476,6 +477,26 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::Quit) | Event::Closed => {
                     state.should_quit = true;
+                }
+                Event::Msg(Command::KeyboardInput(keycode, key_state)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.keyboard_input(time.as_millis() as u32, keycode, key_state);
+                }
+                Event::Msg(Command::PointerMotion(position)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.pointer_motion(time.as_nanos() as u64, position, position);
+                }
+                Event::Msg(Command::PointerMotionAbsolute(position)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.pointer_motion_absolute(time.as_nanos() as u64, position);
+                }
+                Event::Msg(Command::PointerButton(btn_code, btn_state)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.pointer_button(time.as_millis() as u32, btn_code, btn_state);
+                }
+                Event::Msg(Command::PointerAxis(horizontal_amount, vertical_amount)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.pointer_axis(time.as_millis() as u32, AxisSource::Wheel, horizontal_amount * 3.0 / 120.0, vertical_amount * 3.0 / 120.0, Some(horizontal_amount), Some(vertical_amount));
                 }
             };
         })

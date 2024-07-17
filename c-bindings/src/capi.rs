@@ -109,6 +109,36 @@ pub extern "C" fn display_set_video_info(dpy: *mut WaylandDisplay, info: *const 
 }
 
 #[no_mangle]
+pub extern "C" fn display_keyboard_input(dpy: *mut WaylandDisplay, key: c_uint, pressed: bool) {
+    let display = unsafe { &mut *dpy };
+    display.keyboard_input(key, pressed);
+}
+
+#[no_mangle]
+pub extern "C" fn display_pointer_motion(dpy: *mut WaylandDisplay, x: f64, y: f64) {
+    let display = unsafe { &mut *dpy };
+    display.pointer_motion(x, y);
+}
+
+#[no_mangle]
+pub extern "C" fn display_pointer_motion_absolute(dpy: *mut WaylandDisplay, x: f64, y: f64) {
+    let display = unsafe { &mut *dpy };
+    display.pointer_motion_absolute(x, y);
+}
+
+#[no_mangle]
+pub extern "C" fn display_pointer_button(dpy: *mut WaylandDisplay, button: c_uint, pressed: bool) {
+    let display = unsafe { &mut *dpy };
+    display.pointer_button(button, pressed);
+}
+
+#[no_mangle]
+pub extern "C" fn display_pointer_axis(dpy: *mut WaylandDisplay, x: f64, y: f64) {
+    let display = unsafe { &mut *dpy };
+    display.pointer_axis(x, y);
+}
+
+#[no_mangle]
 pub extern "C" fn display_get_frame(dpy: *mut WaylandDisplay) -> *mut GstBuffer {
     let display = unsafe { &mut *dpy };
     let _span = match display.tracer.as_ref() {

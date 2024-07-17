@@ -42,164 +42,240 @@ impl LibinputInterface for NixInterface {
 }
 
 impl State {
+    pub fn keyboard_input(&mut self, event_time_msec: u32, keycode: u32, state: KeyState) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.seat.get_keyboard().unwrap();
+
+        keyboard.input::<(), _>(
+            self,
+            keycode,
+            state,
+            serial,
+            event_time_msec,
+            |data, modifiers, handle| {
+                if state == KeyState::Pressed {
+                    if modifiers.ctrl
+                        && modifiers.shift
+                        && !modifiers.alt
+                        && !modifiers.logo
+                    {
+                        match handle.modified_sym() {
+                            Keysym::Tab => {
+                                if let Some(element) = data.space.elements().last().cloned()
+                                {
+                                    data.surpressed_keys.insert(keysyms::KEY_Tab);
+                                    let location =
+                                        data.space.element_location(&element).unwrap();
+                                    data.space.map_element(element.clone(), location, true);
+                                    data.seat.get_keyboard().unwrap().set_focus(
+                                        data,
+                                        Some(FocusTarget::from(element)),
+                                        serial,
+                                    );
+                                    return FilterResult::Intercept(());
+                                }
+                            }
+                            Keysym::Q => {
+                                if let Some(target) =
+                                    data.seat.get_keyboard().unwrap().current_focus()
+                                {
+                                    match target {
+                                        FocusTarget::Wayland(window) => {
+                                            window.toplevel().unwrap().send_close();
+                                        }
+                                        _ => return FilterResult::Forward,
+                                    };
+                                    data.surpressed_keys.insert(keysyms::KEY_Q);
+                                    return FilterResult::Intercept(());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    if data.surpressed_keys.remove(&handle.modified_sym().raw()) {
+                        return FilterResult::Intercept(());
+                    }
+                }
+
+                FilterResult::Forward
+            },
+        );
+    }
+
+    pub fn pointer_motion(&mut self, event_time_usec: u64, delta: Point<f64, Logical>, delta_unaccelerated: Point<f64, Logical>) {
+        self.last_pointer_movement = Instant::now();
+        let serial = SERIAL_COUNTER.next_serial();
+
+        let pointer = self.seat.get_pointer().unwrap();
+        let under = self
+            .space
+            .element_under(self.pointer_location)
+            .map(|(w, pos)| (w.clone().into(), pos));
+
+        /* Check if the pointer is locked or confined (pointer constraints protocol) */
+        let mut pointer_locked = false;
+        let mut pointer_confined = false;
+        let mut confine_region = None;
+        if let Some((surface, surface_loc)) = under
+            .as_ref()
+            .and_then(|(target, l): &(FocusTarget, Point<i32, Logical>)| Some((target.wl_surface()?, l)))
+        {
+            with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
+                Some(constraint) if constraint.is_active() => {
+                    // Constraint does not apply if not within region
+                    if !constraint.region().map_or(true, |x| {
+                        x.contains(pointer.current_location().to_i32_round() - *surface_loc)
+                    }) {
+                        return;
+                    }
+                    match &*constraint {
+                        PointerConstraint::Locked(_locked) => {
+                            pointer_locked = true;
+                        }
+                        PointerConstraint::Confined(confine) => {
+                            pointer_confined = true;
+                            confine_region = confine.region().cloned();
+                        }
+                    }
+                }
+                _ => {}
+            });
+        }
+
+        self.pointer_location += delta;
+        self.pointer_location = self.clamp_coords(self.pointer_location);
+        let new_under = self
+            .space
+            .element_under(self.pointer_location)
+            .map(|(w, pos)| (w.clone().into(), pos));
+
+
+        // If pointer is locked, only emit relative motion
+        if !pointer_locked {
+            pointer.motion(
+                self,
+                new_under.clone(),
+                &MotionEvent {
+                    location: self.pointer_location,
+                    serial,
+                    time: (event_time_usec / 1000) as u32,
+                },
+            );
+        }
+
+        /* Relative motion is always applied */
+        pointer.relative_motion(
+            self,
+            under,
+            &RelativeMotionEvent {
+                delta,
+                delta_unaccel: delta_unaccelerated,
+                utime: event_time_usec,
+            },
+        );
+
+        // If pointer is now in a constraint region, activate it
+        if let Some((under, surface_location)) =
+            new_under.and_then(|(target, loc)| Some((target.wl_surface()?, loc)))
+        {
+            with_pointer_constraint(&under, &pointer, |constraint| match constraint {
+                Some(constraint) if !constraint.is_active() => {
+                    let point = self.pointer_location.to_i32_round() - surface_location;
+                    if constraint.region().map_or(true, |region| region.contains(point)) {
+                        constraint.activate();
+                    }
+                }
+                _ => {}
+            });
+        }
+
+        pointer.frame(self);
+    }
+
+    pub fn pointer_motion_absolute(&mut self, event_time_usec: u64, position: Point<f64, Logical>) {
+        self.last_pointer_movement = Instant::now();
+        let serial = SERIAL_COUNTER.next_serial();
+        let relative_movement = (position.x - self.pointer_location.x, position.y - self.pointer_location.y).into();
+        self.pointer_location = position;
+
+        let pointer = self.seat.get_pointer().unwrap();
+        let under = self
+            .space
+            .element_under(self.pointer_location)
+            .map(|(w, pos)| (w.clone().into(), pos));
+        pointer.motion(
+            self,
+            under.clone(),
+            &MotionEvent {
+                location: self.pointer_location,
+                serial,
+                time: (event_time_usec / 1000) as u32,
+            },
+        );
+
+        pointer.relative_motion(
+            self,
+            under,
+            &RelativeMotionEvent {
+                delta: relative_movement,
+                delta_unaccel: relative_movement,
+                utime: event_time_usec,
+            });
+
+        pointer.frame(self);
+    }
+
+    pub fn pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
+        self.last_pointer_movement = Instant::now();
+        let serial = SERIAL_COUNTER.next_serial();
+
+        if ButtonState::Pressed == state {
+            self.update_keyboard_focus(serial);
+        };
+        self.seat.get_pointer().unwrap().button(
+            self,
+            &ButtonEvent {
+                button: button_code,
+                state: state.try_into().unwrap(),
+                serial,
+                time: event_time_msec,
+            },
+        );
+    }
+
+    pub fn pointer_axis(&mut self, event_time_msec: u32, source: AxisSource, horizontal_amount: f64, vertical_amount: f64, horizontal_amount_discrete: Option<f64>, vertical_amount_discrete: Option<f64>) {
+        let mut frame = AxisFrame::new(event_time_msec).source(source);
+        if horizontal_amount != 0.0 {
+            frame = frame.value(Axis::Horizontal, horizontal_amount);
+            if let Some(discrete) = horizontal_amount_discrete {
+                frame = frame.v120(Axis::Horizontal, discrete as i32);
+            }
+        } else if source == AxisSource::Finger {
+            frame = frame.stop(Axis::Horizontal);
+        }
+        if vertical_amount != 0.0 {
+            frame = frame.value(Axis::Vertical, vertical_amount);
+            if let Some(discrete) = vertical_amount_discrete {
+                frame = frame.v120(Axis::Vertical, discrete as i32);
+            }
+        } else if source == AxisSource::Finger {
+            frame = frame.stop(Axis::Vertical);
+        }
+        let pointer = self.seat.get_pointer().unwrap();
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
     pub fn process_input_event(&mut self, event: InputEvent<LibinputInputBackend>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
-                let keycode = event.key_code();
-                let state = event.state();
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = event.time_msec();
-                let keyboard = self.seat.get_keyboard().unwrap();
-
-                keyboard.input::<(), _>(
-                    self,
-                    keycode,
-                    state,
-                    serial,
-                    time,
-                    |data, modifiers, handle| {
-                        if state == KeyState::Pressed {
-                            if modifiers.ctrl
-                                && modifiers.shift
-                                && !modifiers.alt
-                                && !modifiers.logo
-                            {
-                                match handle.modified_sym() {
-                                    Keysym::Tab => {
-                                        if let Some(element) = data.space.elements().last().cloned()
-                                        {
-                                            data.surpressed_keys.insert(keysyms::KEY_Tab);
-                                            let location =
-                                                data.space.element_location(&element).unwrap();
-                                            data.space.map_element(element.clone(), location, true);
-                                            data.seat.get_keyboard().unwrap().set_focus(
-                                                data,
-                                                Some(FocusTarget::from(element)),
-                                                serial,
-                                            );
-                                            return FilterResult::Intercept(());
-                                        }
-                                    }
-                                    Keysym::Q => {
-                                        if let Some(target) =
-                                            data.seat.get_keyboard().unwrap().current_focus()
-                                        {
-                                            match target {
-                                                FocusTarget::Wayland(window) => {
-                                                    window.toplevel().unwrap().send_close();
-                                                }
-                                                _ => return FilterResult::Forward,
-                                            };
-                                            data.surpressed_keys.insert(keysyms::KEY_Q);
-                                            return FilterResult::Intercept(());
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        } else {
-                            if data.surpressed_keys.remove(&handle.modified_sym().raw()) {
-                                return FilterResult::Intercept(());
-                            }
-                        }
-
-                        FilterResult::Forward
-                    },
-                );
+                self.keyboard_input(event.time_msec(), event.key_code(), event.state());
             }
             InputEvent::PointerMotion { event, .. } => {
-                self.last_pointer_movement = Instant::now();
-                let serial = SERIAL_COUNTER.next_serial();
-                let delta = event.delta();
-
-                let pointer = self.seat.get_pointer().unwrap();
-                let under = self
-                    .space
-                    .element_under(self.pointer_location)
-                    .map(|(w, pos)| (w.clone().into(), pos));
-
-                /* Check if the pointer is locked or confined (pointer constraints protocol) */
-                let mut pointer_locked = false;
-                let mut pointer_confined = false;
-                let mut confine_region = None;
-                if let Some((surface, surface_loc)) = under
-                    .as_ref()
-                    .and_then(|(target, l): &(FocusTarget, Point<i32, Logical>)| Some((target.wl_surface()?, l)))
-                {
-                    with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
-                        Some(constraint) if constraint.is_active() => {
-                            // Constraint does not apply if not within region
-                            if !constraint.region().map_or(true, |x| {
-                                x.contains(pointer.current_location().to_i32_round() - *surface_loc)
-                            }) {
-                                return;
-                            }
-                            match &*constraint {
-                                PointerConstraint::Locked(_locked) => {
-                                    pointer_locked = true;
-                                }
-                                PointerConstraint::Confined(confine) => {
-                                    pointer_confined = true;
-                                    confine_region = confine.region().cloned();
-                                }
-                            }
-                        }
-                        _ => {}
-                    });
-                }
-
-                self.pointer_location += delta;
-                self.pointer_location = self.clamp_coords(self.pointer_location);
-                let new_under = self
-                    .space
-                    .element_under(self.pointer_location)
-                    .map(|(w, pos)| (w.clone().into(), pos));
-
-
-                // If pointer is locked, only emit relative motion
-                if !pointer_locked {
-                    pointer.motion(
-                        self,
-                        new_under.clone(),
-                        &MotionEvent {
-                            location: self.pointer_location,
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                }
-
-                /* Relative motion is always applied */
-                pointer.relative_motion(
-                    self,
-                    under,
-                    &RelativeMotionEvent {
-                        delta,
-                        delta_unaccel: event.delta_unaccel(),
-                        utime: event.time_usec(),
-                    },
-                );
-
-                // If pointer is now in a constraint region, activate it
-                if let Some((under, surface_location)) =
-                    new_under.and_then(|(target, loc)| Some((target.wl_surface()?, loc)))
-                {
-                    with_pointer_constraint(&under, &pointer, |constraint| match constraint {
-                        Some(constraint) if !constraint.is_active() => {
-                            let point = self.pointer_location.to_i32_round() - surface_location;
-                            if constraint.region().map_or(true, |region| region.contains(point)) {
-                                constraint.activate();
-                            }
-                        }
-                        _ => {}
-                    });
-                }
-
-                pointer.frame(self);
+                self.pointer_motion(event.time_usec(), event.delta(), event.delta_unaccel());
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                self.last_pointer_movement = Instant::now();
-                let serial = SERIAL_COUNTER.next_serial();
                 if let Some(output) = self.output.as_ref() {
                     let output_size = output
                         .current_mode()
@@ -211,55 +287,12 @@ impl State {
 
                     let new_x = event.absolute_x_transformed(output_size.w);
                     let new_y = event.absolute_y_transformed(output_size.h);
-                    let relative_movement = (new_x - self.pointer_location.x, new_y - self.pointer_location.y).into();
-                    self.pointer_location = (new_x, new_y).into();
 
-                    let pointer = self.seat.get_pointer().unwrap();
-                    let under = self
-                        .space
-                        .element_under(self.pointer_location)
-                        .map(|(w, pos)| (w.clone().into(), pos));
-                    pointer.motion(
-                        self,
-                        under.clone(),
-                        &MotionEvent {
-                            location: self.pointer_location,
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-
-                    pointer.relative_motion(
-                        self,
-                        under,
-                        &RelativeMotionEvent {
-                            delta: relative_movement,
-                            delta_unaccel: relative_movement,
-                            utime: event.time_usec(),
-                        },
-                    );
-
-                    pointer.frame(self);
+                    self.pointer_motion_absolute(event.time_usec(), (new_x, new_y).into());
                 }
             }
             InputEvent::PointerButton { event, .. } => {
-                self.last_pointer_movement = Instant::now();
-                let serial = SERIAL_COUNTER.next_serial();
-                let button = event.button_code();
-
-                let state = ButtonState::from(event.state());
-                if ButtonState::Pressed == state {
-                    self.update_keyboard_focus(serial);
-                };
-                self.seat.get_pointer().unwrap().button(
-                    self,
-                    &ButtonEvent {
-                        button,
-                        state: state.try_into().unwrap(),
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
+                self.pointer_button(event.time_msec(), event.button(), event.state());
             }
             InputEvent::PointerAxis { event, .. } => {
                 self.last_pointer_movement = Instant::now();
@@ -274,28 +307,14 @@ impl State {
                 let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
                 let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
 
-                {
-                    let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
-                    if horizontal_amount != 0.0 {
-                        frame = frame.value(Axis::Horizontal, horizontal_amount);
-                        if let Some(discrete) = horizontal_amount_discrete {
-                            frame = frame.v120(Axis::Horizontal, discrete as i32);
-                        }
-                    } else if event.source() == AxisSource::Finger {
-                        frame = frame.stop(Axis::Horizontal);
-                    }
-                    if vertical_amount != 0.0 {
-                        frame = frame.value(Axis::Vertical, vertical_amount);
-                        if let Some(discrete) = vertical_amount_discrete {
-                            frame = frame.v120(Axis::Vertical, discrete as i32);
-                        }
-                    } else if event.source() == AxisSource::Finger {
-                        frame = frame.stop(Axis::Vertical);
-                    }
-                    let pointer = self.seat.get_pointer().unwrap();
-                    pointer.axis(self, frame);
-                    pointer.frame(self);
-                }
+                self.pointer_axis(
+                    event.time_msec(),
+                    event.source(),
+                    horizontal_amount,
+                    vertical_amount,
+                    horizontal_amount_discrete,
+                    vertical_amount_discrete,
+                );
             }
             _ => {}
         }
