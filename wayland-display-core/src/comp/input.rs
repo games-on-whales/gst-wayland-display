@@ -1,9 +1,12 @@
 use super::{focus::FocusTarget, State};
+use smithay::input::keyboard::Keysym;
+use smithay::reexports::input::event::pointer::PointerEventTrait;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::{
     backend::{
         input::{
-            Axis, AxisSource, Event, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent,
-            PointerButtonEvent, PointerMotionEvent, ButtonState,
+            Axis, AxisSource, ButtonState, Event, InputEvent, KeyState, KeyboardKeyEvent,
+            PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         },
         libinput::LibinputInputBackend,
     },
@@ -13,28 +16,23 @@ use smithay::{
     },
     reexports::{
         input::LibinputInterface,
-        rustix::{
-            fs::{open, OFlags, Mode}
-        },
+        rustix::fs::{open, Mode, OFlags},
     },
     utils::{Logical, Point, Serial, SERIAL_COUNTER},
     wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint},
 };
-use std::{
-    os::unix::io::OwnedFd,
-    path::Path,
-    time::Instant,
-};
-use smithay::input::keyboard::Keysym;
-use smithay::reexports::input::event::pointer::PointerEventTrait;
-use smithay::wayland::seat::WaylandFocus;
+use std::{os::unix::io::OwnedFd, path::Path, time::Instant};
 
 pub struct NixInterface;
 
 impl LibinputInterface for NixInterface {
     fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        open(path, OFlags::from_bits_truncate(flags as u32), Mode::empty())
-            .map_err(|err| err.raw_os_error())
+        open(
+            path,
+            OFlags::from_bits_truncate(flags as u32),
+            Mode::empty(),
+        )
+        .map_err(|err| err.raw_os_error())
     }
     fn close_restricted(&mut self, fd: OwnedFd) {
         let _ = fd;
@@ -54,18 +52,12 @@ impl State {
             event_time_msec,
             |data, modifiers, handle| {
                 if state == KeyState::Pressed {
-                    if modifiers.ctrl
-                        && modifiers.shift
-                        && !modifiers.alt
-                        && !modifiers.logo
-                    {
+                    if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.logo {
                         match handle.modified_sym() {
                             Keysym::Tab => {
-                                if let Some(element) = data.space.elements().last().cloned()
-                                {
+                                if let Some(element) = data.space.elements().last().cloned() {
                                     data.surpressed_keys.insert(keysyms::KEY_Tab);
-                                    let location =
-                                        data.space.element_location(&element).unwrap();
+                                    let location = data.space.element_location(&element).unwrap();
                                     data.space.map_element(element.clone(), location, true);
                                     data.seat.get_keyboard().unwrap().set_focus(
                                         data,
@@ -103,7 +95,12 @@ impl State {
         );
     }
 
-    pub fn pointer_motion(&mut self, event_time_usec: u64, delta: Point<f64, Logical>, delta_unaccelerated: Point<f64, Logical>) {
+    pub fn pointer_motion(
+        &mut self,
+        event_time_usec: u64,
+        delta: Point<f64, Logical>,
+        delta_unaccelerated: Point<f64, Logical>,
+    ) {
         self.last_pointer_movement = Instant::now();
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -117,9 +114,12 @@ impl State {
         let mut pointer_locked = false;
         let mut pointer_confined = false;
         let mut confine_region = None;
-        if let Some((surface, surface_loc)) = under
-            .as_ref()
-            .and_then(|(target, l): &(FocusTarget, Point<i32, Logical>)| Some((target.wl_surface()?, l)))
+        if let Some((surface, surface_loc)) =
+            under
+                .as_ref()
+                .and_then(|(target, l): &(FocusTarget, Point<i32, Logical>)| {
+                    Some((target.wl_surface()?, l))
+                })
         {
             with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
                 Some(constraint) if constraint.is_active() => {
@@ -148,8 +148,7 @@ impl State {
         let new_under = self
             .space
             .element_under(self.pointer_location)
-            .map(|(w, pos)| (w.clone().into(), pos));
-
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
 
         // If pointer is locked, only emit relative motion
         if !pointer_locked {
@@ -167,7 +166,7 @@ impl State {
         /* Relative motion is always applied */
         pointer.relative_motion(
             self,
-            under,
+            under.map(|(w, pos)| (w, pos.to_f64())),
             &RelativeMotionEvent {
                 delta,
                 delta_unaccel: delta_unaccelerated,
@@ -176,13 +175,18 @@ impl State {
         );
 
         // If pointer is now in a constraint region, activate it
-        if let Some((under, surface_location)) =
-            new_under.and_then(|(target, loc)| Some((target.wl_surface()?, loc)))
+        if let Some((under, surface_location)) = new_under
+            .as_ref()
+            .and_then(|(target, loc)| Some((target.wl_surface()?, loc)))
         {
             with_pointer_constraint(&under, &pointer, |constraint| match constraint {
                 Some(constraint) if !constraint.is_active() => {
-                    let point = self.pointer_location.to_i32_round() - surface_location;
-                    if constraint.region().map_or(true, |region| region.contains(point)) {
+                    let point =
+                        self.pointer_location.to_i32_round() - surface_location.to_i32_round();
+                    if constraint
+                        .region()
+                        .map_or(true, |region| region.contains(point))
+                    {
                         constraint.activate();
                     }
                 }
@@ -196,14 +200,18 @@ impl State {
     pub fn pointer_motion_absolute(&mut self, event_time_usec: u64, position: Point<f64, Logical>) {
         self.last_pointer_movement = Instant::now();
         let serial = SERIAL_COUNTER.next_serial();
-        let relative_movement = (position.x - self.pointer_location.x, position.y - self.pointer_location.y).into();
+        let relative_movement = (
+            position.x - self.pointer_location.x,
+            position.y - self.pointer_location.y,
+        )
+            .into();
         self.pointer_location = position;
 
         let pointer = self.seat.get_pointer().unwrap();
         let under = self
             .space
             .element_under(self.pointer_location)
-            .map(|(w, pos)| (w.clone().into(), pos));
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64().clone()));
         pointer.motion(
             self,
             under.clone(),
@@ -221,7 +229,8 @@ impl State {
                 delta: relative_movement,
                 delta_unaccel: relative_movement,
                 utime: event_time_usec,
-            });
+            },
+        );
 
         pointer.frame(self);
     }
@@ -244,7 +253,15 @@ impl State {
         );
     }
 
-    pub fn pointer_axis(&mut self, event_time_msec: u32, source: AxisSource, horizontal_amount: f64, vertical_amount: f64, horizontal_amount_discrete: Option<f64>, vertical_amount_discrete: Option<f64>) {
+    pub fn pointer_axis(
+        &mut self,
+        event_time_msec: u32,
+        source: AxisSource,
+        horizontal_amount: f64,
+        vertical_amount: f64,
+        horizontal_amount_discrete: Option<f64>,
+        vertical_amount_discrete: Option<f64>,
+    ) {
         let mut frame = AxisFrame::new(event_time_msec).source(source);
         if horizontal_amount != 0.0 {
             frame = frame.value(Axis::Horizontal, horizontal_amount);

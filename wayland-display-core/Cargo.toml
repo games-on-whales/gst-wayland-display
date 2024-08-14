@@ -21,8 +21,8 @@ wayland-backend = "0.3.3"
 wayland-scanner = "0.31.1"
 
 [dependencies.smithay]
-git = "https://github.com/smithay/Smithay"
-rev = "fe04633"
+git = "https://github.com/games-on-whales/smithay"
+rev = "ef9782b"
 default-features = false
 features = [
     "backend_drm",

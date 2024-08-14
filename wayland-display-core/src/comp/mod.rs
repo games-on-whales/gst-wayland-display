@@ -348,7 +348,7 @@ pub(crate) fn init(
                                 states
                                     .data_map
                                     .get::<XdgToplevelSurfaceData>()
-                                    .map(|_attrs| states.cached_state.current::<SurfaceCachedState>().max_size)
+                                    .map(|_attrs| states.cached_state.get::<SurfaceCachedState>().current().max_size)
                             })
                                 .unwrap_or(new_size),
                         );
@@ -387,9 +387,10 @@ pub(crate) fn init(
                         };
                         if let Err(_) = match state.create_frame() {
                             Ok((buf, render_result)) => {
-                                state.last_render = Some(now);
                                 render_result.sync.wait().expect("Error during render_result.sync"); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
                                 let res = buffer_sender.send(Ok(buf));
+                                let rendered_states = &render_result.states;
+                                let rendered_damage = render_result.damage.is_some();
 
                                 if let Some(output) = state.output.as_ref() {
                                     let mut output_presentation_feedback =
@@ -400,7 +401,7 @@ pub(crate) fn init(
                                                 surface,
                                                 output,
                                                 states,
-                                                &render_result.states,
+                                                rendered_states,
                                                 |next_output, _, _, _| next_output,
                                             );
                                         });
@@ -416,12 +417,12 @@ pub(crate) fn init(
                                             |surface, _| {
                                                 surface_presentation_feedback_flags_from_states(
                                                     surface,
-                                                    &render_result.states,
+                                                    rendered_states,
                                                 )
                                             },
                                         );
                                     }
-                                    if render_result.damage.is_some() {
+                                    if rendered_damage {
                                         output_presentation_feedback.presented(
                                             state.clock.now(),
                                             Duration::from_millis(output
@@ -445,6 +446,7 @@ pub(crate) fn init(
                                     }
                                 }
 
+                                state.last_render = Some(now);
                                 res
                             }
                             Err(err) => {

@@ -1,18 +1,20 @@
 use smithay::{
-    backend::renderer::utils::{on_commit_buffer_handler},
+    backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor,
     desktop::PopupKind,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
-        wayland_server::{Client,
-                         protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface}},
+        wayland_server::{
+            protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+            Client,
+        },
     },
     utils::{Size, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
-        compositor::{with_states, CompositorHandler, CompositorState, CompositorClientState},
+        compositor::{with_states, CompositorClientState, CompositorHandler, CompositorState},
         seat::WaylandFocus,
-        shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData, SurfaceCachedState},
+        shell::xdg::{SurfaceCachedState, XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
 };
 
@@ -37,7 +39,7 @@ impl CompositorHandler for State {
         if let Some(window) = self
             .space
             .elements()
-            .find(|w| w.wl_surface().as_ref() == Some(surface))
+            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
         {
             window.on_commit();
         }
@@ -47,7 +49,7 @@ impl CompositorHandler for State {
         if let Some(idx) = self
             .pending_windows
             .iter_mut()
-            .position(|w| w.wl_surface().as_ref() == Some(surface))
+            .position(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
         {
             let window = self.pending_windows.swap_remove(idx);
 
@@ -58,7 +60,7 @@ impl CompositorHandler for State {
 
                 (
                     attributes_guard.initial_configure_sent,
-                    states.cached_state.current::<SurfaceCachedState>().max_size
+                    states.cached_state.get::<SurfaceCachedState>().current().max_size,
                 )
             });
 

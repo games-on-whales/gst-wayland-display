@@ -1,8 +1,8 @@
 use smithay::{
     delegate_xdg_shell,
     desktop::{
-        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupPointerGrab,
-        PopupUngrabStrategy, Window,
+        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind,
+        PopupPointerGrab, PopupUngrabStrategy, Window,
     },
     input::{pointer::Focus, Seat},
     reexports::wayland_server::protocol::wl_seat::WlSeat,
@@ -40,7 +40,7 @@ impl XdgShellHandler for State {
         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
             self.space
                 .elements()
-                .find(|w| w.wl_surface().map(|s| s == root).unwrap_or(false))
+                .find(|w| w.wl_surface().map(|s| *s == root).unwrap_or(false))
                 .cloned()
                 .map(FocusTarget::from)
         }) {
@@ -49,19 +49,19 @@ impl XdgShellHandler for State {
                 if let Some(keyboard) = seat.get_keyboard() {
                     if keyboard.is_grabbed()
                         && !(keyboard.has_grab(serial)
-                        || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+                            || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
                     {
                         grab.ungrab(PopupUngrabStrategy::All);
                         return;
                     }
                     keyboard.set_focus(self, grab.current_grab(), serial);
-                    keyboard.set_grab(PopupKeyboardGrab::new(&grab), serial);
+                    keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
                 }
                 if let Some(pointer) = seat.get_pointer() {
                     if pointer.is_grabbed()
                         && !(pointer.has_grab(serial)
-                        || pointer
-                        .has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+                            || pointer
+                                .has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
                     {
                         grab.ungrab(PopupUngrabStrategy::All);
                         return;
@@ -72,7 +72,12 @@ impl XdgShellHandler for State {
         }
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             let geometry = positioner.get_geometry();
             state.geometry = geometry;
@@ -88,7 +93,11 @@ impl State {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self.space.elements().find(|w| w.toplevel().unwrap().wl_surface() == &root) else {
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
+        else {
             return;
         };
 
@@ -107,7 +116,5 @@ impl State {
         });
     }
 }
-
-
 
 delegate_xdg_shell!(State);

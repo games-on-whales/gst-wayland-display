@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use smithay::{
     backend::input::KeyState,
     desktop::{PopupKind, Window, WindowSurface},
@@ -243,10 +244,10 @@ impl PointerTarget<State> for FocusTarget {
 }
 
 impl WaylandFocus for FocusTarget {
-    fn wl_surface(&self) -> Option<WlSurface> {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
         match self {
             FocusTarget::Wayland(w) => w.wl_surface(),
-            FocusTarget::Popup(p) => Some(p.wl_surface().clone()),
+            FocusTarget::Popup(p) => Some(Cow::Borrowed(p.wl_surface())),
         }
     }
 
