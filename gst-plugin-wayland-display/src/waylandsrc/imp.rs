@@ -15,9 +15,9 @@ use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
 use gst_base::traits::BaseSrcExt;
 
-use waylanddisplaycore::WaylandDisplay;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
+use waylanddisplaycore::WaylandDisplay;
 
 use crate::utils::{GstLayer, CAT};
 
@@ -56,21 +56,22 @@ impl ObjectSubclass for WaylandDisplaySrc {
 impl ObjectImpl for WaylandDisplaySrc {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
-            vec![glib::ParamSpecString::builder("render-node")
-                     .nick("DRM Render Node")
-                     .blurb("DRM Render Node to use (e.g. /dev/dri/renderD128")
-                     .construct()
-                     .build(),
-                 glib::ParamSpecString::builder("mouse")
-                     .nick("Input Device")
-                     .blurb("Input device to use (e.g. /dev/input/event0")
-                     .construct()
-                     .build(),
-                 glib::ParamSpecString::builder("keyboard")
-                     .nick("Input Device")
-                     .blurb("Input device to use (e.g. /dev/input/event0")
-                     .construct()
-                     .build(),
+            vec![
+                glib::ParamSpecString::builder("render-node")
+                    .nick("DRM Render Node")
+                    .blurb("DRM Render Node to use (e.g. /dev/dri/renderD128")
+                    .construct()
+                    .build(),
+                glib::ParamSpecString::builder("mouse")
+                    .nick("Input Device")
+                    .blurb("Input device to use (e.g. /dev/input/event0")
+                    .construct()
+                    .build(),
+                glib::ParamSpecString::builder("keyboard")
+                    .nick("Input Device")
+                    .blurb("Input device to use (e.g. /dev/input/event0")
+                    .construct()
+                    .build(),
             ]
         });
 
@@ -86,14 +87,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .expect("Type checked upstream");
             }
             "mouse" => {
-                let actual_val = value.get::<Option<String>>().expect("Type checked upstream");
+                let actual_val = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
                 if actual_val.is_some() {
                     let mut settings = self.settings.lock().unwrap();
                     settings.input_devices.push(actual_val.unwrap());
                 }
             }
             "keyboard" => {
-                let actual_val = value.get::<Option<String>>().expect("Type checked upstream");
+                let actual_val = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
                 if actual_val.is_some() {
                     let mut settings = self.settings.lock().unwrap();
                     settings.input_devices.push(actual_val.unwrap());
@@ -115,15 +120,11 @@ impl ObjectImpl for WaylandDisplaySrc {
             }
             "mouse" => {
                 let settings = self.settings.lock().unwrap();
-                settings.input_devices
-                    .join(",")
-                    .to_value()
+                settings.input_devices.join(",").to_value()
             }
             "keyboard" => {
                 let settings = self.settings.lock().unwrap();
-                settings.input_devices
-                    .join(",")
-                    .to_value()
+                settings.input_devices.join(",").to_value()
             }
             _ => unreachable!(),
         }
@@ -171,7 +172,7 @@ impl ElementImpl for WaylandDisplaySrc {
                 gst::PadPresence::Always,
                 &caps,
             )
-                .unwrap();
+            .unwrap();
 
             vec![src_pad_template]
         });
@@ -242,6 +243,70 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 }
 
                 return true;
+            } else if structure.has_name("MouseMoveAbsolute") {
+                let mut state = self.state.lock().unwrap();
+                let display = &mut state.as_mut().unwrap().display;
+
+                let x = structure
+                    .get::<f64>("pointer_x")
+                    .expect("Should contain pointer_x");
+                let y = structure
+                    .get::<f64>("pointer_y")
+                    .expect("Should contain pointer_y");
+
+                display.pointer_motion_absolute(x, y);
+
+                return true;
+            } else if structure.has_name("MouseMoveRelative") {
+                let mut state = self.state.lock().unwrap();
+                let display = &mut state.as_mut().unwrap().display;
+
+                let x = structure
+                    .get::<f64>("pointer_x")
+                    .expect("Should contain pointer_x");
+                let y = structure
+                    .get::<f64>("pointer_y")
+                    .expect("Should contain pointer_y");
+
+                display.pointer_motion(x, y);
+
+                return true;
+            } else if structure.has_name("MouseButton") {
+                let mut state = self.state.lock().unwrap();
+                let display = &mut state.as_mut().unwrap().display;
+
+                let button = structure
+                    .get::<u32>("button")
+                    .expect("Should contain button");
+                let pressed = structure
+                    .get::<bool>("pressed")
+                    .expect("Should contain pressed");
+
+                display.pointer_button(button, pressed);
+
+                return true;
+            } else if structure.has_name("MouseAxis") {
+                let mut state = self.state.lock().unwrap();
+                let display = &mut state.as_mut().unwrap().display;
+
+                let x = structure.get::<f64>("x").expect("Should contain x");
+                let y = structure.get::<f64>("y").expect("Should contain y");
+
+                display.pointer_axis(x, y);
+
+                return true;
+            } else if structure.has_name("KeyboardKey") {
+                let mut state = self.state.lock().unwrap();
+                let display = &mut state.as_mut().unwrap().display;
+
+                let key = structure.get::<u32>("key").expect("Should contain key");
+                let pressed = structure
+                    .get::<bool>("pressed")
+                    .expect("Should contain pressed");
+
+                display.keyboard_input(key, pressed);
+
+                return true;
             }
         }
         self.parent_event(event)
@@ -270,7 +335,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
         let subscriber = Registry::default().with(GstLayer);
 
-        let Ok(mut display) = tracing::subscriber::with_default(subscriber, || WaylandDisplay::new(settings.render_node.clone())) else {
+        let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
+            WaylandDisplay::new(settings.render_node.clone())
+        }) else {
             return Err(gst::error_msg!(LibraryError::Failed, ("Failed to open drm node {}, if you want to utilize software rendering set `render-node=software`.", settings.render_node.as_deref().unwrap_or("/dev/dri/renderD128"))));
         };
 
