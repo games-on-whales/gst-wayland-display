@@ -242,7 +242,8 @@ impl State {
         if ButtonState::Pressed == state {
             self.update_keyboard_focus(serial);
         };
-        self.seat.get_pointer().unwrap().button(
+        let pointer = self.seat.get_pointer().unwrap();
+        pointer.button(
             self,
             &ButtonEvent {
                 button: button_code,
@@ -251,6 +252,7 @@ impl State {
                 time: event_time_msec,
             },
         );
+        pointer.frame(self);
     }
 
     pub fn pointer_axis(
