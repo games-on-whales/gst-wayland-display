@@ -12,8 +12,8 @@ use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use utils::RenderTarget;
 
-pub(crate) mod comp;
 pub(crate) mod utils;
+pub(crate) mod comp;
 pub(crate) mod wayland;
 
 pub(crate) enum Command {

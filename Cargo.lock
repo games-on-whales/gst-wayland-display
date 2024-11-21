@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "c-bindings"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "gstreamer",
  "gstreamer-video",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "gst-plugin-wayland-display"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "gst-plugin-version-helper",
  "gstreamer",
@@ -1055,6 +1055,7 @@ dependencies = [
  "appendlist",
  "bitflags 2.4.1",
  "calloop",
+ "cc",
  "cgmath",
  "cursor-icon",
  "downcast-rs",
@@ -1070,6 +1071,7 @@ dependencies = [
  "libc",
  "libloading",
  "once_cell",
+ "pkg-config",
  "profiling",
  "rand",
  "rustix",

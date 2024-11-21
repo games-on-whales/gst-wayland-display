@@ -27,6 +27,7 @@ default-features = false
 features = [
     "backend_drm",
     "backend_egl",
+    "backend_gbm",
     "backend_libinput",
     "backend_udev",
     "renderer_gl",
