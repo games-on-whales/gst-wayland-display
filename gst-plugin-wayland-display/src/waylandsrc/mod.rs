@@ -11,7 +11,7 @@ pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gst::Element::register(
         Some(plugin),
         "waylanddisplaysrc",
-        gst::Rank::Marginal,
+        gst::Rank::MARGINAL,
         WaylandDisplaySrc::static_type(),
     )
 }

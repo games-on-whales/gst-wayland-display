@@ -20,7 +20,9 @@ doc = []
 
 [dependencies]
 gst.workspace = true
-gst-base = { version = "0.20", package = "gstreamer-base", features = ["v1_18"] }
+gst-base = { version = "0.23.2", package = "gstreamer-base", features = ["v1_24"] }
+gstreamer-allocators = { version = "0.23.2", package = "gstreamer-allocators", features = ["v1_24"] }
+
 gst-video.workspace = true
 wayland-display-core = { path = "../wayland-display-core" }
 tracing.workspace = true

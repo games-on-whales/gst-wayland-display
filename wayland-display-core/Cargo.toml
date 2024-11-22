@@ -19,6 +19,7 @@ tracing.workspace = true
 once_cell.workspace = true
 wayland-backend = "0.3.3"
 wayland-scanner = "0.31.1"
+gstreamer-allocators = {version = "0.23.2", package = "gstreamer-allocators", features = ["v1_24"]}
 
 [dependencies.smithay]
 git = "https://github.com/games-on-whales/smithay"

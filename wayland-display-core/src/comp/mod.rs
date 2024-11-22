@@ -1,5 +1,5 @@
 use super::Command;
-use gst_video::VideoInfo;
+use gst_video::{VideoFormat, VideoInfo};
 use smithay::backend::input::AxisSource;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::{
@@ -67,7 +67,7 @@ mod rendering;
 pub use self::focus::*;
 pub use self::input::*;
 pub use self::rendering::*;
-use crate::utils::allocator::{Allocator, AllocatorType, GLESAllocator};
+use crate::utils::allocator::{GsBufferType, GsDmaBuf, GsGlesbuffer};
 use crate::utils::renderer::setup_renderer;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
 
@@ -89,7 +89,7 @@ pub(crate) struct State {
 
     // render
     dtr: Option<OutputDamageTracker>,
-    buffer_allocator: Option<AllocatorType>,
+    output_buffer: Option<GsBufferType>,
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
@@ -202,7 +202,7 @@ pub(crate) fn init(
 
         renderer,
         dtr: None,
-        buffer_allocator: None,
+        output_buffer: None,
         dmabuf_global,
         video_info: None,
         last_render: None,
@@ -284,14 +284,25 @@ pub(crate) fn init(
                     state.space.map_output(&output, (0, 0));
                     state.dtr = Some(dtr);
                     state.pointer_location = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-                    let mut allocator = AllocatorType::GLES(GLESAllocator::default());
-                    allocator.alloc_buffer(
-                        &mut state.renderer,
-                        Fourcc::try_from(info.format().to_fourcc()).unwrap_or(Fourcc::Abgr8888),
-                        info.width() as i32,
-                        info.height() as i32,
-                    );
-                    state.buffer_allocator = Some(allocator);
+                    match render_target {
+                        RenderTarget::Hardware(_) => {
+                            if info.format() == VideoFormat::DmaDrm {
+                                let allocator = GsDmaBuf::new(render_node.unwrap(), info.clone())
+                                    .expect("Failed to create GsDmaBuf");
+                                state.output_buffer = Some(GsBufferType::DMA(allocator));
+                            } else {
+                                let allocator =
+                                    GsGlesbuffer::new(&mut state.renderer, info.clone())
+                                        .expect("Failed to create GsGlesbuffer");
+                                state.output_buffer = Some(GsBufferType::RAW(allocator));
+                            }
+                        }
+                        RenderTarget::Software => {
+                            let allocator = GsGlesbuffer::new(&mut state.renderer, info.clone())
+                                .expect("Failed to create GsGlesbuffer");
+                            state.output_buffer = Some(GsBufferType::RAW(allocator));
+                        }
+                    }
                     state.video_info = Some(info);
 
                     let new_size = size

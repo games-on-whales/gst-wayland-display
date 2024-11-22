@@ -1,9 +1,8 @@
 use std::time::{Duration, Instant};
 
 use super::State;
-use crate::utils::allocator::Allocator;
+use crate::utils::allocator::GsBuffer;
 use smithay::{
-    backend::allocator::Fourcc,
     backend::renderer::{
         damage::Error as DTRError,
         damage::RenderOutputResult,
@@ -11,12 +10,11 @@ use smithay::{
             memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement, Kind,
         },
         gles::GlesRenderer,
-        Bind, ExportMem, ImportAll, ImportMem, Renderer, Unbind,
+        ImportAll, ImportMem, Renderer, Unbind,
     },
     desktop::space::render_output,
     input::pointer::CursorImageStatus,
     render_elements,
-    utils::Rectangle,
 };
 
 pub const CURSOR_DATA_BYTES: &[u8] = include_bytes!("../../resources/cursor.rgba");
@@ -34,7 +32,7 @@ impl State {
         assert!(self.output.is_some());
         assert!(self.dtr.is_some());
         assert!(self.video_info.is_some());
-        assert!(self.buffer_allocator.is_some());
+        assert!(self.output_buffer.is_some());
 
         let elements =
             if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
@@ -68,9 +66,12 @@ impl State {
                 vec![]
             };
 
-        self.renderer
-            .bind(self.buffer_allocator.clone().unwrap().get_buffer().unwrap())
+        let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
+
+        output_buffer
+            .bind(&mut self.renderer)
             .map_err(DTRError::Rendering)?;
+
         let render_output_result = render_output(
             self.output.as_ref().unwrap(),
             &mut self.renderer,
@@ -82,41 +83,8 @@ impl State {
             [0.0, 0.0, 0.0, 1.0],
         )?;
 
-        let mapping = self
-            .renderer
-            .copy_framebuffer(
-                Rectangle::from_loc_and_size(
-                    (0, 0),
-                    (
-                        self.video_info.as_ref().unwrap().width() as i32,
-                        self.video_info.as_ref().unwrap().height() as i32,
-                    ),
-                ),
-                Fourcc::try_from(self.video_info.as_ref().unwrap().format().to_fourcc())
-                    .unwrap_or(Fourcc::Abgr8888),
-            )
-            .expect("Failed to export framebuffer");
-        let map = self
-            .renderer
-            .map_texture(&mapping)
-            .expect("Failed to download framebuffer");
+        let buffer = output_buffer.to_gs_buffer(&mut self.renderer);
 
-        let buffer = {
-            let mut buffer = gst::Buffer::with_size(map.len()).expect("failed to create buffer");
-            {
-                let buffer = buffer.get_mut().unwrap();
-
-                let mut vframe = gst_video::VideoFrameRef::from_buffer_ref_writable(
-                    buffer,
-                    self.video_info.as_ref().unwrap(),
-                )
-                .unwrap();
-                let plane_data = vframe.plane_data_mut(0).unwrap();
-                plane_data.clone_from_slice(map);
-            }
-
-            buffer
-        };
         self.renderer.unbind().map_err(DTRError::Rendering)?;
         Ok((buffer, render_output_result))
     }

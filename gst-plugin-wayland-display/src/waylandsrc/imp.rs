@@ -5,16 +5,12 @@ use gst_video::{VideoCapsBuilder, VideoFormat};
 
 use gst::subclass::prelude::*;
 use gst::{glib, Event, Fraction};
-use gst::{
-    glib::{once_cell::sync::Lazy, ValueArray},
-    LibraryError,
-};
+use gst::{glib::ValueArray, LibraryError};
 use gst::{prelude::*, Structure};
-
+use gst_base::prelude::BaseSrcExt;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
-use gst_base::traits::BaseSrcExt;
-
+use once_cell::sync::Lazy;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
 use waylanddisplaycore::WaylandDisplay;
@@ -166,11 +162,20 @@ impl ElementImpl for WaylandDisplaySrc {
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
                 .build();
+            let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .field("drm-format", "ABGR") // Modifier is linear
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            dmabuf_caps.merge(caps);
             let src_pad_template = gst::PadTemplate::new(
                 "src",
                 gst::PadDirection::Src,
                 gst::PadPresence::Always,
-                &caps,
+                &dmabuf_caps,
             )
             .unwrap();
 
@@ -209,18 +214,28 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn caps(&self, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
-        let mut caps = VideoCapsBuilder::new()
+        let caps = VideoCapsBuilder::new()
             .format(VideoFormat::Rgbx)
             .height_range(..i32::MAX)
             .width_range(..i32::MAX)
             .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
             .build();
 
+        let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(VideoFormat::DmaDrm)
+            .field("drm-format", "ABGR") // Modifier is linear
+            .height_range(..i32::MAX)
+            .width_range(..i32::MAX)
+            .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+            .build();
+        dmabuf_caps.merge(caps);
+
         if let Some(filter) = filter {
-            caps = caps.intersect(filter);
+            dmabuf_caps = dmabuf_caps.intersect(filter);
         }
 
-        Some(caps)
+        Some(dmabuf_caps)
     }
 
     fn negotiate(&self) -> Result<(), gst::LoggableError> {
