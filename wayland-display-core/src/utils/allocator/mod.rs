@@ -200,3 +200,151 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::renderer::setup_renderer;
+    use std::sync::Once;
+
+    fn render_into<R>(renderer: &mut R, w: i32, h: i32)
+    where
+        R: Renderer,
+    {
+        let mut frame = renderer
+            .render((w, h).into(), Transform::Normal)
+            .expect("Failed to create render frame");
+        frame
+            .clear(
+                [1.0, 0.0, 0.0, 1.0],
+                &[Rectangle::from_loc_and_size((0, 0), (w / 2, h / 2))],
+            )
+            .expect("Render error");
+        frame
+            .clear(
+                [0.0, 1.0, 0.0, 1.0],
+                &[Rectangle::from_loc_and_size((w / 2, 0), (w / 2, h / 2))],
+            )
+            .expect("Render error");
+        frame
+            .clear(
+                [0.0, 0.0, 1.0, 1.0],
+                &[Rectangle::from_loc_and_size((0, h / 2), (w / 2, h / 2))],
+            )
+            .expect("Render error");
+        frame
+            .clear(
+                [1.0, 1.0, 0.0, 1.0],
+                &[Rectangle::from_loc_and_size((w / 2, h / 2), (w / 2, h / 2))],
+            )
+            .expect("Render error");
+        frame
+            .finish()
+            .expect("Failed to finish render frame")
+            .wait()
+            .expect("Synchronization error");
+    }
+
+    static INIT: Once = Once::new();
+
+    pub fn setup() -> () {
+        INIT.call_once(|| {
+            gst::init().expect("Failed to initialize GStreamer");
+        });
+    }
+
+    #[test]
+    fn test_gsglesbuffer() {
+        setup();
+
+        let mut renderer = setup_renderer(None);
+        let video_info = VideoInfo::builder(gst_video::VideoFormat::Rgba, 10, 10)
+            .build()
+            .unwrap();
+
+        let raw_buffer = GsGlesbuffer::new(&mut renderer, video_info.clone());
+        assert!(raw_buffer.is_some());
+
+        let mut buffer = GsBufferType::RAW(raw_buffer.unwrap());
+        let bind_result = buffer.bind(&mut renderer);
+        assert!(bind_result.is_ok());
+
+        render_into(&mut renderer, 10, 10);
+        let mut gst_buffer = buffer.to_gs_buffer(&mut renderer);
+        assert!(gst_buffer.is_writable());
+        // Check buffer content
+        let vframe = gst_video::VideoFrameRef::from_buffer_ref_writable(
+            gst_buffer.get_mut().unwrap(),
+            &video_info,
+        )
+        .unwrap();
+        let plane_data = vframe.plane_data(0).unwrap();
+        assert_eq!(plane_data.len(), 10 * 10 * 4); // 10x10 pixels, 4 bytes per pixel (RGBA)
+        assert_eq!(
+            plane_data,
+            [
+                [
+                    // R, G, B, A
+                    255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+                    0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255
+                ]
+                .repeat(5),
+                [
+                    0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+                    255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255,
+                    255, 0, 255
+                ]
+                .repeat(5)
+            ]
+            .concat()
+        )
+    }
+
+    #[test]
+    fn test_dmabuf() {
+        let render_node =
+            DrmNode::from_path("/dev/dri/card0").expect("Failed to create render node");
+        let mut renderer = setup_renderer(Some(render_node));
+        let video_info = VideoInfo::builder(gst_video::VideoFormat::DmaDrm, 10, 10)
+            .build()
+            .unwrap();
+
+        let raw_buffer = GsDmaBuf::new(render_node, video_info.clone());
+        assert!(raw_buffer.is_some());
+
+        let mut buffer = GsBufferType::DMA(raw_buffer.unwrap());
+        let bind_result = buffer.bind(&mut renderer);
+        assert!(bind_result.is_ok());
+
+        render_into(&mut renderer, 10, 10);
+        let mut gst_buffer = buffer.to_gs_buffer(&mut renderer);
+        assert!(gst_buffer.is_writable());
+        // TODO: fails with: fatal runtime error: IO Safety violation: owned file descriptor already closed
+        // Check buffer content
+        let vframe = gst_video::VideoFrameRef::from_buffer_ref_writable(
+            gst_buffer.get_mut().unwrap(),
+            &video_info,
+        )
+        .unwrap();
+        let plane_data = vframe.plane_data(0).unwrap();
+        assert_eq!(plane_data.len(), 10 * 10 * 4); // 10x10 pixels, 4 bytes per pixel (RGBA)
+        assert_eq!(
+            plane_data,
+            [
+                [
+                    // R, G, B, A
+                    255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+                    0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255
+                ]
+                .repeat(5),
+                [
+                    0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+                    255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255,
+                    255, 0, 255
+                ]
+                .repeat(5)
+            ]
+            .concat()
+        )
+    }
+}
