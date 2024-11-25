@@ -1,5 +1,5 @@
 use super::Command;
-use gst_video::{VideoFormat, VideoInfo};
+use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use smithay::backend::input::AxisSource;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::{
@@ -287,7 +287,11 @@ pub(crate) fn init(
                     match render_target {
                         RenderTarget::Hardware(_) => {
                             if info.format() == VideoFormat::DmaDrm {
-                                let allocator = GsDmaBuf::new(render_node.unwrap(), info.clone())
+                                // TODO: this doesn't work, get the right one from set_caps()
+                                let caps = info.clone().to_caps().unwrap();
+                                let dma_info = VideoInfoDmaDrm::from_caps(caps.as_ref())
+                                    .expect("Failed to create VideoInfoDmaDrm");
+                                let allocator = GsDmaBuf::new(render_node.unwrap(), dma_info)
                                     .expect("Failed to create GsDmaBuf");
                                 state.output_buffer = Some(GsBufferType::DMA(allocator));
                             } else {

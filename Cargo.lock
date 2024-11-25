@@ -1378,6 +1378,7 @@ dependencies = [
  "once_cell",
  "smithay",
  "tracing",
+ "tracing-subscriber",
  "wayland-backend",
  "wayland-scanner",
 ]

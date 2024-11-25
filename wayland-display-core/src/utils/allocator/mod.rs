@@ -1,9 +1,9 @@
-use gst::Buffer;
-use gst_video::VideoInfo;
-use gstreamer_allocators::DmaBufAllocator;
+use gst::Buffer as GstBuffer;
+use gst_video::{VideoInfo, VideoInfoDmaDrm};
+use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Allocator, Fourcc};
+use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
@@ -42,13 +42,14 @@ impl GsGlesbuffer {
 #[derive(Debug, Clone)]
 pub struct GsDmaBuf {
     buffer: Dmabuf,
-    format: DrmFourcc,
-    video_info: VideoInfo,
+    video_info: VideoInfoDmaDrm,
+    gst_allocator: DmaBufAllocator,
 }
 
 impl GsDmaBuf {
-    pub fn new(render_node: DrmNode, video_info: VideoInfo) -> Option<Self> {
-        let format = Fourcc::Abgr8888; // TODO: format from drm-format
+    pub fn new(render_node: DrmNode, video_info: VideoInfoDmaDrm) -> Option<Self> {
+        let drm_fourcc = Fourcc::try_from(video_info.fourcc()).ok()?;
+        let drm_modifier = Modifier::try_from(video_info.modifier()).unwrap_or(Modifier::Linear);
 
         let file = File::options()
             .read(true)
@@ -60,18 +61,18 @@ impl GsDmaBuf {
         let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
         let mut dma_allocator = DmabufAllocator(allocator);
 
-        let modifiers = [Modifier::Linear]; // TODO: Support modifiers from video_info
+        let modifiers = [drm_modifier];
         let result = dma_allocator.create_buffer(
             video_info.width(),
             video_info.height(),
-            format,
+            drm_fourcc,
             &modifiers,
         );
         match result {
             Ok(buffer) => Some(GsDmaBuf {
                 buffer,
-                format,
-                video_info
+                video_info,
+                gst_allocator: DmaBufAllocator::new(),
             }),
             Err(_) => None,
         }
@@ -101,7 +102,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         }
     }
 
-    fn to_gs_buffer(&self, renderer: &mut GlesRenderer) -> Buffer {
+    fn to_gs_buffer(&self, renderer: &mut GlesRenderer) -> GstBuffer {
         match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer
@@ -138,23 +139,16 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::DMA(buffer) => {
                 // Adapted from: https://github.com/games-on-whales/smithay/blob/ef9782b8548c6e876bc61052e4e09351e4071a35/examples/buffer_test.rs#L326-L351
-                let size = (
-                    buffer.video_info.width() as i32,
-                    buffer.video_info.height() as i32,
-                );
-
-                let mut gst_buffer = gst::Buffer::new();
+                let mut gst_buffer = GstBuffer::new();
                 {
-                    // TODO: is this right?
                     let gst_buffer = gst_buffer.get_mut().unwrap();
-
-                    let allocator = DmaBufAllocator::new();
                     buffer.buffer.handles().for_each(|handle| {
                         let fd = handle.as_raw_fd();
-                        // TODO: should we leak the handle here somehow?
+                        let size = buffer.buffer.size().h * buffer.buffer.size().w * 4;
                         let memory = unsafe {
-                            allocator
-                                .alloc(fd, (size.0 * size.1) as usize)
+                            buffer
+                                .gst_allocator
+                                .alloc_with_flags(fd, size as usize, FdMemoryFlags::DONT_CLOSE)
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);
@@ -170,9 +164,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
 mod tests {
     use super::*;
     use crate::utils::renderer::setup_renderer;
-    use std::sync::Once;
     use smithay::backend::renderer::Frame;
-    use smithay::utils::{Transform};
+    use smithay::utils::Transform;
+    use std::sync::Once;
 
     fn render_into<R>(renderer: &mut R, w: i32, h: i32)
     where
@@ -216,6 +210,7 @@ mod tests {
 
     pub fn setup() -> () {
         INIT.call_once(|| {
+            tracing_subscriber::fmt::try_init().ok();
             gst::init().expect("Failed to initialize GStreamer");
         });
     }
@@ -237,15 +232,14 @@ mod tests {
         assert!(bind_result.is_ok());
 
         render_into(&mut renderer, 10, 10);
-        let mut gst_buffer = buffer.to_gs_buffer(&mut renderer);
+        let gst_buffer = buffer.to_gs_buffer(&mut renderer);
         assert!(gst_buffer.is_writable());
-        // Check buffer content
-        let vframe = gst_video::VideoFrameRef::from_buffer_ref_writable(
-            gst_buffer.get_mut().unwrap(),
-            &video_info,
-        )
-        .unwrap();
-        let plane_data = vframe.plane_data(0).unwrap();
+        assert!(gst_buffer.size() == video_info.size());
+
+        let read_buf = gst_buffer
+            .into_mapped_buffer_readable()
+            .expect("Failed to map buffer");
+        let plane_data = read_buf.as_slice();
         assert_eq!(plane_data.len(), 10 * 10 * 4); // 10x10 pixels, 4 bytes per pixel (RGBA)
         assert_eq!(
             plane_data,
@@ -269,14 +263,21 @@ mod tests {
 
     #[test]
     fn test_dmabuf() {
+        setup();
+
         let render_node =
-            DrmNode::from_path("/dev/dri/card0").expect("Failed to create render node");
+            DrmNode::from_path("/dev/dri/renderD128").expect("Failed to create render node");
         let mut renderer = setup_renderer(Some(render_node));
         let video_info = VideoInfo::builder(gst_video::VideoFormat::DmaDrm, 10, 10)
             .build()
             .unwrap();
+        let drm_video_info = VideoInfoDmaDrm::new(
+            video_info.clone(),
+            Fourcc::Abgr8888 as u32,
+            Modifier::Linear.into(),
+        );
 
-        let raw_buffer = GsDmaBuf::new(render_node, video_info.clone());
+        let raw_buffer = GsDmaBuf::new(render_node, drm_video_info.clone());
         assert!(raw_buffer.is_some());
 
         let mut buffer = GsBufferType::DMA(raw_buffer.clone().unwrap());
@@ -284,13 +285,14 @@ mod tests {
         assert!(bind_result.is_ok());
 
         render_into(&mut renderer, 10, 10);
-        // TODO: Output to Gstreamer
-        //       let mut gst_buffer = buffer.to_gs_buffer(&mut renderer);
+        let gst_buffer = buffer.to_gs_buffer(&mut renderer);
+        assert!(gst_buffer.size() == 10 * 10 * 4);
+        // TODO: get buffer content
 
-        let mapping = renderer
-            .copy_framebuffer(Rectangle::from_loc_and_size((0, 0), (10, 10)), Fourcc::Abgr8888)
-            .expect("Failed to map framebuffer");
-        let plane_data = renderer.map_texture(&mapping).expect("Failed to read mapping");
+        let read_buf = gst_buffer
+            .into_mapped_buffer_readable()
+            .expect("Failed to map buffer");
+        let plane_data = read_buf.as_slice();
 
         assert_eq!(plane_data.len(), 10 * 10 * 4); // 10x10 pixels, 4 bytes per pixel (RGBA)
         assert_eq!(

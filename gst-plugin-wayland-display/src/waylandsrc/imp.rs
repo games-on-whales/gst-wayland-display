@@ -165,7 +165,7 @@ impl ElementImpl for WaylandDisplaySrc {
             let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
                 .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
                 .format(VideoFormat::DmaDrm)
-                .field("drm-format", "ABGR") // Modifier is linear
+                .field("drm-format", "NV12:0x0100000000000001") // Modifier is linear
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -224,7 +224,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
             .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
             .format(VideoFormat::DmaDrm)
-            .field("drm-format", "ABGR") // Modifier is linear
+            .field("drm-format", "NV12:0x0100000000000001") // TODO: ask the GlesRenderer for render_formats
             .height_range(..i32::MAX)
             .width_range(..i32::MAX)
             .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -336,6 +336,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             .unwrap()
             .display
             .set_video_info(video_info);
+
+
+        // TODO: gst_video_is_dma_drm_caps(caps)
+        //  and bubble up the VideoInfoDmaDrm
 
         self.parent_set_caps(caps)
     }
