@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use gst::message::Application;
-use gst_video::{VideoCapsBuilder, VideoFormat};
+use gst_video::{VideoCapsBuilder, VideoFormat, VideoInfoDmaDrm};
 
 use gst::subclass::prelude::*;
 use gst::{glib, Event, Fraction};
@@ -13,7 +13,7 @@ use gst_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
-use waylanddisplaycore::WaylandDisplay;
+use waylanddisplaycore::{GstVideoInfo, WaylandDisplay};
 
 use crate::utils::{GstLayer, CAT};
 
@@ -165,7 +165,8 @@ impl ElementImpl for WaylandDisplaySrc {
             let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
                 .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
                 .format(VideoFormat::DmaDrm)
-                .field("drm-format", "NV12:0x0100000000000001") // Modifier is linear
+                // we can let the drm-format field absent to mean the super set of all formats
+                // we'll negotiate the actual format with the pads
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -224,7 +225,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
             .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
             .format(VideoFormat::DmaDrm)
-            .field("drm-format", "NV12:0x0100000000000001") // TODO: ask the GlesRenderer for render_formats
+            .field("drm-format", "RGBA") // TODO: ask the GlesRenderer for render_formats
             .height_range(..i32::MAX)
             .width_range(..i32::MAX)
             .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -328,7 +329,15 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
-        let video_info = gst_video::VideoInfo::from_caps(caps).expect("failed to get video info");
+        let video_info = match VideoInfoDmaDrm::from_caps(caps) {
+            Ok(dma_video_info) => {
+                GstVideoInfo::DMA(dma_video_info)
+            }
+            Err(_) => {
+                GstVideoInfo::RAW(gst_video::VideoInfo::from_caps(caps).expect("failed to get video info"))
+            }
+        };
+
         self.state
             .lock()
             .unwrap()
@@ -336,10 +345,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             .unwrap()
             .display
             .set_video_info(video_info);
-
-
-        // TODO: gst_video_is_dma_drm_caps(caps)
-        //  and bubble up the VideoInfoDmaDrm
 
         self.parent_set_caps(caps)
     }

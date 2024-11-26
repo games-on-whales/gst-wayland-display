@@ -1,5 +1,5 @@
-use super::Command;
-use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm};
+use super::{Command, GstVideoInfo};
+use gst_video::{VideoInfo};
 use smithay::backend::input::AxisSource;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::{
@@ -96,7 +96,7 @@ pub(crate) struct State {
 
     // management
     pub output: Option<Output>,
-    pub video_info: Option<VideoInfo>,
+    pub video_info: Option<GstVideoInfo>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -246,15 +246,16 @@ pub(crate) fn init(
         .handle()
         .insert_source(command_src, move |event, _, state| {
             match event {
-                Event::Msg(Command::VideoInfo(info)) => {
+                Event::Msg(Command::VideoInfo(video_info)) => {
+                    let base_info: VideoInfo = video_info.clone().into();
                     debug!(
                         "Requested video format: {} .to_fourcc() = {}",
-                        info.format(),
-                        info.format().to_fourcc()
+                        base_info.format(),
+                        base_info.format().to_fourcc()
                     );
                     let size: Size<i32, Physical> =
-                        (info.width() as i32, info.height() as i32).into();
-                    let framerate = info.fps();
+                        (base_info.width() as i32, base_info.height() as i32).into();
+                    let framerate = base_info.fps();
                     let duration = Duration::from_secs_f64(
                         framerate.numer() as f64 / framerate.denom() as f64,
                     );
@@ -285,29 +286,26 @@ pub(crate) fn init(
                     state.dtr = Some(dtr);
                     state.pointer_location = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
                     match render_target {
-                        RenderTarget::Hardware(_) => {
-                            if info.format() == VideoFormat::DmaDrm {
-                                // TODO: this doesn't work, get the right one from set_caps()
-                                let caps = info.clone().to_caps().unwrap();
-                                let dma_info = VideoInfoDmaDrm::from_caps(caps.as_ref())
-                                    .expect("Failed to create VideoInfoDmaDrm");
-                                let allocator = GsDmaBuf::new(render_node.unwrap(), dma_info)
-                                    .expect("Failed to create GsDmaBuf");
-                                state.output_buffer = Some(GsBufferType::DMA(allocator));
-                            } else {
-                                let allocator =
-                                    GsGlesbuffer::new(&mut state.renderer, info.clone())
-                                        .expect("Failed to create GsGlesbuffer");
+                        RenderTarget::Hardware(_) => match video_info.clone() {
+                            GstVideoInfo::RAW(base_info) => {
+                                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
+                                    .expect("Failed to create GsGlesbuffer");
                                 state.output_buffer = Some(GsBufferType::RAW(allocator));
                             }
-                        }
+                            GstVideoInfo::DMA(base_info) => {
+                                let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
+                                    .expect("Failed to create GsDmaBuf");
+                                state.output_buffer = Some(GsBufferType::DMA(allocator));
+                            }
+                        },
                         RenderTarget::Software => {
-                            let allocator = GsGlesbuffer::new(&mut state.renderer, info.clone())
-                                .expect("Failed to create GsGlesbuffer");
+                            let allocator =
+                                GsGlesbuffer::new(&mut state.renderer, base_info.clone())
+                                    .expect("Failed to create GsGlesbuffer");
                             state.output_buffer = Some(GsBufferType::RAW(allocator));
                         }
                     }
-                    state.video_info = Some(info);
+                    state.video_info = Some(video_info);
 
                     let new_size = size
                         .to_f64()
@@ -345,7 +343,9 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
                     let wait = if let Some(last_render) = state.last_render {
-                        let framerate = state.video_info.as_ref().unwrap().fps();
+                        let base_info: VideoInfo =
+                            state.video_info.as_ref().unwrap().clone().into();
+                        let framerate = base_info.fps();
                         let duration = Duration::from_secs_f64(
                             framerate.denom() as f64 / framerate.numer() as f64,
                         );

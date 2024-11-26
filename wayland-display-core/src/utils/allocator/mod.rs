@@ -48,6 +48,7 @@ pub struct GsDmaBuf {
 
 impl GsDmaBuf {
     pub fn new(render_node: DrmNode, video_info: VideoInfoDmaDrm) -> Option<Self> {
+        tracing::debug!("Creating DMA buffer from {:?}", video_info);
         let drm_fourcc = Fourcc::try_from(video_info.fourcc()).ok()?;
         let drm_modifier = Modifier::try_from(video_info.modifier()).unwrap_or(Modifier::Linear);
 
@@ -152,6 +153,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         };
                         gst_buffer.append_memory(memory);
                     });
+                    // TODO: There may be some extra information about the pitch, stride and plane
+                    //       offset when we export the surface, we also need to translate them into
+                    //       GstVideoMeta and attached it to the GstBuffer
                 }
                 gst_buffer
             }

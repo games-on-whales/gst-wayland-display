@@ -105,7 +105,7 @@ pub extern "C" fn display_set_video_info(dpy: *mut WaylandDisplay, info: *const 
     }
     let video_info = unsafe { VideoInfo::from_glib_none(info) };
 
-    display.set_video_info(video_info);
+    display.set_video_info(video_info.into());
 }
 
 #[no_mangle]

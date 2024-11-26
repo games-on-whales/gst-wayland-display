@@ -1,25 +1,29 @@
-use gst_video::VideoInfo;
-
 use smithay::backend::drm::CreateDrmNodeError;
 use smithay::backend::SwapBuffersError;
 use smithay::reexports::calloop::channel::Sender;
 
+use smithay::backend::input::{ButtonState, KeyState};
+use smithay::utils::{Logical, Point};
 use std::ffi::{c_char, c_void, CString};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
-use smithay::backend::input::{ButtonState, KeyState};
-use smithay::utils::{Logical, Point};
 use utils::RenderTarget;
 
-pub(crate) mod utils;
 pub(crate) mod comp;
+pub(crate) mod utils;
 pub(crate) mod wayland;
+
+pub use crate::utils::video_info::GstVideoInfo;
+
 
 pub(crate) enum Command {
     InputDevice(String),
-    VideoInfo(VideoInfo),
-    Buffer(SyncSender<Result<gst::Buffer, SwapBuffersError>>, Option<Tracer>),
+    VideoInfo(GstVideoInfo),
+    Buffer(
+        SyncSender<Result<gst::Buffer, SwapBuffersError>>,
+        Option<Tracer>,
+    ),
     KeyboardInput(u32, KeyState),
     PointerMotion(Point<f64, Logical>),
     PointerMotionAbsolute(Point<f64, Logical>),
@@ -40,11 +44,11 @@ pub struct Trace {
 }
 
 impl Tracer {
-    pub fn new(start_fn: extern "C" fn(*const c_char) -> *mut c_void, end_fn: extern "C" fn(*mut c_void)) -> Self {
-        Tracer {
-            start_fn,
-            end_fn,
-        }
+    pub fn new(
+        start_fn: extern "C" fn(*const c_char) -> *mut c_void,
+        end_fn: extern "C" fn(*mut c_void),
+    ) -> Self {
+        Tracer { start_fn, end_fn }
     }
 
     pub fn trace(&self, name: &str) -> Trace {
@@ -123,14 +127,14 @@ impl WaylandDisplay {
         })
     }
 
-    pub fn devices(&mut self) -> impl Iterator<Item=&str> {
+    pub fn devices(&mut self) -> impl Iterator<Item = &str> {
         self.devices
             .get()
             .iter()
             .map(|string| string.to_str().unwrap())
     }
 
-    pub fn env_vars(&mut self) -> impl Iterator<Item=&str> {
+    pub fn env_vars(&mut self) -> impl Iterator<Item = &str> {
         self.envs
             .get()
             .iter()
@@ -141,12 +145,16 @@ impl WaylandDisplay {
         let _ = self.command_tx.send(Command::InputDevice(path.into()));
     }
 
-    pub fn set_video_info(&self, info: VideoInfo) {
+    pub fn set_video_info(&self, info: GstVideoInfo) {
         let _ = self.command_tx.send(Command::VideoInfo(info));
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {
-        let state = if pressed { KeyState::Pressed } else { KeyState::Released };
+        let state = if pressed {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
         let _ = self.command_tx.send(Command::KeyboardInput(key, state));
     }
 
@@ -155,11 +163,17 @@ impl WaylandDisplay {
     }
 
     pub fn pointer_motion_absolute(&self, x: f64, y: f64) {
-        let _ = self.command_tx.send(Command::PointerMotionAbsolute((x, y).into()));
+        let _ = self
+            .command_tx
+            .send(Command::PointerMotionAbsolute((x, y).into()));
     }
 
     pub fn pointer_button(&self, button: u32, pressed: bool) {
-        let state = if pressed { ButtonState::Pressed } else { ButtonState::Released };
+        let state = if pressed {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
         let _ = self.command_tx.send(Command::PointerButton(button, state));
     }
 
@@ -169,7 +183,10 @@ impl WaylandDisplay {
 
     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
-        if let Err(err) = self.command_tx.send(Command::Buffer(buffer_tx, self.tracer.clone())) {
+        if let Err(err) = self
+            .command_tx
+            .send(Command::Buffer(buffer_tx, self.tracer.clone()))
+        {
             tracing::warn!(?err, "Failed to send buffer command.");
             return Err(gst::FlowError::Eos);
         }
