@@ -3,15 +3,16 @@ use gst_video::{VideoInfo, VideoInfoDmaDrm};
 use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
+use smithay::backend::allocator::{Allocator, Fourcc};
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
 use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::gbm::Modifier;
+use smithay::reexports::rustix::fs::{seek, SeekFrom};
 use smithay::utils::{DeviceFd, Rectangle};
 use std::fs::File;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 #[derive(Debug, Clone)]
 pub struct GsGlesbuffer {
@@ -42,7 +43,6 @@ impl GsGlesbuffer {
 #[derive(Debug, Clone)]
 pub struct GsDmaBuf {
     buffer: Dmabuf,
-    video_info: VideoInfoDmaDrm,
     gst_allocator: DmaBufAllocator,
 }
 
@@ -71,7 +71,6 @@ impl GsDmaBuf {
         match result {
             Ok(buffer) => Some(GsDmaBuf {
                 buffer,
-                video_info,
                 gst_allocator: DmaBufAllocator::new(),
             }),
             Err(_) => None,
@@ -138,13 +137,13 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 gst_buffer
             }
             GsBufferType::DMA(buffer) => {
-                // Adapted from: https://github.com/games-on-whales/smithay/blob/ef9782b8548c6e876bc61052e4e09351e4071a35/examples/buffer_test.rs#L326-L351
                 let mut gst_buffer = GstBuffer::new();
                 {
                     let gst_buffer = gst_buffer.get_mut().unwrap();
                     buffer.buffer.handles().for_each(|handle| {
                         let fd = handle.as_raw_fd();
-                        let size = buffer.buffer.size().h * buffer.buffer.size().w * 4;
+                        let size = seek(&handle.as_fd(), SeekFrom::End(0)).unwrap();
+                        let _ = seek(&handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
@@ -167,7 +166,15 @@ mod tests {
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
     use std::sync::Once;
+    static INIT: Once = Once::new();
+    pub fn setup() -> () {
+        INIT.call_once(|| {
+            tracing_subscriber::fmt::try_init().ok();
+            gst::init().expect("Failed to initialize GStreamer");
+        });
+    }
 
+    // Adapted from: https://github.com/games-on-whales/smithay/blob/ef9782b8548c6e876bc61052e4e09351e4071a35/examples/buffer_test.rs#L326-L351
     fn render_into<R>(renderer: &mut R, w: i32, h: i32)
     where
         R: Renderer,
@@ -206,15 +213,6 @@ mod tests {
             .expect("Synchronization error");
     }
 
-    static INIT: Once = Once::new();
-
-    pub fn setup() -> () {
-        INIT.call_once(|| {
-            tracing_subscriber::fmt::try_init().ok();
-            gst::init().expect("Failed to initialize GStreamer");
-        });
-    }
-
     #[test]
     fn test_gsglesbuffer() {
         setup();
@@ -234,7 +232,7 @@ mod tests {
         render_into(&mut renderer, 10, 10);
         let gst_buffer = buffer.to_gs_buffer(&mut renderer);
         assert!(gst_buffer.is_writable());
-        assert!(gst_buffer.size() == video_info.size());
+        assert_eq!(gst_buffer.size(), video_info.size());
 
         let read_buf = gst_buffer
             .into_mapped_buffer_readable()
@@ -286,17 +284,17 @@ mod tests {
 
         render_into(&mut renderer, 10, 10);
         let gst_buffer = buffer.to_gs_buffer(&mut renderer);
-        assert!(gst_buffer.size() == 10 * 10 * 4);
-        // TODO: get buffer content
+        let gst_buffer_size = gst_buffer.size();
+        assert_eq!(gst_buffer_size, 65536); // There's going to be a lot of padding
 
         let read_buf = gst_buffer
             .into_mapped_buffer_readable()
             .expect("Failed to map buffer");
         let plane_data = read_buf.as_slice();
 
-        assert_eq!(plane_data.len(), 10 * 10 * 4); // 10x10 pixels, 4 bytes per pixel (RGBA)
+        assert_eq!(plane_data.len(), gst_buffer_size);
         assert_eq!(
-            plane_data,
+            plane_data[0..10 * 10 * 4],
             [
                 [
                     // R, G, B, A

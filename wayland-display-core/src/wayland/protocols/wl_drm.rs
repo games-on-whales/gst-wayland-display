@@ -56,6 +56,7 @@ pub enum ImportError {
     Failed,
 }
 
+#[allow(dead_code)]
 pub trait DrmHandler<R: 'static> {
     fn dmabuf_imported(&mut self, global: &DmabufGlobal, dmabuf: Dmabuf) -> Result<R, ImportError>;
     fn buffer_created(&mut self, buffer: WlBuffer, result: R) {
