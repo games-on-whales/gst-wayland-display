@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::sync::Mutex;
 
 use gst::message::Application;
@@ -13,7 +14,7 @@ use gst_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
-use waylanddisplaycore::{GstVideoInfo, WaylandDisplay};
+use waylanddisplaycore::{DrmFormat, DrmModifier, DrmVendor, Fourcc, GstVideoInfo, WaylandDisplay};
 
 use crate::utils::{GstLayer, CAT};
 
@@ -215,28 +216,56 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn caps(&self, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
-        let caps = VideoCapsBuilder::new()
+        let mut caps = VideoCapsBuilder::new()
             .format(VideoFormat::Rgbx)
             .height_range(..i32::MAX)
             .width_range(..i32::MAX)
             .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
             .build();
 
-        let mut dmabuf_caps = gst_video::VideoCapsBuilder::new()
-            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
-            .format(VideoFormat::DmaDrm)
-            .field("drm-format", "RGBA") // TODO: ask the GlesRenderer for render_formats
-            .height_range(..i32::MAX)
-            .width_range(..i32::MAX)
-            .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
-            .build();
-        dmabuf_caps.merge(caps);
+        let state = self.state.lock().unwrap();
+        let gst_dma_formats: Vec<String> = match state.as_ref() {
+            None => Default::default(),
+            Some(state) => {
+                let dma_formats = state
+                    .display
+                    .get_supported_dma_formats()
+                    .unwrap_or(Default::default());
 
-        if let Some(filter) = filter {
-            dmabuf_caps = dmabuf_caps.intersect(filter);
+                dma_formats.iter().filter_map(drm_to_gst_format).collect()
+            }
+        };
+
+        gst::info!(CAT, "Supported DMA formats: {:?}", gst_dma_formats);
+
+        if gst_dma_formats.is_empty() {
+            let dmabuf_caps = gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            caps.merge(dmabuf_caps);
+        } else {
+            for format in gst_dma_formats {
+                let dmabuf_caps = gst_video::VideoCapsBuilder::new()
+                    .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                    .format(VideoFormat::DmaDrm)
+                    .field("drm-format", &format)
+                    .height_range(..i32::MAX)
+                    .width_range(..i32::MAX)
+                    .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                    .build();
+                caps.merge(dmabuf_caps);
+            }
         }
 
-        Some(dmabuf_caps)
+        if let Some(filter) = filter {
+            caps = caps.intersect(filter);
+        }
+
+        Some(caps)
     }
 
     fn negotiate(&self) -> Result<(), gst::LoggableError> {
@@ -330,12 +359,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
         let video_info = match VideoInfoDmaDrm::from_caps(caps) {
-            Ok(dma_video_info) => {
-                GstVideoInfo::DMA(dma_video_info)
-            }
-            Err(_) => {
-                GstVideoInfo::RAW(gst_video::VideoInfo::from_caps(caps).expect("failed to get video info"))
-            }
+            Ok(dma_video_info) => GstVideoInfo::DMA(dma_video_info),
+            Err(_) => GstVideoInfo::RAW(
+                gst_video::VideoInfo::from_caps(caps).expect("failed to get video info"),
+            ),
         };
 
         self.state
@@ -411,5 +438,91 @@ impl PushSrcImpl for WaylandDisplaySrc {
         tracing::subscriber::with_default(subscriber, || {
             state.display.frame().map(CreateSuccess::NewBuffer)
         })
+    }
+}
+
+fn drm_to_video_format(format: &DrmFormat) -> Option<VideoFormat> {
+    let format = match format.code {
+        // see: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gst-plugins-base/gst-libs/gst/video/video-info-dma.c#L702-742
+        Fourcc::Abgr8888 => VideoFormat::Rgba,
+        Fourcc::Argb8888 => VideoFormat::Bgra,
+        Fourcc::Bgra8888 => VideoFormat::Argb,
+        Fourcc::Bgrx8888 => VideoFormat::Xrgb,
+        Fourcc::Rgba8888 => VideoFormat::Abgr,
+        Fourcc::Rgbx8888 => VideoFormat::Xbgr,
+        Fourcc::Xbgr8888 => VideoFormat::Rgbx,
+        Fourcc::Xrgb8888 => VideoFormat::Bgrx,
+        _ => {
+            gst::debug!(CAT, "Unsupported format {:?}", format.code);
+            return None;
+        }
+    };
+    Some(format)
+}
+
+fn drm_to_gst_format(format: &DrmFormat) -> Option<String> {
+    let video_format = drm_to_video_format(format)?;
+    if format.modifier == DrmModifier::Linear {
+        Some(video_format.to_string())
+    } else {
+        let modifier = match format.modifier {
+            DrmModifier::Invalid => None,
+            modifier => Some(modifier),
+        };
+        let modifier: u64 = modifier?.into();
+        let vendor: u8 = match format.modifier.vendor() {
+            Ok(vendor) => match vendor {
+                Some(DrmVendor::Allwinner) => 9,
+                Some(DrmVendor::Amd) => 2,
+                Some(DrmVendor::Amlogic) => 10,
+                Some(DrmVendor::Arm) => 8,
+                Some(DrmVendor::Broadcom) => 7,
+                Some(DrmVendor::Intel) => 1,
+                Some(DrmVendor::Nvidia) => 3,
+                Some(DrmVendor::Qcom) => 5,
+                Some(DrmVendor::Samsung) => 4,
+                Some(DrmVendor::Vivante) => 6,
+                None => 0,
+            },
+            Err(_) => 0,
+        };
+        Some(format!(
+            "{}:0x{:02x}{:014x}",
+            video_format, vendor, modifier
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use waylanddisplaycore::utils::tests::INIT;
+    use waylanddisplaycore::DrmFormat;
+
+    fn test_init() -> () {
+        INIT.call_once(|| {
+            tracing_subscriber::fmt::try_init().ok();
+            gst::init().expect("Failed to initialize GStreamer");
+        });
+    }
+
+    #[test]
+    fn test_drm_format_to_gstreamer() {
+        test_init();
+
+        assert_eq!(
+            super::drm_to_gst_format(&DrmFormat {
+                code: waylanddisplaycore::Fourcc::Abgr8888,
+                modifier: waylanddisplaycore::DrmModifier::Linear
+            }),
+            Some("RGBA".to_string())
+        );
+
+        assert_eq!(
+            super::drm_to_gst_format(&DrmFormat {
+                code: waylanddisplaycore::Fourcc::Rgba8888,
+                modifier: waylanddisplaycore::DrmModifier::Nvidia_16bx2_block_eight_gob
+            }),
+            Some("ABGR:0x03300000000000013".to_string())
+        );
     }
 }

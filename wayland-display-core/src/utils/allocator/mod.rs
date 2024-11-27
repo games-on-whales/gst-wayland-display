@@ -1,3 +1,4 @@
+use crate::DrmModifier;
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoInfo, VideoInfoDmaDrm};
 use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
@@ -49,8 +50,13 @@ pub struct GsDmaBuf {
 impl GsDmaBuf {
     pub fn new(render_node: DrmNode, video_info: VideoInfoDmaDrm) -> Option<Self> {
         tracing::debug!("Creating DMA buffer from {:?}", video_info);
-        let drm_fourcc = Fourcc::try_from(video_info.fourcc()).ok()?;
-        let drm_modifier = Modifier::try_from(video_info.modifier()).unwrap_or(Modifier::Linear);
+        let drm_fourcc = gst_video_format_to_drm_fourcc(video_info.clone())?;
+        let drm_modifier = gst_video_format_to_drm_modifier(video_info.clone())?;
+        tracing::info!(
+            "Creating DMA buffer - DrmFourcc: {:?}, Modifier: {:?}",
+            drm_fourcc,
+            drm_modifier
+        );
 
         let file = File::options()
             .read(true)
@@ -163,20 +169,57 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
     }
 }
 
+pub fn gst_video_format_to_drm_fourcc(format: VideoInfoDmaDrm) -> Option<DrmFourcc> {
+    // VideoFormat::from_fourcc() returns format unknown for some reason, so we manually parse the caps
+    let caps = format.to_caps().unwrap();
+    let drm_format_str = caps.structure(0)?.get::<&str>("drm-format");
+    if drm_format_str.is_err() {
+        tracing::warn!("Failed to get DRM format from caps {:?}", caps);
+        return None;
+    }
+    let gst_format = drm_format_str.unwrap().split(":").next().unwrap();
+
+    let format = match gst_format.to_lowercase().as_str() {
+        "abgr" => DrmFourcc::Rgba8888,
+        "argb" => DrmFourcc::Bgra8888,
+        "bgra" => DrmFourcc::Argb8888,
+        "bgrx" => DrmFourcc::Xrgb8888,
+        "rgba" => DrmFourcc::Abgr8888,
+        "rgbx" => DrmFourcc::Xbgr8888,
+        "xbgr" => DrmFourcc::Rgbx8888,
+        "xrgb" => DrmFourcc::Bgrx8888,
+        _ => {
+            tracing::warn!("Unsupported video format: {:?}", gst_format);
+            return None;
+        }
+    };
+    Some(format)
+}
+
+pub fn gst_video_format_to_drm_modifier(format: VideoInfoDmaDrm) -> Option<DrmModifier> {
+    let full_modifier = format.modifier();
+    // Here we want to drop the first 4 bits which are the vendor
+    let modifier = full_modifier & 0xCFFFFFFFFFFFFFFF;
+    match Modifier::try_from(modifier) {
+        Ok(modifier) => Some(modifier),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to convert modifier ({:?}): {:?}",
+                full_modifier,
+                error
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::utils::renderer::setup_renderer;
+    use crate::utils::tests::test_init;
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    pub fn setup() -> () {
-        INIT.call_once(|| {
-            tracing_subscriber::fmt::try_init().ok();
-            gst::init().expect("Failed to initialize GStreamer");
-        });
-    }
 
     // Adapted from: https://github.com/games-on-whales/smithay/blob/ef9782b8548c6e876bc61052e4e09351e4071a35/examples/buffer_test.rs#L326-L351
     fn render_into<R>(renderer: &mut R, w: i32, h: i32)
@@ -219,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_gsglesbuffer() {
-        setup();
+        test_init();
 
         let mut renderer = setup_renderer(None);
         let video_info = VideoInfo::builder(gst_video::VideoFormat::Rgba, 10, 10)
@@ -265,18 +308,31 @@ mod tests {
 
     #[test]
     fn test_dmabuf() {
-        setup();
+        test_init();
 
         let render_node =
             DrmNode::from_path("/dev/dri/renderD128").expect("Failed to create render node");
         let mut renderer = setup_renderer(Some(render_node));
-        let video_info = VideoInfo::builder(gst_video::VideoFormat::DmaDrm, 10, 10)
-            .build()
-            .unwrap();
-        let drm_video_info = VideoInfoDmaDrm::new(
-            video_info.clone(),
-            Fourcc::Abgr8888 as u32,
-            Modifier::Linear.into(),
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(gst_video::VideoFormat::DmaDrm)
+            .field("drm-format", "RGBA")
+            .height(10)
+            .width(10)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        assert!(caps.is_fixed()); // Required to pass gst_video_is_dma_drm_caps()
+        let drm_video_info =
+            VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
+
+        assert_eq!(
+            gst_video_format_to_drm_fourcc(drm_video_info.clone()),
+            Some(DrmFourcc::Abgr8888)
+        );
+        assert_eq!(
+            gst_video_format_to_drm_modifier(drm_video_info.clone()),
+            Some(Modifier::Linear)
         );
 
         let raw_buffer = GsDmaBuf::new(render_node, drm_video_info.clone());
@@ -314,6 +370,34 @@ mod tests {
                 .repeat(5)
             ]
             .concat()
+        )
+    }
+
+    #[test]
+    fn test_gst_video_format_conversions() {
+        test_init();
+
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(gst_video::VideoFormat::DmaDrm)
+            .field("drm-format", "BGRA:0x01100000000000001")
+            .height(10)
+            .width(10)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        assert!(caps.is_fixed()); // Required to pass gst_video_is_dma_drm_caps()
+        let drm_video_info =
+            VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
+
+        assert_eq!(
+            gst_video_format_to_drm_fourcc(drm_video_info.clone()),
+            Some(DrmFourcc::Argb8888)
+        );
+
+        assert_eq!(
+            gst_video_format_to_drm_modifier(drm_video_info.clone()),
+            Some(Modifier::I915_x_tiled)
         )
     }
 }

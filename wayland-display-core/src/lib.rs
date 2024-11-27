@@ -2,6 +2,9 @@ use smithay::backend::drm::CreateDrmNodeError;
 use smithay::backend::SwapBuffersError;
 use smithay::reexports::calloop::channel::Sender;
 
+pub use smithay::backend::allocator::{
+    format::FormatSet, Format as DrmFormat, Fourcc, Modifier as DrmModifier, Vendor as DrmVendor
+};
 use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{c_char, c_void, CString};
@@ -11,11 +14,10 @@ use std::thread::JoinHandle;
 use utils::RenderTarget;
 
 pub(crate) mod comp;
-pub(crate) mod utils;
+pub mod utils;
 pub(crate) mod wayland;
 
 pub use crate::utils::video_info::GstVideoInfo;
-
 
 pub(crate) enum Command {
     InputDevice(String),
@@ -29,6 +31,7 @@ pub(crate) enum Command {
     PointerMotionAbsolute(Point<f64, Logical>),
     PointerButton(u32, ButtonState),
     PointerAxis(f64, f64),
+    GetSupportedDmaFormats(SyncSender<Option<FormatSet>>),
     Quit,
 }
 
@@ -203,6 +206,14 @@ impl WaylandDisplay {
                 Err(gst::FlowError::Error)
             }
         }
+    }
+
+    pub fn get_supported_dma_formats(&self) -> Option<FormatSet> {
+        let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+        let _ = self
+            .command_tx
+            .send(Command::GetSupportedDmaFormats(buffer_tx));
+        buffer_rx.recv().unwrap()
     }
 }
 
