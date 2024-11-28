@@ -1,7 +1,9 @@
 use super::{Command, GstVideoInfo};
 use gst_video::VideoInfo;
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::input::AxisSource;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::reexports::gbm::BufferObjectFlags;
 use smithay::{
     backend::{
         allocator::{dmabuf::Dmabuf, Fourcc},
@@ -67,7 +69,7 @@ mod rendering;
 pub use self::focus::*;
 pub use self::input::*;
 pub use self::rendering::*;
-use crate::utils::allocator::{GsBufferType, GsDmaBuf, GsGlesbuffer};
+use crate::utils::allocator::{new_gbm_device, GsBufferType, GsDmaBuf, GsGlesbuffer};
 use crate::utils::renderer::setup_renderer;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
 
@@ -90,6 +92,7 @@ pub(crate) struct State {
     // render
     dtr: Option<OutputDamageTracker>,
     output_buffer: Option<GsBufferType>,
+    render_node: Option<DrmNode>,
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
@@ -203,6 +206,7 @@ pub(crate) fn init(
         renderer,
         dtr: None,
         output_buffer: None,
+        render_node,
         dmabuf_global,
         video_info: None,
         last_render: None,
@@ -494,8 +498,24 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::GetSupportedDmaFormats(sender)) => {
                     let formats = Bind::<Dmabuf>::supported_formats(&state.renderer);
-                    debug!("Supported dma formats: {:?}", formats);
-                    let _ = sender.send(formats);
+                    let supported_formats = match state.render_node {
+                        Some(node) => {
+                            let gbm_dev =
+                                new_gbm_device(node).expect("Failed to create gbm device");
+                            formats
+                                .unwrap_or_default()
+                                .iter()
+                                .filter(|f| {
+                                    gbm_dev
+                                        .is_format_supported(f.code, BufferObjectFlags::RENDERING)
+                                })
+                                .map(|f| *f)
+                                .collect()
+                        }
+                        None => FormatSet::default(),
+                    };
+                    tracing::info!("Supported dma formats: {:?}", supported_formats);
+                    let _ = sender.send(supported_formats);
                 }
             };
         })

@@ -14,7 +14,7 @@ use gst_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
-use waylanddisplaycore::{DrmFormat, DrmModifier, DrmVendor, Fourcc, GstVideoInfo, WaylandDisplay};
+use waylanddisplaycore::{DrmFormat, DrmModifier, GstVideoInfo, WaylandDisplay};
 
 use crate::utils::{GstLayer, CAT};
 
@@ -227,16 +227,12 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let gst_dma_formats: Vec<String> = match state.as_ref() {
             None => Default::default(),
             Some(state) => {
-                let dma_formats = state
-                    .display
-                    .get_supported_dma_formats()
-                    .unwrap_or(Default::default());
-
+                let dma_formats = state.display.get_supported_dma_formats();
                 dma_formats.iter().filter_map(drm_to_gst_format).collect()
             }
         };
 
-        gst::info!(CAT, "Supported DMA formats: {:?}", gst_dma_formats);
+        gst::debug!(CAT, "Supported DMA formats: {:?}", gst_dma_formats);
 
         if gst_dma_formats.is_empty() {
             let dmabuf_caps = gst_video::VideoCapsBuilder::new()
@@ -441,55 +437,19 @@ impl PushSrcImpl for WaylandDisplaySrc {
     }
 }
 
-fn drm_to_video_format(format: &DrmFormat) -> Option<VideoFormat> {
-    let format = match format.code {
-        // see: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gst-plugins-base/gst-libs/gst/video/video-info-dma.c#L702-742
-        Fourcc::Abgr8888 => VideoFormat::Rgba,
-        Fourcc::Argb8888 => VideoFormat::Bgra,
-        Fourcc::Bgra8888 => VideoFormat::Argb,
-        Fourcc::Bgrx8888 => VideoFormat::Xrgb,
-        Fourcc::Rgba8888 => VideoFormat::Abgr,
-        Fourcc::Rgbx8888 => VideoFormat::Xbgr,
-        Fourcc::Xbgr8888 => VideoFormat::Rgbx,
-        Fourcc::Xrgb8888 => VideoFormat::Bgrx,
-        _ => {
-            gst::debug!(CAT, "Unsupported format {:?}", format.code);
-            return None;
-        }
-    };
-    Some(format)
-}
-
 fn drm_to_gst_format(format: &DrmFormat) -> Option<String> {
-    let video_format = drm_to_video_format(format)?;
+    let video_format = format.code.to_string();
+    let video_format = video_format.trim();
     if format.modifier == DrmModifier::Linear {
-        Some(video_format.to_string())
+        Some(video_format.into())
     } else {
-        let modifier = match format.modifier {
+        match format.modifier {
             DrmModifier::Invalid => None,
-            modifier => Some(modifier),
-        };
-        let modifier: u64 = modifier?.into();
-        let vendor: u8 = match format.modifier.vendor() {
-            Ok(vendor) => match vendor {
-                Some(DrmVendor::Allwinner) => 9,
-                Some(DrmVendor::Amd) => 2,
-                Some(DrmVendor::Amlogic) => 10,
-                Some(DrmVendor::Arm) => 8,
-                Some(DrmVendor::Broadcom) => 7,
-                Some(DrmVendor::Intel) => 1,
-                Some(DrmVendor::Nvidia) => 3,
-                Some(DrmVendor::Qcom) => 5,
-                Some(DrmVendor::Samsung) => 4,
-                Some(DrmVendor::Vivante) => 6,
-                None => 0,
-            },
-            Err(_) => 0,
-        };
-        Some(format!(
-            "{}:0x{:02x}{:014x}",
-            video_format, vendor, modifier
-        ))
+            modifier => {
+                let modifier: u64 = modifier.into();
+                Some(format!("{}:0x{:016x}", video_format, modifier))
+            }
+        }
     }
 }
 
@@ -514,7 +474,7 @@ mod tests {
                 code: waylanddisplaycore::Fourcc::Abgr8888,
                 modifier: waylanddisplaycore::DrmModifier::Linear
             }),
-            Some("RGBA".to_string())
+            Some("AB24".to_string())
         );
 
         assert_eq!(
@@ -522,7 +482,7 @@ mod tests {
                 code: waylanddisplaycore::Fourcc::Rgba8888,
                 modifier: waylanddisplaycore::DrmModifier::Nvidia_16bx2_block_eight_gob
             }),
-            Some("ABGR:0x03300000000000013".to_string())
+            Some("RA24:0x0300000000000013".to_string())
         );
     }
 }

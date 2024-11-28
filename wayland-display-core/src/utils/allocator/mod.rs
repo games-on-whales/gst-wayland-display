@@ -47,6 +47,16 @@ pub struct GsDmaBuf {
     gst_allocator: DmaBufAllocator,
 }
 
+pub fn new_gbm_device(render_node: DrmNode) -> Option<GbmDevice<DeviceFd>> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open(render_node.dev_path()?.as_path())
+        .ok()?;
+    let fd = DeviceFd::from(Into::<OwnedFd>::into(file));
+    GbmDevice::new(fd).ok()
+}
+
 impl GsDmaBuf {
     pub fn new(render_node: DrmNode, video_info: VideoInfoDmaDrm) -> Option<Self> {
         tracing::debug!("Creating DMA buffer from {:?}", video_info);
@@ -58,13 +68,7 @@ impl GsDmaBuf {
             drm_modifier
         );
 
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open(render_node.dev_path().unwrap().as_path())
-            .expect("Failed to open device node");
-        let fd = DeviceFd::from(Into::<OwnedFd>::into(file));
-        let gbm = GbmDevice::new(fd).expect("Failed to create GBM device");
+        let gbm = new_gbm_device(render_node)?;
         let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
         let mut dma_allocator = DmabufAllocator(allocator);
 
@@ -171,36 +175,45 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
 
 pub fn gst_video_format_to_drm_fourcc(format: VideoInfoDmaDrm) -> Option<DrmFourcc> {
     // VideoFormat::from_fourcc() returns format unknown for some reason, so we manually parse the caps
-    let caps = format.to_caps().unwrap();
-    let drm_format_str = caps.structure(0)?.get::<&str>("drm-format");
-    if drm_format_str.is_err() {
-        tracing::warn!("Failed to get DRM format from caps {:?}", caps);
-        return None;
-    }
-    let gst_format = drm_format_str.unwrap().split(":").next().unwrap();
+    let fourcc = DrmFourcc::try_from(format.fourcc());
+    match fourcc {
+        Ok(fourcc) => Some(fourcc),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to convert fourcc ({:?}): {:?}",
+                format.fourcc(),
+                error
+            );
+            let caps = format.to_caps().unwrap();
+            let drm_format_str = caps.structure(0)?.get::<&str>("drm-format");
+            if drm_format_str.is_err() {
+                tracing::warn!("Failed to get DRM format from caps {:?}", caps);
+                return None;
+            }
+            let gst_format = drm_format_str.unwrap().split(":").next().unwrap();
 
-    let format = match gst_format.to_lowercase().as_str() {
-        "abgr" => DrmFourcc::Rgba8888,
-        "argb" => DrmFourcc::Bgra8888,
-        "bgra" => DrmFourcc::Argb8888,
-        "bgrx" => DrmFourcc::Xrgb8888,
-        "rgba" => DrmFourcc::Abgr8888,
-        "rgbx" => DrmFourcc::Xbgr8888,
-        "xbgr" => DrmFourcc::Rgbx8888,
-        "xrgb" => DrmFourcc::Bgrx8888,
-        _ => {
-            tracing::warn!("Unsupported video format: {:?}", gst_format);
-            return None;
+            let format = match gst_format.to_lowercase().as_str() {
+                "abgr" => DrmFourcc::Rgba8888,
+                "argb" => DrmFourcc::Bgra8888,
+                "bgra" => DrmFourcc::Argb8888,
+                "bgrx" => DrmFourcc::Xrgb8888,
+                "rgba" => DrmFourcc::Abgr8888,
+                "rgbx" => DrmFourcc::Xbgr8888,
+                "xbgr" => DrmFourcc::Rgbx8888,
+                "xrgb" => DrmFourcc::Bgrx8888,
+                _ => {
+                    tracing::warn!("Unsupported video format: {:?}", gst_format);
+                    return None;
+                }
+            };
+            Some(format)
         }
-    };
-    Some(format)
+    }
 }
 
 pub fn gst_video_format_to_drm_modifier(format: VideoInfoDmaDrm) -> Option<DrmModifier> {
     let full_modifier = format.modifier();
-    // Here we want to drop the first 4 bits which are the vendor
-    let modifier = full_modifier & 0xCFFFFFFFFFFFFFFF;
-    match Modifier::try_from(modifier) {
+    match Modifier::try_from(full_modifier) {
         Ok(modifier) => Some(modifier),
         Err(error) => {
             tracing::warn!(
@@ -380,7 +393,7 @@ mod tests {
         let caps = gst_video::VideoCapsBuilder::new()
             .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
             .format(gst_video::VideoFormat::DmaDrm)
-            .field("drm-format", "BGRA:0x01100000000000001")
+            .field("drm-format", "AB24:0x0300000000606010")
             .height(10)
             .width(10)
             .pixel_aspect_ratio(1.into())
@@ -391,13 +404,13 @@ mod tests {
             VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
 
         assert_eq!(
-            gst_video_format_to_drm_fourcc(drm_video_info.clone()),
-            Some(DrmFourcc::Argb8888)
+            gst_video_format_to_drm_fourcc(drm_video_info.clone()).unwrap(),
+            DrmFourcc::try_from(875708993).unwrap()
         );
 
         assert_eq!(
-            gst_video_format_to_drm_modifier(drm_video_info.clone()),
-            Some(Modifier::I915_x_tiled)
+            gst_video_format_to_drm_modifier(drm_video_info.clone()).unwrap(),
+            Modifier::Unrecognized(0x0300000000606010)
         )
     }
 }
