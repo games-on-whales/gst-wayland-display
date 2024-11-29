@@ -1,10 +1,10 @@
 use crate::DrmModifier;
 use gst::Buffer as GstBuffer;
-use gst_video::{VideoInfo, VideoInfoDmaDrm};
+use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Allocator, Fourcc};
+use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
@@ -44,6 +44,7 @@ impl GsGlesbuffer {
 #[derive(Debug, Clone)]
 pub struct GsDmaBuf {
     buffer: Dmabuf,
+    video_info: VideoInfoDmaDrm,
     gst_allocator: DmaBufAllocator,
 }
 
@@ -82,6 +83,7 @@ impl GsDmaBuf {
         match result {
             Ok(buffer) => Some(GsDmaBuf {
                 buffer,
+                video_info,
                 gst_allocator: DmaBufAllocator::new(),
             }),
             Err(_) => None,
@@ -163,9 +165,43 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         };
                         gst_buffer.append_memory(memory);
                     });
-                    // TODO: There may be some extra information about the pitch, stride and plane
-                    //       offset when we export the surface, we also need to translate them into
-                    //       GstVideoMeta and attached it to the GstBuffer
+
+                    let offsets = buffer
+                        .buffer
+                        .offsets()
+                        .map(|o| o as usize)
+                        .collect::<Vec<_>>();
+
+                    let strides = buffer
+                        .buffer
+                        .strides()
+                        .map(|s| s as i32)
+                        .collect::<Vec<_>>();
+
+                    let video_format =
+                        match VideoFormat::from_fourcc(buffer.buffer.format().code as u32) {
+                            // TODO: this seems to always fail
+                            VideoFormat::Unknown => {
+                                tracing::debug!(
+                                    "Failed to convert fourcc to video format: {:?}",
+                                    buffer.buffer.format().code
+                                );
+                                VideoFormat::Bgrx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
+                            }
+                            format => format,
+                        };
+                    let meta_result = VideoMeta::add_full(
+                        gst_buffer,
+                        gst_video::VideoFrameFlags::empty(),
+                        video_format,
+                        buffer.video_info.width(),
+                        buffer.video_info.height(),
+                        &offsets,
+                        &strides,
+                    );
+                    if let Err(error) = meta_result {
+                        tracing::warn!("Failed to add video meta: {:?}", error);
+                    }
                 }
                 gst_buffer
             }
@@ -361,6 +397,7 @@ mod tests {
         assert_eq!(gst_buffer_size, 65536); // There's going to be a lot of padding
 
         let read_buf = gst_buffer
+            .clone()
             .into_mapped_buffer_readable()
             .expect("Failed to map buffer");
         let plane_data = read_buf.as_slice();
@@ -383,7 +420,16 @@ mod tests {
                 .repeat(5)
             ]
             .concat()
-        )
+        );
+
+        let buf_meta = gst_buffer
+            .meta::<VideoMeta>()
+            .expect("Failed to get buffer meta");
+        assert_eq!(buf_meta.width(), 10);
+        assert_eq!(buf_meta.height(), 10);
+        assert_eq!(buf_meta.n_planes(), 1);
+        assert_eq!(buf_meta.stride(), vec![40]);
+        assert_eq!(buf_meta.offset(), vec![0]);
     }
 
     #[test]

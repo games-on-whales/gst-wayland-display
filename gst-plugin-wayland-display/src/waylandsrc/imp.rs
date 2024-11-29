@@ -232,7 +232,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             }
         };
 
-        gst::debug!(CAT, "Supported DMA formats: {:?}", gst_dma_formats);
+        tracing::info!("Supported DMA formats: {:?}", gst_dma_formats);
 
         if gst_dma_formats.is_empty() {
             let dmabuf_caps = gst_video::VideoCapsBuilder::new()
