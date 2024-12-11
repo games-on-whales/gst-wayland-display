@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::ops::DerefMut;
 use std::sync::Mutex;
 
 use gst::message::Application;
@@ -14,20 +15,29 @@ use gst_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
-use waylanddisplaycore::{DrmFormat, DrmModifier, GstVideoInfo, WaylandDisplay};
+use waylanddisplaycore::{
+    channel, ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, Sender,
+    WaylandDisplay,
+};
 
 use crate::utils::{GstLayer, CAT};
 
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
     settings: Mutex<Settings>,
+    command_tx: Sender<Command>,
+    command_rx: Mutex<Option<Channel<Command>>>,
 }
 
 impl Default for WaylandDisplaySrc {
     fn default() -> Self {
+        let (command_tx, command_rx) = channel();
+
         WaylandDisplaySrc {
             state: Mutex::new(None),
             settings: Mutex::new(Settings::default()),
+            command_tx,
+            command_rx: Mutex::new(Some(command_rx)),
         }
     }
 }
@@ -48,6 +58,96 @@ impl ObjectSubclass for WaylandDisplaySrc {
     type Type = super::WaylandDisplaySrc;
     type ParentType = gst_base::PushSrc;
     type Interfaces = ();
+}
+
+trait EventHandler {
+    fn handle_event(&self, event: &Event) -> bool;
+}
+
+impl EventHandler for WaylandDisplaySrc {
+    fn handle_event(&self, event: &Event) -> bool {
+        tracing::debug!("Received event: {:?}", event);
+        if event.type_() == gst::EventType::CustomUpstream {
+            let structure = event.structure().expect("Unable to get message structure");
+            if structure.has_name("VirtualDevicesReady") {
+                let paths = structure
+                    .get::<ValueArray>("paths")
+                    .expect("Should contain paths");
+                for value in paths.into_iter() {
+                    let path = value.get::<String>().expect("Paths are strings");
+                    let _ = self.command_tx.send(Command::InputDevice(path));
+                }
+
+                return true;
+            } else if structure.has_name("MouseMoveAbsolute") {
+                let x = structure
+                    .get::<f64>("pointer_x")
+                    .expect("Should contain pointer_x");
+                let y = structure
+                    .get::<f64>("pointer_y")
+                    .expect("Should contain pointer_y");
+
+                let _ = self
+                    .command_tx
+                    .send(Command::PointerMotionAbsolute((x, y).into()));
+
+                return true;
+            } else if structure.has_name("MouseMoveRelative") {
+                let x = structure
+                    .get::<f64>("pointer_x")
+                    .expect("Should contain pointer_x");
+                let y = structure
+                    .get::<f64>("pointer_y")
+                    .expect("Should contain pointer_y");
+
+                let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
+
+                return true;
+            } else if structure.has_name("MouseButton") {
+                let button = structure
+                    .get::<u32>("button")
+                    .expect("Should contain button");
+                let pressed = structure
+                    .get::<bool>("pressed")
+                    .expect("Should contain pressed");
+
+                let _ = self.command_tx.send(Command::PointerButton(
+                    button,
+                    if pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    },
+                ));
+
+                return true;
+            } else if structure.has_name("MouseAxis") {
+                let x = structure.get::<f64>("x").expect("Should contain x");
+                let y = structure.get::<f64>("y").expect("Should contain y");
+
+                let _ = self.command_tx.send(Command::PointerAxis(x, y));
+
+                return true;
+            } else if structure.has_name("KeyboardKey") {
+                let key = structure.get::<u32>("key").expect("Should contain key");
+                let pressed = structure
+                    .get::<bool>("pressed")
+                    .expect("Should contain pressed");
+
+                let _ = self.command_tx.send(Command::KeyboardInput(
+                    key,
+                    if pressed {
+                        KeyState::Pressed
+                    } else {
+                        KeyState::Released
+                    },
+                ));
+
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl ObjectImpl for WaylandDisplaySrc {
@@ -153,6 +253,13 @@ impl ElementImpl for WaylandDisplaySrc {
         });
 
         Some(&*ELEMENT_METADATA)
+    }
+
+    fn send_event(&self, event: Event) -> bool {
+        if self.handle_event(&event) {
+            return true;
+        }
+        self.parent_send_event(event)
     }
 
     fn pad_templates() -> &'static [gst::PadTemplate] {
@@ -269,86 +376,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn event(&self, event: &Event) -> bool {
-        if event.type_() == gst::EventType::CustomUpstream {
-            let structure = event.structure().expect("Unable to get message structure");
-            if structure.has_name("VirtualDevicesReady") {
-                let mut state = self.state.lock().unwrap();
-                let display = &mut state.as_mut().unwrap().display;
-
-                let paths = structure
-                    .get::<ValueArray>("paths")
-                    .expect("Should contain paths");
-                for value in paths.into_iter() {
-                    let path = value.get::<String>().expect("Paths are strings");
-                    display.add_input_device(path);
-                }
-
-                return true;
-            } else if structure.has_name("MouseMoveAbsolute") {
-                let mut state = self.state.lock().unwrap();
-                let display = &mut state.as_mut().unwrap().display;
-
-                let x = structure
-                    .get::<f64>("pointer_x")
-                    .expect("Should contain pointer_x");
-                let y = structure
-                    .get::<f64>("pointer_y")
-                    .expect("Should contain pointer_y");
-
-                display.pointer_motion_absolute(x, y);
-
-                return true;
-            } else if structure.has_name("MouseMoveRelative") {
-                let mut state = self.state.lock().unwrap();
-                let display = &mut state.as_mut().unwrap().display;
-
-                let x = structure
-                    .get::<f64>("pointer_x")
-                    .expect("Should contain pointer_x");
-                let y = structure
-                    .get::<f64>("pointer_y")
-                    .expect("Should contain pointer_y");
-
-                display.pointer_motion(x, y);
-
-                return true;
-            } else if structure.has_name("MouseButton") {
-                let mut state = self.state.lock().unwrap();
-                let display = &mut state.as_mut().unwrap().display;
-
-                let button = structure
-                    .get::<u32>("button")
-                    .expect("Should contain button");
-                let pressed = structure
-                    .get::<bool>("pressed")
-                    .expect("Should contain pressed");
-
-                display.pointer_button(button, pressed);
-
-                return true;
-            } else if structure.has_name("MouseAxis") {
-                let mut state = self.state.lock().unwrap();
-                let display = &mut state.as_mut().unwrap().display;
-
-                let x = structure.get::<f64>("x").expect("Should contain x");
-                let y = structure.get::<f64>("y").expect("Should contain y");
-
-                display.pointer_axis(x, y);
-
-                return true;
-            } else if structure.has_name("KeyboardKey") {
-                let mut state = self.state.lock().unwrap();
-                let display = &mut state.as_mut().unwrap().display;
-
-                let key = structure.get::<u32>("key").expect("Should contain key");
-                let pressed = structure
-                    .get::<bool>("pressed")
-                    .expect("Should contain pressed");
-
-                display.keyboard_input(key, pressed);
-
-                return true;
-            }
+        if self.handle_event(&event) {
+            return true;
         }
         self.parent_event(event)
     }
@@ -361,13 +390,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             ),
         };
 
-        self.state
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .display
-            .set_video_info(video_info);
+        let _ = self.command_tx.send(Command::VideoInfo(video_info));
 
         self.parent_set_caps(caps)
     }
@@ -383,7 +406,12 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let subscriber = Registry::default().with(GstLayer);
 
         let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
-            WaylandDisplay::new(settings.render_node.clone())
+            let mut command_rx = self.command_rx.lock().unwrap();
+            WaylandDisplay::new_with_channel(
+                settings.render_node.clone(),
+                self.command_tx.clone(),
+                command_rx.deref_mut().take().unwrap(),
+            )
         }) else {
             return Err(gst::error_msg!(LibraryError::Failed, ("Failed to open drm node {}, if you want to utilize software rendering set `render-node=software`.", settings.render_node.as_deref().unwrap_or("/dev/dri/renderD128"))));
         };

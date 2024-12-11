@@ -1,11 +1,11 @@
 use smithay::backend::drm::CreateDrmNodeError;
 use smithay::backend::SwapBuffersError;
-use smithay::reexports::calloop::channel::Sender;
+pub use smithay::reexports::calloop::channel::{channel, Channel, Sender};
 
 pub use smithay::backend::allocator::{
-    format::FormatSet, Format as DrmFormat, Fourcc, Modifier as DrmModifier, Vendor as DrmVendor
+    format::FormatSet, Format as DrmFormat, Fourcc, Modifier as DrmModifier, Vendor as DrmVendor,
 };
-use smithay::backend::input::{ButtonState, KeyState};
+pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{c_char, c_void, CString};
 use std::str::FromStr;
@@ -19,7 +19,7 @@ pub(crate) mod wayland;
 
 pub use crate::utils::video_info::GstVideoInfo;
 
-pub(crate) enum Command {
+pub enum Command {
     InputDevice(String),
     VideoInfo(GstVideoInfo),
     Buffer(
@@ -120,6 +120,30 @@ impl WaylandDisplay {
             }
         });
         let command_tx = channel_rx.recv().unwrap();
+
+        Ok(WaylandDisplay {
+            thread_handle: Some(thread_handle),
+            command_tx,
+            tracer: None,
+            devices: MaybeRecv::Rx(devices_rx),
+            envs: MaybeRecv::Rx(envs_rx),
+        })
+    }
+
+    pub fn new_with_channel(
+        render_node: Option<String>,
+        command_tx: Sender<Command>,
+        commands_rx: Channel<Command>,
+    ) -> Result<WaylandDisplay, CreateDrmNodeError> {
+        let (devices_tx, devices_rx) = std::sync::mpsc::channel();
+        let (envs_tx, envs_rx) = std::sync::mpsc::channel();
+        let render_target = RenderTarget::from_str(
+            &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
+        )?;
+
+        let thread_handle = std::thread::spawn(move || {
+            comp::init(commands_rx, render_target, devices_tx, envs_tx);
+        });
 
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
