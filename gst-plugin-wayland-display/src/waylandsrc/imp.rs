@@ -248,7 +248,7 @@ impl ElementImpl for WaylandDisplaySrc {
                 "Wayland display source",
                 "Source/Video",
                 "GStreamer video src running a wayland compositor",
-                "Victoria Brekenfeld <wayland@drakulix.de>",
+                "Victoria Brekenfeld <wayland@drakulix.de>, ABeltramo <https://github.com/ABeltramo>",
             )
         });
 
