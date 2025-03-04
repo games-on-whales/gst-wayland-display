@@ -97,27 +97,7 @@ impl CompositorHandler for State {
                 toplevel.send_configure();
                 self.pending_windows.push(window);
             } else {
-                let window_size = toplevel.current_state().size.unwrap_or((0, 0).into());
-                let output_size: Size<i32, _> = self
-                    .output
-                    .as_ref()
-                    .unwrap()
-                    .current_mode()
-                    .unwrap()
-                    .size
-                    .to_f64()
-                    .to_logical(
-                        self.output
-                            .as_ref()
-                            .unwrap()
-                            .current_scale()
-                            .fractional_scale(),
-                    )
-                    .to_i32_round();
-                let loc = (
-                    (output_size.w / 2) - (window_size.w / 2),
-                    (output_size.h / 2) - (window_size.h / 2),
-                );
+                let loc = (0,0);
                 self.space.map_element(window.clone(), loc, true);
                 self.seat.get_keyboard().unwrap().set_focus(
                     self,
