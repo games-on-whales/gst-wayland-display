@@ -13,6 +13,7 @@ use smithay::{
     input::{
         keyboard::{keysyms, FilterResult},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
+        touch::{TouchDownEvent, TouchMotionEvent, TouchUpEvent},
     },
     reexports::{
         input::LibinputInterface,
@@ -285,6 +286,83 @@ impl State {
         pointer.axis(self, frame);
         pointer.frame(self);
     }
+    
+    pub fn touch_down(
+        &mut self,
+        event_time_msec: u32,
+        slot: u32,
+        location: Point<f64, Logical>,
+    ) {
+        let serial = SERIAL_COUNTER.next_serial();
+        self.last_pointer_movement = Instant::now();
+    
+        let touch = self.seat.get_touch().unwrap();
+        let under = self
+            .space
+            .element_under(location)
+            .map(|(w, pos)| (w.clone().into(), pos));
+    
+        touch.down(
+            self,
+            &TouchDownEvent {
+                slot,
+                location,
+                serial,
+                time: event_time_msec,
+            },
+            under,
+        );
+        touch.frame(self);
+    }
+
+    pub fn touch_up(
+        &mut self,
+        event_time_msec: u32,
+        slot: u32,
+    ) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let touch = self.seat.get_touch().unwrap();
+    
+        touch.up(
+            self,
+            &TouchUpEvent {
+                slot,
+                serial,
+                time: event_time_msec,
+            },
+        );
+        touch.frame(self);
+    }
+    
+    pub fn touch_motion(
+        &mut self,
+        event_time_msec: u32,
+        slot: u32,
+        location: Point<f64, Logical>,
+    ) {
+        let touch = self.seat.get_touch().unwrap();
+    
+        touch.motion(
+            self,
+            &TouchMotionEvent {
+                slot,
+                location,
+                time: event_time_msec,
+            },
+        );
+        touch.frame(self);
+    }
+
+    pub fn touch_cancel(&mut self, event_time_msec: u32) {
+        let touch = self.seat.get_touch().unwrap();
+        touch.cancel(self, event_time_msec);
+        touch.frame(self);
+    }
+    
+    pub fn touch_frame(&mut self) {
+        let touch = self.seat.get_touch().unwrap();
+        touch.frame(self);
+    }
 
     pub fn process_input_event(&mut self, event: InputEvent<LibinputInputBackend>) {
         match event {
@@ -334,6 +412,47 @@ impl State {
                     horizontal_amount_discrete,
                     vertical_amount_discrete,
                 );
+            }
+            InputEvent::TouchDown { event, .. } => {
+                if let Some(output) = self.output.as_ref() {
+                    let output_size = output
+                        .current_mode()
+                        .unwrap()
+                        .size
+                        .to_f64()
+                        .to_logical(output.current_scale().fractional_scale())
+                        .to_i32_round();
+            
+                    let x = event.absolute_x_transformed(output_size.w);
+                    let y = event.absolute_y_transformed(output_size.h);
+            
+                    self.touch_down(event.time_msec(), event.slot(), (x, y).into());
+                }
+            }
+            InputEvent::TouchUp { event, .. } => {
+                self.touch_up(event.time_msec(), event.slot());
+            }
+            InputEvent::TouchMotion { event, .. } => {
+                if let Some(output) = self.output.as_ref() {
+                    let output_size = output
+                        .current_mode()
+                        .unwrap()
+                        .size
+                        .to_f64()
+                        .to_logical(output.current_scale().fractional_scale())
+                        .to_i32_round();
+            
+                    let x = event.absolute_x_transformed(output_size.w);
+                    let y = event.absolute_y_transformed(output_size.h);
+            
+                    self.touch_motion(event.time_msec(), event.slot(), (x, y).into());
+                }
+            }
+            InputEvent::TouchCancel { event, .. } => {
+                self.touch_cancel(event.time_msec());
+            }
+            InputEvent::TouchFrame { .. } => {
+                self.touch_frame();
             }
             _ => {}
         }
