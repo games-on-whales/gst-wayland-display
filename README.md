@@ -1,4 +1,3 @@
-A fork to try adding inputevent handling of touches
 # gst-wayland-display
 
 A micro Wayland compositor that can be used as a Gstreamer plugin. Based
