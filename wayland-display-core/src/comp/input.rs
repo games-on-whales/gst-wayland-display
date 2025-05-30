@@ -6,14 +6,14 @@ use smithay::{
     backend::{
         input::{
             Axis, AxisSource, ButtonState, Event, InputEvent, KeyState, KeyboardKeyEvent,
-            PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+            PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent,
         },
         libinput::LibinputInputBackend,
     },
     input::{
         keyboard::{keysyms, FilterResult},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
-        touch::{TouchDownEvent, TouchMotionEvent, TouchUpEvent},
+        touch::{DownEvent, UpEvent},
     },
     reexports::{
         input::LibinputInterface,
@@ -303,7 +303,7 @@ impl State {
         touch.down(
             self,
             under,
-            &TouchDownEvent {
+            &DownEvent {
                 slot: slot,
                 location: location,
                 serial,
@@ -323,7 +323,7 @@ impl State {
     
         touch.up(
             self,
-            &TouchUpEvent {
+            &UpEvent {
                 slot: slot,
                 serial,
                 time: event_time_msec,
