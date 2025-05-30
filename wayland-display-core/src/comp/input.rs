@@ -7,7 +7,7 @@ use smithay::{
         input::{
             Axis, AxisSource, ButtonState, Event, InputEvent, KeyState, KeyboardKeyEvent,
             PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent, TouchSlot,
-            AbsolutePositionEvent,
+            AbsolutePositionEvent, DeviceCapability,
         },
         libinput::LibinputInputBackend,
     },
@@ -454,6 +454,11 @@ impl State {
             }
             InputEvent::TouchFrame { .. } => {
                 self.touch_frame();
+            }
+            InputEvent::DeviceAdded { device } => {
+                if device.has_capability(DeviceCapability::Touch.into()) && self.seat.get_touch().is_none() {
+                    self.seat.add_touch();
+                }
             }
             _ => {}
         }
