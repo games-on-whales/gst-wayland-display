@@ -294,8 +294,6 @@ impl State {
         location: Point<f64, Logical>,
     ) {
         let serial = SERIAL_COUNTER.next_serial();
-        self.last_pointer_movement = Instant::now();
-    
         let touch = self.seat.get_touch().unwrap();
         let under = self
             .space
@@ -304,13 +302,13 @@ impl State {
     
         touch.down(
             self,
+            under,
             &TouchDownEvent {
-                slot,
-                location,
+                slot: slot,
+                location: location,
                 serial,
                 time: event_time_msec,
             },
-            under,
         );
         touch.frame(self);
     }
@@ -326,7 +324,7 @@ impl State {
         touch.up(
             self,
             &TouchUpEvent {
-                slot,
+                slot: slot,
                 serial,
                 time: event_time_msec,
             },
@@ -341,9 +339,14 @@ impl State {
         location: Point<f64, Logical>,
     ) {
         let touch = self.seat.get_touch().unwrap();
+        let under = self
+            .space
+            .element_under(location)
+            .map(|(w, pos)| (w.clone().into(), pos));
     
         touch.motion(
             self,
+            under,
             &TouchMotionEvent {
                 slot,
                 location,
