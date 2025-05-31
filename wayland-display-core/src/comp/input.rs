@@ -307,6 +307,32 @@ impl State {
                 + output_geometry.loc.to_f64(),
         )
     }
+
+    pub fn relative_touch_to_logical(
+        &mut self,                
+        relative_pos: Point<f64, Logical>,                           // 0.0 to 1.0
+    ) -> Option<Point<f64, Logical>> {
+        let output = self.space
+            .outputs()
+            .find(|output| output.name().starts_with("eDP"))
+            .or_else(|| self.space.outputs().next())?;
+
+        let output_geometry = self.space.output_geometry(output)?;
+        let transform = output.current_transform();
+
+        // Size before transform
+        let untransformed_size = transform.invert().transform_size(output_geometry.size);
+        let size_f64 = untransformed_size.to_f64();
+
+        // Scaled raw position in untransformed space
+        let pos = Point::from((relative_pos.x * size_f64.w, relative_pos.y * size_f64.h));
+
+        // Now apply the output transform
+        let transformed_pos = transform.transform_point_in(pos, &size_f64);
+
+        // Map to global logical coordinates
+        Some(transformed_pos + output_geometry.loc.to_f64())
+    }
     
     pub fn touch_down(
         &mut self,

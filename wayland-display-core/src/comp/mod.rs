@@ -504,7 +504,9 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::TouchDown(id, position)) => {
                     let time: Duration = state.clock.now().into();
-                    state.touch_down(time.as_millis() as u32, TouchSlot::from(Some(id)), position);
+                    let logical_position = state.relative_touch_to_logical(position)
+                        .expect("Failed to convert relative touch position to logical coordinates");
+                    state.touch_down(time.as_millis() as u32, TouchSlot::from(Some(id)), logical_position);
                 }
                 Event::Msg(Command::TouchUp(id)) => {
                     let time: Duration = state.clock.now().into();
@@ -512,7 +514,9 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::TouchMotion(id, position)) => {
                     let time: Duration = state.clock.now().into();
-                    state.touch_motion(time.as_millis() as u32, TouchSlot::from(Some(id)), position);
+                    let logical_position = state.relative_touch_to_logical(position)
+                        .expect("Failed to convert relative touch position to logical coordinates");
+                    state.touch_motion(time.as_millis() as u32, TouchSlot::from(Some(id)), logical_position);
                 }
                 Event::Msg(Command::TouchCancel) => {
                     state.touch_cancel();
