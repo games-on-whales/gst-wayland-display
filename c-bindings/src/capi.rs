@@ -139,6 +139,36 @@ pub extern "C" fn display_pointer_axis(dpy: *mut WaylandDisplay, x: f64, y: f64)
 }
 
 #[no_mangle]
+pub extern "C" fn display_touch_down(dpy: *mut WaylandDisplay, id: c_uint, x: f64, y: f64) {
+    let display = unsafe { &mut *dpy };
+    display.touch_down(id, x, y);
+}
+
+#[no_mangle]
+pub extern "C" fn display_touch_up(dpy: *mut WaylandDisplay, id: c_uint) {
+    let display = unsafe { &mut *dpy };
+    display.touch_up(id);
+}
+
+#[no_mangle]
+pub extern "C" fn display_touch_motion(dpy: *mut WaylandDisplay, id: c_uint, x: f64, y: f64) {
+    let display = unsafe { &mut *dpy };
+    display.touch_motion(id, x, y);
+}
+
+#[no_mangle]
+pub extern "C" fn display_touch_cancel(dpy: *mut WaylandDisplay) {
+    let display = unsafe { &mut *dpy };
+    display.touch_cancel();
+}
+
+#[no_mangle]
+pub extern "C" fn display_touch_frame(dpy: *mut WaylandDisplay) {
+    let display = unsafe { &mut *dpy };
+    display.touch_frame();
+}
+
+#[no_mangle]
 pub extern "C" fn display_get_frame(dpy: *mut WaylandDisplay) -> *mut GstBuffer {
     let display = unsafe { &mut *dpy };
     let _span = match display.tracer.as_ref() {

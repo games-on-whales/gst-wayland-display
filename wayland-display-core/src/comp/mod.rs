@@ -60,6 +60,7 @@ use smithay::{
     },
 };
 use smithay::backend::input::AxisSource;
+use smithay::backend::input::TouchSlot;
 use tracing::debug;
 
 mod focus;
@@ -237,6 +238,7 @@ pub(crate) fn init(
     seat.add_keyboard(XkbConfig::default(), 200, 25)
         .expect("Failed to add keyboard to seat");
     seat.add_pointer();
+    seat.add_touch();
 
     let mut event_loop =
         EventLoop::<State>::try_new().expect("Unable to create event_loop");
@@ -499,6 +501,24 @@ pub(crate) fn init(
                 Event::Msg(Command::PointerAxis(horizontal_amount, vertical_amount)) => {
                     let time: Duration = state.clock.now().into();
                     state.pointer_axis(time.as_millis() as u32, AxisSource::Wheel, horizontal_amount * 3.0 / 120.0, vertical_amount * 3.0 / 120.0, Some(horizontal_amount), Some(vertical_amount));
+                }
+                Event::Msg(Command::TouchDown(id, position)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.touch_down(time.as_millis() as u32, TouchSlot::from(Some(id)), position);
+                }
+                Event::Msg(Command::TouchUp(id)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.touch_up(time.as_millis() as u32, TouchSlot::from(Some(id)));
+                }
+                Event::Msg(Command::TouchMotion(id, position)) => {
+                    let time: Duration = state.clock.now().into();
+                    state.touch_motion(time.as_millis() as u32, TouchSlot::from(Some(id)), position);
+                }
+                Event::Msg(Command::TouchCancel) => {
+                    state.touch_cancel();
+                }
+                Event::Msg(Command::TouchFrame) => {
+                    state.touch_frame();
                 }
             };
         })

@@ -25,6 +25,11 @@ pub(crate) enum Command {
     PointerMotionAbsolute(Point<f64, Logical>),
     PointerButton(u32, ButtonState),
     PointerAxis(f64, f64),
+    TouchDown(u32, Point<f64, Logical>),
+    TouchUp(u32),
+    TouchMotion(u32, Point<f64, Logical>),
+    TouchCancel,
+    TouchFrame,
     Quit,
 }
 
@@ -165,6 +170,26 @@ impl WaylandDisplay {
 
     pub fn pointer_axis(&self, x: f64, y: f64) {
         let _ = self.command_tx.send(Command::PointerAxis(x, y));
+    }
+
+    pub fn touch_down(&self, id: u32, x: f64, y: f64) {
+        let _ = self.command_tx.send(Command::TouchDown(id, (x, y).into()));
+    }
+
+    pub fn touch_up(&self, id: u32) {
+        let _ = self.command_tx.send(Command::TouchUp(id));
+    }
+    
+    pub fn touch_motion(&self, id: u32, x: f64, y: f64) {
+        let _ = self.command_tx.send(Command::TouchMotion(id, (x, y).into()));
+    }
+
+    pub fn touch_cancel(&self) {
+        let _ = self.command_tx.send(Command::TouchCancel);
+    }
+
+    pub fn touch_frame(&self) {
+        let _ = self.command_tx.send(Command::TouchFrame);
     }
 
     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
