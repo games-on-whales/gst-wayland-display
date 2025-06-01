@@ -139,9 +139,9 @@ pub extern "C" fn display_pointer_axis(dpy: *mut WaylandDisplay, x: f64, y: f64)
 }
 
 #[no_mangle]
-pub extern "C" fn display_touch_down(dpy: *mut WaylandDisplay, id: c_uint, x: f64, y: f64) {
+pub extern "C" fn display_touch_down(dpy: *mut WaylandDisplay, id: c_uint, rel_x: f64, rel_y: f64) {
     let display = unsafe { &mut *dpy };
-    display.touch_down(id, x, y);
+    display.touch_down(id, rel_x, rel_y);
 }
 
 #[no_mangle]
@@ -151,9 +151,9 @@ pub extern "C" fn display_touch_up(dpy: *mut WaylandDisplay, id: c_uint) {
 }
 
 #[no_mangle]
-pub extern "C" fn display_touch_motion(dpy: *mut WaylandDisplay, id: c_uint, x: f64, y: f64) {
+pub extern "C" fn display_touch_motion(dpy: *mut WaylandDisplay, id: c_uint, rel_x: f64, rel_y: f64) {
     let display = unsafe { &mut *dpy };
-    display.touch_motion(id, x, y);
+    display.touch_motion(id, rel_x, rel_y);
 }
 
 #[no_mangle]

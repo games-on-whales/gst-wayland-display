@@ -502,9 +502,9 @@ pub(crate) fn init(
                     let time: Duration = state.clock.now().into();
                     state.pointer_axis(time.as_millis() as u32, AxisSource::Wheel, horizontal_amount * 3.0 / 120.0, vertical_amount * 3.0 / 120.0, Some(horizontal_amount), Some(vertical_amount));
                 }
-                Event::Msg(Command::TouchDown(id, position)) => {
+                Event::Msg(Command::TouchDown(id, rel_position)) => {
                     let time: Duration = state.clock.now().into();
-                    let logical_position = state.relative_touch_to_logical(position)
+                    let logical_position = state.relative_touch_to_logical(rel_position)
                         .expect("Failed to convert relative touch position to logical coordinates");
                     state.touch_down(time.as_millis() as u32, TouchSlot::from(Some(id)), logical_position);
                 }
@@ -512,9 +512,9 @@ pub(crate) fn init(
                     let time: Duration = state.clock.now().into();
                     state.touch_up(time.as_millis() as u32, TouchSlot::from(Some(id)));
                 }
-                Event::Msg(Command::TouchMotion(id, position)) => {
+                Event::Msg(Command::TouchMotion(id, rel_position)) => {
                     let time: Duration = state.clock.now().into();
-                    let logical_position = state.relative_touch_to_logical(position)
+                    let logical_position = state.relative_touch_to_logical(rel_position)
                         .expect("Failed to convert relative touch position to logical coordinates");
                     state.touch_motion(time.as_millis() as u32, TouchSlot::from(Some(id)), logical_position);
                 }

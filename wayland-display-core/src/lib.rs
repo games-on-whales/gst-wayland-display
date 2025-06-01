@@ -172,16 +172,16 @@ impl WaylandDisplay {
         let _ = self.command_tx.send(Command::PointerAxis(x, y));
     }
 
-    pub fn touch_down(&self, id: u32, x: f64, y: f64) {
-        let _ = self.command_tx.send(Command::TouchDown(id, (x, y).into()));
+    pub fn touch_down(&self, id: u32, rel_x: f64, rel_y: f64) {
+        let _ = self.command_tx.send(Command::TouchDown(id, (rel_x, rel_y).into()));
     }
 
     pub fn touch_up(&self, id: u32) {
         let _ = self.command_tx.send(Command::TouchUp(id));
     }
     
-    pub fn touch_motion(&self, id: u32, x: f64, y: f64) {
-        let _ = self.command_tx.send(Command::TouchMotion(id, (x, y).into()));
+    pub fn touch_motion(&self, id: u32, rel_x: f64, rel_y: f64) {
+        let _ = self.command_tx.send(Command::TouchMotion(id, (rel_x, rel_y).into()));
     }
 
     pub fn touch_cancel(&self) {
