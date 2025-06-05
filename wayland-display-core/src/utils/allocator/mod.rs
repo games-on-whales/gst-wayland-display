@@ -62,12 +62,22 @@ impl GsDmaBuf {
     pub fn new(render_node: DrmNode, video_info: VideoInfoDmaDrm) -> Option<Self> {
         tracing::debug!("Creating DMA buffer from {:?}", video_info);
         let drm_fourcc = gst_video_format_to_drm_fourcc(video_info.clone())?;
-        let drm_modifier = gst_video_format_to_drm_modifier(video_info.clone())?;
+        let mut drm_modifier = gst_video_format_to_drm_modifier(video_info.clone())?;
         tracing::info!(
             "Creating DMA buffer - DrmFourcc: {:?}, Modifier: {:?}",
             drm_fourcc,
             drm_modifier
         );
+
+        // NOTE: This is a workaround for the i915 4-tiled modifiers
+        //       not being advertised by gstreamer elements.
+        // - In this part we check for y-tiled modifiers and
+        //   change them back to 4-tiled modifiers to make them actually work.
+        //   (These modifiers overlap well enough to work interchangeably)
+        // Earlier part in gst-plugin-wayland-display waylandsrc/imp.rs.
+        if drm_modifier == DrmModifier::I915_y_tiled {
+            drm_modifier = DrmModifier::Unrecognized(0x0100000000000009)
+        }
 
         let gbm = new_gbm_device(render_node)?;
         let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);

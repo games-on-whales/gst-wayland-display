@@ -473,6 +473,15 @@ fn drm_to_gst_format(format: &DrmFormat) -> Option<String> {
     } else {
         match format.modifier {
             DrmModifier::Invalid => None,
+            DrmModifier::Unrecognized(0x0100000000000009) => {
+                // NOTE: This is a workaround for the i915 4-tiled modifiers
+                //       not being advertised by gstreamer elements.
+                // - In this part we tell we map any 4-tiled modifiers 
+                //   to y-tiled ones for compatibility with gstreamer.
+                // Continued in wayland-display-core allocator/mod.rs.
+                let modifier: u64 = DrmModifier::I915_y_tiled.into();
+                Some(format!("{}:0x{:016x}", video_format, modifier))
+            },
             modifier => {
                 let modifier: u64 = modifier.into();
                 Some(format!("{}:0x{:016x}", video_format, modifier))
