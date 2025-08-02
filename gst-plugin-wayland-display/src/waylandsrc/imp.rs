@@ -77,104 +77,108 @@ trait EventHandler {
 impl EventHandler for WaylandDisplaySrc {
     fn handle_event(&self, event: &Event) -> bool {
         tracing::debug!("Received event: {:?}", event);
-        if event.type_() == gst::EventType::CustomUpstream {
-            let structure = event.structure().expect("Unable to get message structure");
-            if structure.has_name("VirtualDevicesReady") {
-                let path = structure
-                    .get::<String>("path")
-                    .expect("Should contain the path to the device as a String");
-                let _ = self.command_tx.send(Command::InputDevice(path));
-                return true;
-            } else if structure.has_name("MouseMoveAbsolute") {
-                let x = structure
-                    .get::<f64>("pointer_x")
-                    .expect("Should contain pointer_x");
-                let y = structure
-                    .get::<f64>("pointer_y")
-                    .expect("Should contain pointer_y");
 
-                let _ = self
-                    .command_tx
-                    .send(Command::PointerMotionAbsolute((x, y).into()));
+        match event.view() {
+            gst::EventView::CustomUpstream(e) => {
+                let structure = e.structure().expect("Unable to get message structure");
+                if structure.has_name("VirtualDevicesReady") {
+                    let path = structure
+                        .get::<String>("path")
+                        .expect("Should contain the path to the device as a String");
+                    let _ = self.command_tx.send(Command::InputDevice(path));
+                    return true;
+                } else if structure.has_name("MouseMoveAbsolute") {
+                    let x = structure
+                        .get::<f64>("pointer_x")
+                        .expect("Should contain pointer_x");
+                    let y = structure
+                        .get::<f64>("pointer_y")
+                        .expect("Should contain pointer_y");
 
-                return true;
-            } else if structure.has_name("MouseMoveRelative") {
-                let x = structure
-                    .get::<f64>("pointer_x")
-                    .expect("Should contain pointer_x");
-                let y = structure
-                    .get::<f64>("pointer_y")
-                    .expect("Should contain pointer_y");
+                    let _ = self
+                        .command_tx
+                        .send(Command::PointerMotionAbsolute((x, y).into()));
 
-                let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
+                    return true;
+                } else if structure.has_name("MouseMoveRelative") {
+                    let x = structure
+                        .get::<f64>("pointer_x")
+                        .expect("Should contain pointer_x");
+                    let y = structure
+                        .get::<f64>("pointer_y")
+                        .expect("Should contain pointer_y");
 
-                return true;
-            } else if structure.has_name("MouseButton") {
-                let button = structure
-                    .get::<u32>("button")
-                    .expect("Should contain button");
-                let pressed = structure
-                    .get::<bool>("pressed")
-                    .expect("Should contain pressed");
+                    let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
 
-                let _ = self.command_tx.send(Command::PointerButton(
-                    button,
-                    if pressed {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    },
-                ));
+                    return true;
+                } else if structure.has_name("MouseButton") {
+                    let button = structure
+                        .get::<u32>("button")
+                        .expect("Should contain button");
+                    let pressed = structure
+                        .get::<bool>("pressed")
+                        .expect("Should contain pressed");
 
-                return true;
-            } else if structure.has_name("MouseAxis") {
-                let x = structure.get::<f64>("x").expect("Should contain x");
-                let y = structure.get::<f64>("y").expect("Should contain y");
+                    let _ = self.command_tx.send(Command::PointerButton(
+                        button,
+                        if pressed {
+                            ButtonState::Pressed
+                        } else {
+                            ButtonState::Released
+                        },
+                    ));
 
-                let _ = self.command_tx.send(Command::PointerAxis(x, y));
+                    return true;
+                } else if structure.has_name("MouseAxis") {
+                    let x = structure.get::<f64>("x").expect("Should contain x");
+                    let y = structure.get::<f64>("y").expect("Should contain y");
 
-                return true;
-            } else if structure.has_name("KeyboardKey") {
-                let key = structure.get::<u32>("key").expect("Should contain key");
-                let pressed = structure
-                    .get::<bool>("pressed")
-                    .expect("Should contain pressed");
+                    let _ = self.command_tx.send(Command::PointerAxis(x, y));
 
-                let _ = self.command_tx.send(Command::KeyboardInput(
-                    key,
-                    if pressed {
-                        KeyState::Pressed
-                    } else {
-                        KeyState::Released
-                    },
-                ));
+                    return true;
+                } else if structure.has_name("KeyboardKey") {
+                    let key = structure.get::<u32>("key").expect("Should contain key");
+                    let pressed = structure
+                        .get::<bool>("pressed")
+                        .expect("Should contain pressed");
 
-                return true;
-            } else if structure.has_name("TouchDown") {
-                let x = structure.get::<f64>("x").expect("Should contain x");
-                let y = structure.get::<f64>("y").expect("Should contain y");
-                let id = structure.get::<u32>("id").expect("Should contain id");
-                let _ = self.command_tx.send(Command::TouchDown(id, (x, y).into()));
-                return true;
-            } else if structure.has_name("TouchUp") {
-                let id = structure.get::<u32>("id").expect("Should contain id");
-                let _ = self.command_tx.send(Command::TouchUp(id));
-                return true;
-            } else if structure.has_name("TouchMotion") {
-                let x = structure.get::<f64>("x").expect("Should contain x");
-                let y = structure.get::<f64>("y").expect("Should contain y");
-                let id = structure.get::<u32>("id").expect("Should contain id");
-                let _ = self
-                    .command_tx
-                    .send(Command::TouchMotion(id, (x, y).into()));
-                return true;
-            } else if structure.has_name("TouchFrame") {
-                let _ = self.command_tx.send(Command::TouchFrame);
-                return true;
-            } else if structure.has_name("TouchCancel") {
-                let _ = self.command_tx.send(Command::TouchCancel);
-                return true;
-            }
+                    let _ = self.command_tx.send(Command::KeyboardInput(
+                        key,
+                        if pressed {
+                            KeyState::Pressed
+                        } else {
+                            KeyState::Released
+                        },
+                    ));
+
+                    return true;
+                } else if structure.has_name("TouchDown") {
+                    let x = structure.get::<f64>("x").expect("Should contain x");
+                    let y = structure.get::<f64>("y").expect("Should contain y");
+                    let id = structure.get::<u32>("id").expect("Should contain id");
+                    let _ = self.command_tx.send(Command::TouchDown(id, (x, y).into()));
+                    return true;
+                } else if structure.has_name("TouchUp") {
+                    let id = structure.get::<u32>("id").expect("Should contain id");
+                    let _ = self.command_tx.send(Command::TouchUp(id));
+                    return true;
+                } else if structure.has_name("TouchMotion") {
+                    let x = structure.get::<f64>("x").expect("Should contain x");
+                    let y = structure.get::<f64>("y").expect("Should contain y");
+                    let id = structure.get::<u32>("id").expect("Should contain id");
+                    let _ = self
+                        .command_tx
+                        .send(Command::TouchMotion(id, (x, y).into()));
+                    return true;
+                } else if structure.has_name("TouchFrame") {
+                    let _ = self.command_tx.send(Command::TouchFrame);
+                    return true;
+                } else if structure.has_name("TouchCancel") {
+                    let _ = self.command_tx.send(Command::TouchCancel);
+                    return true;
+                }
+            },
+            _ => (),
         }
         false
     }
