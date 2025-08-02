@@ -30,6 +30,7 @@ wayland-display-core = { path = "../wayland-display-core" }
 tracing.workspace = true
 once_cell.workspace = true
 tracing-subscriber = "0.3.16"
+input-event-codes-sys = "0.1.0"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.7.5"

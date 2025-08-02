@@ -8,11 +8,12 @@ use gst::{Structure, prelude::*};
 use gst_base::prelude::BaseSrcExt;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
-use gst_video::{VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
+use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::sync::atomic::AtomicPtr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 #[cfg(feature = "cuda")]
@@ -177,6 +178,64 @@ impl EventHandler for WaylandDisplaySrc {
                     let _ = self.command_tx.send(Command::TouchCancel);
                     return true;
                 }
+            },
+            gst::EventView::Navigation(n) =>{
+                let navigation_event = gst_video::NavigationEvent::parse(n).unwrap();
+
+                match navigation_event {
+                    NavigationEvent::MouseMove { x, y, .. } => {
+                        let _ = self
+                            .command_tx
+                            .send(Command::PointerMotionAbsolute((x, y).into()));
+
+                        return true;
+                    },
+                    NavigationEvent::MouseButtonPress { button, .. } => {
+                        if let Some(cmd) = gst_button_to_msg(button, ButtonState::Pressed) {
+                            let _ = self.command_tx.send(cmd);
+                        } else {
+                            tracing::warn!("Unknown mouse button pressed: {:?}", button);
+                        }
+
+                        return true;
+                    },
+                    NavigationEvent::MouseButtonRelease { button, .. } => {
+                        if let Some(cmd) = gst_button_to_msg(button, ButtonState::Released) {
+                            let _ = self.command_tx.send(cmd);
+                        } else {
+                            tracing::warn!("Unknown mouse button released: {:?}", button);
+                        }
+
+                        return true;
+                    },
+                    NavigationEvent::KeyPress { key, .. } => {
+                        if let Some(scancode) = gst_key_to_scancode(&key) {
+                            let _ = self.command_tx.send(Command::KeyboardInput(
+                                scancode,
+                                KeyState::Pressed
+                            ));
+                        } else {
+                            tracing::warn!("Unknown keyboard key pressed: {:?}", key);
+                        }
+
+                        return true;
+                    },
+                    NavigationEvent::KeyRelease { key, .. } => {
+                        if let Some(scancode) = gst_key_to_scancode(&key) {
+                            let _ = self.command_tx.send(Command::KeyboardInput(
+                                scancode,
+                                KeyState::Released
+                            ));
+                        } else {
+                            tracing::warn!("Unknown keyboard key pressed: {:?}", key);
+                        }
+
+                        return true;
+                    },
+                    _ => {
+                        tracing::warn!("Unhandled event: {:?}", navigation_event);
+                    },
+                };
             },
             _ => (),
         }
@@ -838,6 +897,240 @@ fn drm_to_gst_format(format: &DrmFormat, disable_workaround: bool) -> Option<Str
             }
         }
     }
+}
+
+fn gst_button_to_msg(button: i32, state: ButtonState) -> Option<Command> {
+    match button as u32 {
+        // X11 buttons are internally mapped to some values
+        1 => Some(Command::PointerButton(input_event_codes_sys::BTN_LEFT, state)),
+        2 => Some(Command::PointerButton(input_event_codes_sys::BTN_MIDDLE, state)),
+        3 => Some(Command::PointerButton(input_event_codes_sys::BTN_RIGHT, state)),
+        4 => Some(Command::PointerAxis(0.0, -10.0)),
+        5 => Some(Command::PointerAxis(0.0, 10.0)),
+        // TODO: should we handle these?
+        8 => Some(Command::PointerButton(input_event_codes_sys::BTN_BACK, state)),
+        9 => Some(Command::PointerButton(input_event_codes_sys::BTN_FORWARD, state)),
+        // Wayland buttons are just copies from linux input-event-codes.h, so handle them transparently
+        input_event_codes_sys::BTN_LEFT => Some(Command::PointerButton(input_event_codes_sys::BTN_LEFT, state)),
+        input_event_codes_sys::BTN_RIGHT => Some(Command::PointerButton(input_event_codes_sys::BTN_RIGHT, state)),
+        input_event_codes_sys::BTN_MIDDLE => Some(Command::PointerButton(input_event_codes_sys::BTN_MIDDLE, state)),
+        input_event_codes_sys::BTN_SIDE => Some(Command::PointerButton(input_event_codes_sys::BTN_SIDE, state)),
+        input_event_codes_sys::BTN_EXTRA => Some(Command::PointerButton(input_event_codes_sys::BTN_EXTRA, state)),
+        input_event_codes_sys::BTN_FORWARD => Some(Command::PointerButton(input_event_codes_sys::BTN_FORWARD, state)),
+        input_event_codes_sys::BTN_BACK => Some(Command::PointerButton(input_event_codes_sys::BTN_BACK, state)),
+        input_event_codes_sys::BTN_WHEEL => Some(Command::PointerButton(input_event_codes_sys::BTN_WHEEL, state)),
+        // TODO: should we handle others?
+        _ => None,
+    }
+}
+
+fn gst_key_to_scancode(key: &str) -> Option<u32> {
+    static KEYMAP: LazyLock<HashMap<&str, u32>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("Escape", input_event_codes_sys::KEY_ESC);
+        m.insert("1", input_event_codes_sys::KEY_1);
+        m.insert("exclam", input_event_codes_sys::KEY_1);
+        m.insert("2", input_event_codes_sys::KEY_2);
+        m.insert("at", input_event_codes_sys::KEY_2);
+        m.insert("3", input_event_codes_sys::KEY_3);
+        m.insert("numbersign", input_event_codes_sys::KEY_3);
+        m.insert("4", input_event_codes_sys::KEY_4);
+        m.insert("dollar", input_event_codes_sys::KEY_4);
+        m.insert("5", input_event_codes_sys::KEY_5);
+        m.insert("percent", input_event_codes_sys::KEY_5);
+        m.insert("6", input_event_codes_sys::KEY_6);
+        m.insert("asciicircum", input_event_codes_sys::KEY_6);
+        m.insert("7", input_event_codes_sys::KEY_7);
+        m.insert("ampersand", input_event_codes_sys::KEY_7);
+        m.insert("8", input_event_codes_sys::KEY_8);
+        m.insert("asterisk", input_event_codes_sys::KEY_8);
+        m.insert("9", input_event_codes_sys::KEY_9);
+        m.insert("parenleft", input_event_codes_sys::KEY_9);
+        m.insert("0", input_event_codes_sys::KEY_0);
+        m.insert("parenright", input_event_codes_sys::KEY_0);
+        m.insert("minus", input_event_codes_sys::KEY_MINUS);
+        m.insert("underscore", input_event_codes_sys::KEY_MINUS);
+        m.insert("equal", input_event_codes_sys::KEY_EQUAL);
+        m.insert("plus", input_event_codes_sys::KEY_EQUAL);
+        m.insert("BackSpace", input_event_codes_sys::KEY_BACKSPACE);
+        m.insert("Tab", input_event_codes_sys::KEY_TAB);
+        m.insert("Q", input_event_codes_sys::KEY_Q);
+        m.insert("q", input_event_codes_sys::KEY_Q);
+        m.insert("W", input_event_codes_sys::KEY_W);
+        m.insert("w", input_event_codes_sys::KEY_W);
+        m.insert("E", input_event_codes_sys::KEY_E);
+        m.insert("e", input_event_codes_sys::KEY_E);
+        m.insert("R", input_event_codes_sys::KEY_R);
+        m.insert("r", input_event_codes_sys::KEY_R);
+        m.insert("T", input_event_codes_sys::KEY_T);
+        m.insert("t", input_event_codes_sys::KEY_T);
+        m.insert("Y", input_event_codes_sys::KEY_Y);
+        m.insert("y", input_event_codes_sys::KEY_Y);
+        m.insert("U", input_event_codes_sys::KEY_U);
+        m.insert("u", input_event_codes_sys::KEY_U);
+        m.insert("I", input_event_codes_sys::KEY_I);
+        m.insert("i", input_event_codes_sys::KEY_I);
+        m.insert("O", input_event_codes_sys::KEY_O);
+        m.insert("o", input_event_codes_sys::KEY_O);
+        m.insert("P", input_event_codes_sys::KEY_P);
+        m.insert("p", input_event_codes_sys::KEY_P);
+        m.insert("bracketleft", input_event_codes_sys::KEY_LEFTBRACE);
+        m.insert("braceleft", input_event_codes_sys::KEY_LEFTBRACE);
+        m.insert("bracketright", input_event_codes_sys::KEY_RIGHTBRACE);
+        m.insert("braceright", input_event_codes_sys::KEY_RIGHTBRACE);
+        m.insert("Return", input_event_codes_sys::KEY_ENTER);
+        m.insert("Control_L", input_event_codes_sys::KEY_LEFTCTRL);
+        m.insert("Control_L", input_event_codes_sys::KEY_LEFTCTRL);
+        m.insert("A", input_event_codes_sys::KEY_A);
+        m.insert("a", input_event_codes_sys::KEY_A);
+        m.insert("S", input_event_codes_sys::KEY_S);
+        m.insert("s", input_event_codes_sys::KEY_S);
+        m.insert("D", input_event_codes_sys::KEY_D);
+        m.insert("d", input_event_codes_sys::KEY_D);
+        m.insert("F", input_event_codes_sys::KEY_F);
+        m.insert("f", input_event_codes_sys::KEY_F);
+        m.insert("G", input_event_codes_sys::KEY_G);
+        m.insert("g", input_event_codes_sys::KEY_G);
+        m.insert("H", input_event_codes_sys::KEY_H);
+        m.insert("h", input_event_codes_sys::KEY_H);
+        m.insert("J", input_event_codes_sys::KEY_J);
+        m.insert("j", input_event_codes_sys::KEY_J);
+        m.insert("K", input_event_codes_sys::KEY_K);
+        m.insert("k", input_event_codes_sys::KEY_K);
+        m.insert("L", input_event_codes_sys::KEY_L);
+        m.insert("l", input_event_codes_sys::KEY_L);
+        m.insert("semicolon", input_event_codes_sys::KEY_SEMICOLON);
+        m.insert("colon", input_event_codes_sys::KEY_SEMICOLON);
+        m.insert("apostrophe", input_event_codes_sys::KEY_APOSTROPHE);
+        m.insert("quotedbl", input_event_codes_sys::KEY_APOSTROPHE);
+        m.insert("grave", input_event_codes_sys::KEY_GRAVE);
+        m.insert("grave", input_event_codes_sys::KEY_GRAVE);
+        m.insert("asciitilde", input_event_codes_sys::KEY_GRAVE);
+        m.insert("asciitilde", input_event_codes_sys::KEY_GRAVE);
+        m.insert("Shift_L", input_event_codes_sys::KEY_LEFTSHIFT);
+        m.insert("backslash", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("backslash", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("bar", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("bar", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("backslash", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("backslash", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("bar", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("bar", input_event_codes_sys::KEY_BACKSLASH);
+        m.insert("Z", input_event_codes_sys::KEY_Z);
+        m.insert("z", input_event_codes_sys::KEY_Z);
+        m.insert("X", input_event_codes_sys::KEY_X);
+        m.insert("x", input_event_codes_sys::KEY_X);
+        m.insert("C", input_event_codes_sys::KEY_C);
+        m.insert("c", input_event_codes_sys::KEY_C);
+        m.insert("V", input_event_codes_sys::KEY_V);
+        m.insert("v", input_event_codes_sys::KEY_V);
+        m.insert("B", input_event_codes_sys::KEY_B);
+        m.insert("b", input_event_codes_sys::KEY_B);
+        m.insert("N", input_event_codes_sys::KEY_N);
+        m.insert("n", input_event_codes_sys::KEY_N);
+        m.insert("M", input_event_codes_sys::KEY_M);
+        m.insert("m", input_event_codes_sys::KEY_M);
+        m.insert("comma", input_event_codes_sys::KEY_COMMA);
+        m.insert("less", input_event_codes_sys::KEY_COMMA);
+        m.insert("period", input_event_codes_sys::KEY_DOT);
+        m.insert("greater", input_event_codes_sys::KEY_DOT);
+        m.insert("slash", input_event_codes_sys::KEY_SLASH);
+        m.insert("question", input_event_codes_sys::KEY_SLASH);
+        m.insert("Shift_R", input_event_codes_sys::KEY_RIGHTSHIFT);
+        m.insert("KP_Multiplymultiply", input_event_codes_sys::KEY_KPASTERISK);
+        m.insert("multiply", input_event_codes_sys::KEY_KPASTERISK);
+        m.insert("KP_Multiply", input_event_codes_sys::KEY_KPASTERISK);
+        m.insert("multiply", input_event_codes_sys::KEY_KPASTERISK);
+        m.insert("Alt_L", input_event_codes_sys::KEY_LEFTALT);
+        m.insert("Alt_L", input_event_codes_sys::KEY_LEFTALT);
+        m.insert("space", input_event_codes_sys::KEY_SPACE);
+        m.insert("Caps_Lock", input_event_codes_sys::KEY_CAPSLOCK);
+        m.insert("F1", input_event_codes_sys::KEY_F1);
+        m.insert("F2", input_event_codes_sys::KEY_F2);
+        m.insert("F3", input_event_codes_sys::KEY_F3);
+        m.insert("F4", input_event_codes_sys::KEY_F4);
+        m.insert("F5", input_event_codes_sys::KEY_F5);
+        m.insert("F6", input_event_codes_sys::KEY_F6);
+        m.insert("F7", input_event_codes_sys::KEY_F7);
+        m.insert("F8", input_event_codes_sys::KEY_F8);
+        m.insert("F9", input_event_codes_sys::KEY_F9);
+        m.insert("F10", input_event_codes_sys::KEY_F10);
+        m.insert("Num_Lock", input_event_codes_sys::KEY_NUMLOCK);
+        m.insert("Scroll_Lock", input_event_codes_sys::KEY_SCROLLLOCK);
+        m.insert("KP_Home", input_event_codes_sys::KEY_KP7);
+        m.insert("KP_7", input_event_codes_sys::KEY_KP7);
+        m.insert("KP_Up", input_event_codes_sys::KEY_KP8);
+        m.insert("KP_8", input_event_codes_sys::KEY_KP8);
+        m.insert("KP_Prior", input_event_codes_sys::KEY_KP9);
+        m.insert("KP_9", input_event_codes_sys::KEY_KP9);
+        m.insert("KP_Subtract", input_event_codes_sys::KEY_KPMINUS);
+        m.insert("KP_Left", input_event_codes_sys::KEY_KP4);
+        m.insert("KP_4", input_event_codes_sys::KEY_KP4);
+        m.insert("KP_Begin", input_event_codes_sys::KEY_KP5);
+        m.insert("KP_5", input_event_codes_sys::KEY_KP5);
+        m.insert("KP_Right", input_event_codes_sys::KEY_KP6);
+        m.insert("KP_6", input_event_codes_sys::KEY_KP6);
+        m.insert("KP_Add", input_event_codes_sys::KEY_KPPLUS);
+        m.insert("KP_End", input_event_codes_sys::KEY_KP1);
+        m.insert("KP_1", input_event_codes_sys::KEY_KP1);
+        m.insert("KP_Down", input_event_codes_sys::KEY_KP2);
+        m.insert("KP_2", input_event_codes_sys::KEY_KP2);
+        m.insert("KP_Next", input_event_codes_sys::KEY_KP3);
+        m.insert("KP_3", input_event_codes_sys::KEY_KP3);
+        m.insert("KP_Insert", input_event_codes_sys::KEY_KP0);
+        m.insert("KP_0", input_event_codes_sys::KEY_KP0);
+        m.insert("KP_Delete", input_event_codes_sys::KEY_KPDOT);
+        m.insert("KP_Delete", input_event_codes_sys::KEY_KPDOT);
+        m.insert("KP_Decimal", input_event_codes_sys::KEY_KPDOT);
+        m.insert("KP_Decimal", input_event_codes_sys::KEY_KPDOT);
+        m.insert("Zenkaku_Hankaku", input_event_codes_sys::KEY_ZENKAKUHANKAKU);
+        m.insert("F11", input_event_codes_sys::KEY_F11);
+        m.insert("F12", input_event_codes_sys::KEY_F12);
+        m.insert("underscore", input_event_codes_sys::KEY_RO);
+        m.insert("Katakana", input_event_codes_sys::KEY_KATAKANA);
+        m.insert("Katakana", input_event_codes_sys::KEY_KATAKANA);
+        m.insert("Hiragana", input_event_codes_sys::KEY_HIRAGANA);
+        m.insert("Hiragana", input_event_codes_sys::KEY_HIRAGANA);
+        m.insert("Henkan", input_event_codes_sys::KEY_HENKAN);
+        m.insert("Hiragana_Katakana", input_event_codes_sys::KEY_KATAKANAHIRAGANA);
+        m.insert("Muhenkan", input_event_codes_sys::KEY_MUHENKAN);
+        m.insert("Muhenkan", input_event_codes_sys::KEY_MUHENKAN);
+        m.insert("KP_Separator", input_event_codes_sys::KEY_KPJPCOMMA);
+        m.insert("KP_Separator", input_event_codes_sys::KEY_KPJPCOMMA);
+        m.insert("KP_Enter", input_event_codes_sys::KEY_KPENTER);
+        m.insert("Control_R", input_event_codes_sys::KEY_RIGHTCTRL);
+        m.insert("KP_Divide", input_event_codes_sys::KEY_KPSLASH);
+        m.insert("Sys_Req", input_event_codes_sys::KEY_SYSRQ);
+        m.insert("Sys_Req", input_event_codes_sys::KEY_SYSRQ);
+        m.insert("Alt_R", input_event_codes_sys::KEY_RIGHTALT);
+        m.insert("Alt_R", input_event_codes_sys::KEY_RIGHTALT);
+        m.insert("Home", input_event_codes_sys::KEY_HOME);
+        m.insert("Up", input_event_codes_sys::KEY_UP);
+        m.insert("Prior", input_event_codes_sys::KEY_PAGEUP);
+        m.insert("Page_Up", input_event_codes_sys::KEY_PAGEUP);
+        m.insert("Left", input_event_codes_sys::KEY_LEFT);
+        m.insert("Right", input_event_codes_sys::KEY_RIGHT);
+        m.insert("End", input_event_codes_sys::KEY_END);
+        m.insert("Down", input_event_codes_sys::KEY_DOWN);
+        m.insert("Next", input_event_codes_sys::KEY_PAGEDOWN);
+        m.insert("Page_Down", input_event_codes_sys::KEY_PAGEDOWN);
+        m.insert("Insert", input_event_codes_sys::KEY_INSERT);
+        m.insert("Delete", input_event_codes_sys::KEY_DELETE);
+        m.insert("Delete", input_event_codes_sys::KEY_DELETE);
+        m.insert("KP_Equal", input_event_codes_sys::KEY_KPEQUAL);
+        m.insert("Pause", input_event_codes_sys::KEY_PAUSE);
+        m.insert("Meta_L", input_event_codes_sys::KEY_LEFTMETA);
+        m.insert("Meta_L", input_event_codes_sys::KEY_LEFTMETA);
+        m.insert("Super_L", input_event_codes_sys::KEY_LEFTMETA);
+        m.insert("Meta_R", input_event_codes_sys::KEY_RIGHTMETA);
+        m.insert("Meta_R", input_event_codes_sys::KEY_RIGHTMETA);
+        m.insert("Super_R", input_event_codes_sys::KEY_RIGHTMETA);
+        m.insert("Help", input_event_codes_sys::KEY_HELP);
+        m.insert("Select", input_event_codes_sys::KEY_SELECT);
+
+        m
+    });
+    KEYMAP.get(key).copied()
 }
 
 #[cfg(test)]
