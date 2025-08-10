@@ -77,6 +77,7 @@ use crate::utils::allocator::{
 };
 use crate::utils::renderer::setup_renderer;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
+use crate::utils::device::gpu::GPUDevice;
 
 #[derive(Debug, Default)]
 pub struct ClientState {
@@ -581,6 +582,23 @@ pub(crate) fn init(
                     };
                     debug!("Supported dma formats: {:?}", supported_formats);
                     let _ = sender.send(supported_formats);
+                }
+                Event::Msg(Command::GetRenderDevice(sender)) => {
+                    let render_device: Option<GPUDevice> = match &state.render_node {
+                        Some(node) => {
+                            if let Ok(gpu_dev) = GPUDevice::try_from(*node) {
+                                Some(gpu_dev)
+                            } else {
+                                tracing::warn!("Failed to create GPUDevice from render node.");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    debug!("Render device requested: {:?}", render_device);
+                    if let Err(err) = sender.send(render_device) {
+                        tracing::warn!(?err, "Failed to send render device.");
+                    }
                 }
                 Event::Msg(Command::TouchDown(id, rel_position)) => {
                     let time: Duration = state.clock.now().into();

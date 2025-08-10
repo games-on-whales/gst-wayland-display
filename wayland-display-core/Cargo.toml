@@ -39,6 +39,7 @@ features = [
     "backend_gbm",
     "backend_libinput",
     "backend_udev",
+    "backend_vulkan",
     "renderer_gl",
     "use_system_lib",
     "desktop",

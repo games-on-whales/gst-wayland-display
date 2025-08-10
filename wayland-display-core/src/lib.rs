@@ -13,6 +13,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
 use utils::RenderTarget;
 
+use crate::utils::device::gpu::GPUDevice;
+
 pub(crate) mod comp;
 #[cfg(test)]
 mod tests;
@@ -34,6 +36,7 @@ pub enum Command {
     PointerButton(u32, ButtonState),
     PointerAxis(f64, f64),
     GetSupportedDmaFormats(SyncSender<FormatSet>),
+    GetRenderDevice(SyncSender<Option<GPUDevice>>),
     TouchDown(u32, Point<f64, Logical>),
     TouchUp(u32),
     TouchMotion(u32, Point<f64, Logical>),
@@ -268,6 +271,12 @@ impl WaylandDisplay {
         let _ = self
             .command_tx
             .send(Command::GetSupportedDmaFormats(buffer_tx));
+        buffer_rx.recv().unwrap()
+    }
+
+    pub fn get_render_device(&self) -> Option<GPUDevice> {
+        let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+        let _ = self.command_tx.send(Command::GetRenderDevice(buffer_tx));
         buffer_rx.recv().unwrap()
     }
 }
