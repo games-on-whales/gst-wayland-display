@@ -38,9 +38,7 @@ impl std::fmt::Display for GPUDevice {
         write!(
             f,
             "GPUDevice {{ drm_node: {}, pci_vendor: {}, device_name: {} }}",
-            self.drm_node,
-            self.pci_vendor,
-            self.device_name
+            self.drm_node, self.pci_vendor, self.device_name
         )
     }
 }
