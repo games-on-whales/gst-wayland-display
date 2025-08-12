@@ -1,6 +1,5 @@
 #[test]
 fn test_enumerate_gpu_devices() {
-    use crate::utils::device::PCIVendor;
     use crate::utils::device::gpu::enumerate_gpu_devices;
 
     let devices = enumerate_gpu_devices().expect("Failed to enumerate GPU devices");
@@ -13,13 +12,6 @@ fn test_enumerate_gpu_devices() {
         assert!(
             !device.drm_node().to_string().is_empty(),
             "DRM node path is empty"
-        );
-
-        // Ensure the PCI vendor is known
-        assert_ne!(
-            *device.pci_vendor(),
-            PCIVendor::Unknown,
-            "Unknown PCI vendor"
         );
 
         // Ensure the device name is not empty

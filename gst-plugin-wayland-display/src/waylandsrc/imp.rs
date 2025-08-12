@@ -376,13 +376,17 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 let mut disable_workaround = settings.disable_intel_workaround;
                 if let Some(render_device) = state.display.get_render_device() {
-                    // Disable workaround for non-DG2 (Alchemist) Intel GPUs, Battlemage and later
+                    // Only enable workaround for DG2 (Alchemist) Intel GPUs, Battlemage and later
                     // have reportedly no issues with the DRM modifier and don't require workaround.
-                    if *render_device.pci_vendor() == PCIVendor::Intel
-                        && !render_device.device_name().contains("DG2")
-                    {
-                        tracing::info!("Disabling workaround for Intel GPU");
-                        disable_workaround = true;
+                    if !disable_workaround && *render_device.pci_vendor() == PCIVendor::Intel {
+                        if !render_device.device_name().contains("DG2") {
+                            tracing::info!(
+                                "Disabling workaround for non-Alchemist (DG2) Intel GPU"
+                            );
+                            disable_workaround = true;
+                        } else if !disable_workaround {
+                            tracing::info!("Enabling workaround for Alchemist (DG2) Intel GPU");
+                        }
                     }
                 }
 

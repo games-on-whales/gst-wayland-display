@@ -64,9 +64,6 @@ pub fn enumerate_gpu_devices() -> Result<Vec<GPUDevice>, Box<dyn std::error::Err
 
         let properties = p_dev.properties();
         let pci_vendor = PCIVendor::try_from(properties.vendor_id);
-        if pci_vendor.is_err() {
-            continue; // Skip unknown vendor
-        }
 
         // array of c_char's (i8) needs conversion to String
         let device_name = properties
@@ -79,7 +76,7 @@ pub fn enumerate_gpu_devices() -> Result<Vec<GPUDevice>, Box<dyn std::error::Err
 
         devices.push(GPUDevice {
             drm_node,
-            pci_vendor: pci_vendor.unwrap(),
+            pci_vendor: pci_vendor.unwrap_or(PCIVendor::Unknown),
             device_name,
         });
     }
