@@ -37,6 +37,7 @@
           cargoHash = "sha256-VjtrS0wmG9heZqb68GLM4PE6IezalQ3Z9CEYeJ/ndZw=";
 
           nativeBuildInputs = with pkgs; [
+            cargo-c
             pkg-config
           ];
 
@@ -49,6 +50,20 @@
             udev
             wayland
           ];
+
+          buildPhase = ''
+            runHook preBuild
+            ${pkgs.rust.envVars.setEnv} cargo cbuild -j $NIX_BUILD_CORES --release --frozen \
+              --prefix=${placeholder "out"} --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            ${pkgs.rust.envVars.setEnv} cargo cinstall -j $NIX_BUILD_CORES --release --frozen \
+              --prefix=${placeholder "out"} --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+            runHook postInstall
+          '';
 
           # Checks don't work properly in the Nix sandbox.
           doCheck = false;
