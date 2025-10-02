@@ -61,6 +61,12 @@
           inputsFrom = [
             gst-wayland-display
           ];
+
+          packages = with pkgs; [
+            gst_all_1.gst-plugins-good
+          ];
+
+          LD_LIBRARY_PATH = "${pkgs.libglvnd}/lib";
         };
 
         packages = {
