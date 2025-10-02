@@ -66,6 +66,7 @@
             gst_all_1.gst-plugins-good
           ];
 
+          GST_PLUGIN_PATH = "${gst-wayland-display}/lib";
           LD_LIBRARY_PATH = "${pkgs.libglvnd}/lib";
         };
 
