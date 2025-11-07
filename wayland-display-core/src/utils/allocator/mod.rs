@@ -425,6 +425,7 @@ pub fn gst_video_format_to_drm_modifier(format: &VideoInfoDmaDrm) -> Option<DrmM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::device::gpu::get_cuda_device_id_from_drm_node;
     use crate::utils::renderer::setup_renderer;
     use crate::utils::tests::test_init;
     use smithay::backend::renderer::Frame;
@@ -598,6 +599,13 @@ mod tests {
 
         let render_node =
             DrmNode::from_path("/dev/dri/renderD129").expect("Failed to create render node");
+
+        // Get CUDA device ID from render_node before it's moved to setup_renderer
+        let cuda_device_id = get_cuda_device_id_from_drm_node(render_node)
+            .expect("Failed to get CUDA device ID from render_node");
+
+        println!("CUDA device ID: {}", cuda_device_id);
+
         let mut renderer = setup_renderer(Some(render_node));
         let caps = gst_video::VideoCapsBuilder::new()
             .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
@@ -621,7 +629,7 @@ mod tests {
             Some(Modifier::Unrecognized(0x0300000000606010))
         );
 
-        let gst_cuda_ctx = CUDAContext::new(0).expect("Failed to create CUDA context");
+        let gst_cuda_ctx = CUDAContext::new(cuda_device_id).expect("Failed to create CUDA context");
 
         let cuda_caps = gst_video::VideoCapsBuilder::new()
             .features([cuda::CAPS_FEATURE_MEMORY_CUDA_MEMORY])

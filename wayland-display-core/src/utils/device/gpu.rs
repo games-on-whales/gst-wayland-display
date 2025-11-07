@@ -135,3 +135,105 @@ fn gnu_dev_minor(dev: u64) -> u32 {
     minor |= ((dev >> 12) & 0xffffff00) as u32;
     minor
 }
+
+/// Get PCI bus ID from NVIDIA render-node
+/// 
+/// # Arguments
+/// * `render_path` - DRM render node path, e.g., "/dev/dri/renderD128"
+/// 
+/// # Returns
+/// Returns PCI bus ID in format "00000000:01:00.0"
+pub fn get_pci_bus_id_from_render_node(render_path: &str) -> Result<String, Box<dyn Error>> {
+    let card = get_card_from_render_node(render_path)?;
+    
+    // Read PCI information from /sys/class/drm/cardX/device/uevent
+    let uevent_path = format!("/sys/class/drm/{}/device/uevent", card);
+    let uevent_content = fs::read_to_string(uevent_path)?;
+    
+    // Find PCI_SLOT_NAME in format "0000:01:00.0"
+    for line in uevent_content.lines() {
+        if line.starts_with("PCI_SLOT_NAME=") {
+            let pci_slot = line.strip_prefix("PCI_SLOT_NAME=").unwrap();
+            // Convert to nvidia-smi format: "00000000:01:00.0"
+            let parts: Vec<&str> = pci_slot.split(':').collect();
+            if parts.len() == 3 {
+                return Ok(format!("00000000:{}:{}", parts[1], parts[2]));
+            }
+        }
+    }
+    
+    Err("Failed to find PCI bus ID from render node".into())
+}
+
+/// Get CUDA device ID from NVIDIA render-node (without using nvidia-smi)
+/// 
+/// # Arguments
+/// * `render_path` - DRM render node path, e.g., "/dev/dri/renderD128"
+/// 
+/// # Returns
+/// Returns CUDA device ID (typically 0, 1, 2, ...)
+/// 
+/// # Method
+/// 1. Get PCI bus ID from render-node (format: 0000:01:00.0)
+/// 2. Iterate through /proc/driver/nvidia/gpus/ directory to find matching PCI bus ID
+/// 3. CUDA device ID is assigned in alphabetical order of PCI bus IDs (this is CUDA's default behavior)
+/// 
+/// # Note
+/// This method does not depend on nvidia-smi, but requires NVIDIA driver to be loaded
+/// and /proc/driver/nvidia/gpus/ directory to be accessible
+pub fn get_cuda_device_id_from_render_node(render_path: &str) -> Result<i32, Box<dyn Error>> {
+    // Get PCI bus ID from render-node (format: 0000:01:00.0)
+    let card = get_card_from_render_node(render_path)?;
+    let uevent_path = format!("/sys/class/drm/{}/device/uevent", card);
+    let uevent_content = fs::read_to_string(uevent_path)?;
+    
+    let mut pci_slot_name: Option<&str> = None;
+    for line in uevent_content.lines() {
+        if line.starts_with("PCI_SLOT_NAME=") {
+            pci_slot_name = Some(line.strip_prefix("PCI_SLOT_NAME=").unwrap());
+            break;
+        }
+    }
+    
+    let pci_slot = pci_slot_name.ok_or("Failed to find PCI_SLOT_NAME from render node")?;
+    
+    // Read /proc/driver/nvidia/gpus/ directory
+    // Each subdirectory name in this directory is the PCI bus ID of the corresponding GPU
+    let nvidia_gpus_dir = "/proc/driver/nvidia/gpus";
+    let entries: Vec<_> = fs::read_dir(nvidia_gpus_dir)
+        .map_err(|e| format!("Failed to read {}: {}. Make sure NVIDIA driver is loaded and accessible.", nvidia_gpus_dir, e))?
+        .collect::<Result<Vec<_>, _>>()?;
+    
+    if entries.is_empty() {
+        return Err("No NVIDIA GPUs found in /proc/driver/nvidia/gpus/".into());
+    }
+    
+    // Collect PCI bus IDs of all GPUs
+    let mut gpus: Vec<String> = Vec::new();
+    for entry in &entries {
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        // Directory name is the PCI bus ID (format: 0000:01:00.0)
+        gpus.push(dir_name);
+    }
+    
+    // Sort by PCI bus ID
+    // CUDA device ID is assigned in alphabetical order of PCI bus IDs (this is CUDA's default behavior)
+    gpus.sort();
+    
+    // Find matching PCI bus ID, the index is the CUDA device ID
+    for (cuda_id, pci_id) in gpus.iter().enumerate() {
+        if pci_id == pci_slot {
+            return Ok(cuda_id as i32);
+        }
+    }
+    
+    Err(format!("No CUDA device found for PCI bus ID: {}. Available GPUs: {:?}", 
+        pci_slot, gpus).into())
+}
+
+/// Get CUDA device ID from DrmNode
+pub fn get_cuda_device_id_from_drm_node(drm_node: DrmNode) -> Result<i32, Box<dyn Error>> {
+    let render_path = drm_node.dev_path()
+        .ok_or("Failed to get device path from DrmNode")?;
+    get_cuda_device_id_from_render_node(render_path.to_str().unwrap())
+}
