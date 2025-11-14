@@ -8,6 +8,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::gbm::BufferObjectFlags;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::wayland::presentation::Refresh;
+use smithay::wayland::selection::data_device::set_data_device_selection;
 use smithay::{
     backend::{
         allocator::{Fourcc, dmabuf::Dmabuf},
@@ -675,6 +676,14 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::TouchFrame) => {
                     state.touch_frame();
+                }
+                Event::Msg(Command::SetClipboard(contents)) => {
+                    set_data_device_selection(
+                        &state.dh,
+                        &state.seat,
+                        vec!["text/plain".to_string()],
+                        contents,
+                    );
                 }
             };
         })

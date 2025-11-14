@@ -45,6 +45,7 @@ pub enum Command {
     TouchMotion(u32, Point<f64, Logical>),
     TouchCancel,
     TouchFrame,
+    SetClipboard(String),
     Quit,
 }
 

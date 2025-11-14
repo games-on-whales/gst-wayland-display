@@ -176,6 +176,12 @@ impl EventHandler for WaylandDisplaySrc {
             } else if structure.has_name("TouchCancel") {
                 let _ = self.command_tx.send(Command::TouchCancel);
                 return true;
+            } else if structure.has_name("SetClipboard") {
+                let content = structure
+                    .get::<String>("content")
+                    .expect("Should contain text content");
+                let _ = self.command_tx.send(Command::SetClipboard(content));
+                return true;
             }
         }
         false
