@@ -397,17 +397,14 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 let mut gst_buffer = GstBuffer::new();
                 {
                     let video_format =
-                        match VideoFormat::from_fourcc(buffer.buffer.format().code as u32) {
-                            // TODO: this seems to always fail
-                            VideoFormat::Unknown => {
+                        gst_video::dma_drm_fourcc_to_format(buffer.buffer.format().code as u32)
+                            .unwrap_or_else(|_| {
                                 tracing::debug!(
                                     "Failed to convert fourcc to video format: {:?}",
                                     buffer.buffer.format().code
                                 );
                                 VideoFormat::Bgrx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
-                            }
-                            format => format,
-                        };
+                            });
 
                     // Calculate the required size based on GStreamer's expectations
                     let required_size = gst_video::VideoInfo::builder(
