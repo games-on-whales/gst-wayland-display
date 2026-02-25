@@ -178,8 +178,8 @@ impl EventHandler for WaylandDisplaySrc {
                     let _ = self.command_tx.send(Command::TouchCancel);
                     return true;
                 }
-            },
-            gst::EventView::Navigation(n) =>{
+            }
+            gst::EventView::Navigation(n) => {
                 let navigation_event = gst_video::NavigationEvent::parse(n).unwrap();
 
                 match navigation_event {
@@ -189,7 +189,7 @@ impl EventHandler for WaylandDisplaySrc {
                             .send(Command::PointerMotionAbsolute((x, y).into()));
 
                         return true;
-                    },
+                    }
                     NavigationEvent::MouseButtonPress { button, .. } => {
                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Pressed) {
                             let _ = self.command_tx.send(cmd);
@@ -198,7 +198,7 @@ impl EventHandler for WaylandDisplaySrc {
                         }
 
                         return true;
-                    },
+                    }
                     NavigationEvent::MouseButtonRelease { button, .. } => {
                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Released) {
                             let _ = self.command_tx.send(cmd);
@@ -207,36 +207,34 @@ impl EventHandler for WaylandDisplaySrc {
                         }
 
                         return true;
-                    },
+                    }
                     NavigationEvent::KeyPress { key, .. } => {
                         if let Some(scancode) = gst_key_to_scancode(&key) {
-                            let _ = self.command_tx.send(Command::KeyboardInput(
-                                scancode,
-                                KeyState::Pressed
-                            ));
+                            let _ = self
+                                .command_tx
+                                .send(Command::KeyboardInput(scancode, KeyState::Pressed));
                         } else {
                             tracing::warn!("Unknown keyboard key pressed: {:?}", key);
                         }
 
                         return true;
-                    },
+                    }
                     NavigationEvent::KeyRelease { key, .. } => {
                         if let Some(scancode) = gst_key_to_scancode(&key) {
-                            let _ = self.command_tx.send(Command::KeyboardInput(
-                                scancode,
-                                KeyState::Released
-                            ));
+                            let _ = self
+                                .command_tx
+                                .send(Command::KeyboardInput(scancode, KeyState::Released));
                         } else {
                             tracing::warn!("Unknown keyboard key pressed: {:?}", key);
                         }
 
                         return true;
-                    },
+                    }
                     _ => {
                         tracing::warn!("Unhandled event: {:?}", navigation_event);
-                    },
+                    }
                 };
-            },
+            }
             _ => (),
         }
         false
@@ -902,23 +900,62 @@ fn drm_to_gst_format(format: &DrmFormat, disable_workaround: bool) -> Option<Str
 fn gst_button_to_msg(button: i32, state: ButtonState) -> Option<Command> {
     match button as u32 {
         // X11 buttons are internally mapped to some values
-        1 => Some(Command::PointerButton(input_event_codes_sys::BTN_LEFT, state)),
-        2 => Some(Command::PointerButton(input_event_codes_sys::BTN_MIDDLE, state)),
-        3 => Some(Command::PointerButton(input_event_codes_sys::BTN_RIGHT, state)),
+        1 => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_LEFT,
+            state,
+        )),
+        2 => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_MIDDLE,
+            state,
+        )),
+        3 => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_RIGHT,
+            state,
+        )),
         4 => Some(Command::PointerAxis(0.0, -10.0)),
         5 => Some(Command::PointerAxis(0.0, 10.0)),
         // TODO: should we handle these?
-        8 => Some(Command::PointerButton(input_event_codes_sys::BTN_BACK, state)),
-        9 => Some(Command::PointerButton(input_event_codes_sys::BTN_FORWARD, state)),
+        8 => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_BACK,
+            state,
+        )),
+        9 => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_FORWARD,
+            state,
+        )),
         // Wayland buttons are just copies from linux input-event-codes.h, so handle them transparently
-        input_event_codes_sys::BTN_LEFT => Some(Command::PointerButton(input_event_codes_sys::BTN_LEFT, state)),
-        input_event_codes_sys::BTN_RIGHT => Some(Command::PointerButton(input_event_codes_sys::BTN_RIGHT, state)),
-        input_event_codes_sys::BTN_MIDDLE => Some(Command::PointerButton(input_event_codes_sys::BTN_MIDDLE, state)),
-        input_event_codes_sys::BTN_SIDE => Some(Command::PointerButton(input_event_codes_sys::BTN_SIDE, state)),
-        input_event_codes_sys::BTN_EXTRA => Some(Command::PointerButton(input_event_codes_sys::BTN_EXTRA, state)),
-        input_event_codes_sys::BTN_FORWARD => Some(Command::PointerButton(input_event_codes_sys::BTN_FORWARD, state)),
-        input_event_codes_sys::BTN_BACK => Some(Command::PointerButton(input_event_codes_sys::BTN_BACK, state)),
-        input_event_codes_sys::BTN_WHEEL => Some(Command::PointerButton(input_event_codes_sys::BTN_WHEEL, state)),
+        input_event_codes_sys::BTN_LEFT => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_LEFT,
+            state,
+        )),
+        input_event_codes_sys::BTN_RIGHT => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_RIGHT,
+            state,
+        )),
+        input_event_codes_sys::BTN_MIDDLE => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_MIDDLE,
+            state,
+        )),
+        input_event_codes_sys::BTN_SIDE => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_SIDE,
+            state,
+        )),
+        input_event_codes_sys::BTN_EXTRA => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_EXTRA,
+            state,
+        )),
+        input_event_codes_sys::BTN_FORWARD => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_FORWARD,
+            state,
+        )),
+        input_event_codes_sys::BTN_BACK => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_BACK,
+            state,
+        )),
+        input_event_codes_sys::BTN_WHEEL => Some(Command::PointerButton(
+            input_event_codes_sys::BTN_WHEEL,
+            state,
+        )),
         // TODO: should we handle others?
         _ => None,
     }
@@ -1092,7 +1129,10 @@ fn gst_key_to_scancode(key: &str) -> Option<u32> {
         m.insert("Hiragana", input_event_codes_sys::KEY_HIRAGANA);
         m.insert("Hiragana", input_event_codes_sys::KEY_HIRAGANA);
         m.insert("Henkan", input_event_codes_sys::KEY_HENKAN);
-        m.insert("Hiragana_Katakana", input_event_codes_sys::KEY_KATAKANAHIRAGANA);
+        m.insert(
+            "Hiragana_Katakana",
+            input_event_codes_sys::KEY_KATAKANAHIRAGANA,
+        );
         m.insert("Muhenkan", input_event_codes_sys::KEY_MUHENKAN);
         m.insert("Muhenkan", input_event_codes_sys::KEY_MUHENKAN);
         m.insert("KP_Separator", input_event_codes_sys::KEY_KPJPCOMMA);
