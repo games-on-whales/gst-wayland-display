@@ -39,6 +39,7 @@ use smithay::{
         },
         input::Libinput,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
+        wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
         wayland_server::{
             Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
@@ -299,13 +300,9 @@ pub(crate) fn init(
         .insert_source(command_src, move |event, _, state| {
             match event {
                 Event::Msg(Command::VideoInfo(video_info)) => {
-                    // Only change the output if it's not running already
-                    // TODO: properly support automatic resolution switching with DMA buffers
-                    if state.output.is_some() {
-                        tracing::info!(
-                            "Output already running, ignoring newly negotiated video info"
-                        );
-                        return;
+                    let output_already_running = state.output.is_some();
+                    if output_already_running {
+                        tracing::info!("Output already running, updating negotiated video info");
                     }
                     let base_info: VideoInfo = video_info.clone().into();
                     debug!(
@@ -342,7 +339,9 @@ pub(crate) fn init(
                     output.set_preferred(mode);
                     let dtr = OutputDamageTracker::from_output(&output);
 
-                    state.space.map_output(&output, (0, 0));
+                    if !output_already_running {
+                        state.space.map_output(&output, (0, 0));
+                    }
                     state.dtr = Some(dtr);
                     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
                     state.pointer_location = position;
@@ -412,7 +411,11 @@ pub(crate) fn init(
                         let new_size = max_size
                             .intersection(Rectangle::from_size(new_size))
                             .map(|rect| rect.size);
-                        toplevel.with_pending_state(|state| state.size = new_size);
+                        toplevel.with_pending_state(|state| {
+                            state.size = new_size;
+                            state.states.set(XdgState::Fullscreen);
+                            state.states.set(XdgState::Activated);
+                        });
                         toplevel.send_configure();
                     }
                 }
