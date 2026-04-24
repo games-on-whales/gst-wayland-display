@@ -302,7 +302,9 @@ pub(crate) fn init(
                 Event::Msg(Command::VideoInfo(video_info)) => {
                     let output_already_running = state.output.is_some();
                     if output_already_running {
-                        tracing::info!("Output already running, updating negotiated video info");
+                        tracing::info!(
+                            "Output already running, updating with newly negotiated video info"
+                        );
                     }
                     let base_info: VideoInfo = video_info.clone().into();
                     debug!(
