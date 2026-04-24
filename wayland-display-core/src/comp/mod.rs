@@ -262,6 +262,136 @@ impl State {
     }
 }
 
+/// Apply a newly-negotiated `GstVideoInfo` to the compositor state: create or update
+/// the (single) Output's mode, rebuild the damage tracker + allocator, recenter the
+/// pointer, and re-send configure to every mapped toplevel clamped to the new size.
+///
+/// Called from the `Command::VideoInfo` handler and from the test suite. The
+/// `output_already_running` path is what closes the resolution-switching gap --
+/// `space.map_output` must stay one-shot, but everything else is safe and desirable
+/// to re-run on every VideoInfo so connected clients observe the new state.
+pub(crate) fn apply_video_info(
+    state: &mut State,
+    video_info: GstVideoInfo,
+    render_target: &RenderTarget,
+    render_node: Option<DrmNode>,
+) {
+    let output_already_running = state.output.is_some();
+    if output_already_running {
+        tracing::info!("Output already running, updating with newly negotiated video info");
+    }
+    let base_info: VideoInfo = video_info.clone().into();
+    debug!(
+        "Requested video format: {} .to_fourcc() = {}",
+        base_info.format(),
+        base_info.format().to_fourcc()
+    );
+    let size: Size<i32, Physical> = (base_info.width() as i32, base_info.height() as i32).into();
+    let framerate = base_info.fps();
+    let duration = Duration::from_secs_f64(framerate.numer() as f64 / framerate.denom() as f64);
+
+    // init wayland objects
+    let output = state.output.get_or_insert_with(|| {
+        let output = Output::new(
+            "HEADLESS-1".into(),
+            PhysicalProperties {
+                make: "Virtual".into(),
+                model: "Wolf".into(),
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+            },
+        );
+        output.create_global::<State>(&state.dh);
+        output
+    });
+    let mode = OutputMode {
+        size: size.into(),
+        refresh: (duration.as_secs_f64() * 1000.0).round() as i32,
+    };
+    output.change_current_state(Some(mode), None, None, None);
+    output.set_preferred(mode);
+    let dtr = OutputDamageTracker::from_output(&output);
+
+    if !output_already_running {
+        state.space.map_output(&output, (0, 0));
+    }
+    state.dtr = Some(dtr);
+    let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
+    state.pointer_location = position;
+    state.pointer_absolute_location = position;
+    state.video_info = Some(video_info.clone().into());
+    match render_target {
+        RenderTarget::Hardware(_) => match video_info {
+            GstVideoInfo::RAW(base_info) => {
+                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
+                    .expect("Failed to create GsGlesbuffer");
+                state.output_buffer = Some(GsBufferType::RAW(allocator));
+            }
+            GstVideoInfo::DMA(base_info) => {
+                let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
+                    .expect("Failed to create GsDmaBuf");
+                state.output_buffer = Some(GsBufferType::DMA(allocator));
+            }
+            #[cfg(feature = "cuda")]
+            GstVideoInfo::CUDA(base_info) => {
+                let egl_display = state
+                    .renderer
+                    .egl_context()
+                    .display()
+                    .get_display_handle()
+                    .handle;
+                let allocator = GsCUDABuf::new(
+                    render_node.unwrap(),
+                    base_info.cuda_context,
+                    base_info.video_info,
+                    Arc::new(Mutex::new(None)),
+                    &egl_display,
+                )
+                .expect("Failed to create GsCUDABuf");
+                state.output_buffer = Some(GsBufferType::CUDA(allocator));
+            }
+        },
+        RenderTarget::Software => {
+            let allocator = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
+                .expect("Failed to create GsGlesbuffer");
+            state.output_buffer = Some(GsBufferType::RAW(allocator));
+        }
+    }
+
+    let new_size = size
+        .to_f64()
+        .to_logical(output.current_scale().fractional_scale())
+        .to_i32_round();
+    for window in state.space.elements() {
+        let toplevel = window.toplevel().unwrap();
+        let max_size = Rectangle::from_size(
+            with_states(toplevel.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .map(|_attrs| {
+                        states
+                            .cached_state
+                            .get::<SurfaceCachedState>()
+                            .current()
+                            .max_size
+                    })
+            })
+            .unwrap_or(new_size),
+        );
+
+        let new_size = max_size
+            .intersection(Rectangle::from_size(new_size))
+            .map(|rect| rect.size);
+        toplevel.with_pending_state(|state| {
+            state.size = new_size;
+            state.states.set(XdgState::Fullscreen);
+            state.states.set(XdgState::Activated);
+        });
+        toplevel.send_configure();
+    }
+}
+
 pub(crate) fn init(
     command_src: Channel<Command>,
     render: impl Into<RenderTarget>,
@@ -300,126 +430,7 @@ pub(crate) fn init(
         .insert_source(command_src, move |event, _, state| {
             match event {
                 Event::Msg(Command::VideoInfo(video_info)) => {
-                    let output_already_running = state.output.is_some();
-                    if output_already_running {
-                        tracing::info!(
-                            "Output already running, updating with newly negotiated video info"
-                        );
-                    }
-                    let base_info: VideoInfo = video_info.clone().into();
-                    debug!(
-                        "Requested video format: {} .to_fourcc() = {}",
-                        base_info.format(),
-                        base_info.format().to_fourcc()
-                    );
-                    let size: Size<i32, Physical> =
-                        (base_info.width() as i32, base_info.height() as i32).into();
-                    let framerate = base_info.fps();
-                    let duration = Duration::from_secs_f64(
-                        framerate.numer() as f64 / framerate.denom() as f64,
-                    );
-
-                    // init wayland objects
-                    let output = state.output.get_or_insert_with(|| {
-                        let output = Output::new(
-                            "HEADLESS-1".into(),
-                            PhysicalProperties {
-                                make: "Virtual".into(),
-                                model: "Wolf".into(),
-                                size: (0, 0).into(),
-                                subpixel: Subpixel::Unknown,
-                            },
-                        );
-                        output.create_global::<State>(&state.dh);
-                        output
-                    });
-                    let mode = OutputMode {
-                        size: size.into(),
-                        refresh: (duration.as_secs_f64() * 1000.0).round() as i32,
-                    };
-                    output.change_current_state(Some(mode), None, None, None);
-                    output.set_preferred(mode);
-                    let dtr = OutputDamageTracker::from_output(&output);
-
-                    if !output_already_running {
-                        state.space.map_output(&output, (0, 0));
-                    }
-                    state.dtr = Some(dtr);
-                    let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-                    state.pointer_location = position;
-                    state.pointer_absolute_location = position;
-                    state.video_info = Some(video_info.clone().into());
-                    match render_target {
-                        RenderTarget::Hardware(_) => match video_info {
-                            GstVideoInfo::RAW(base_info) => {
-                                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
-                                    .expect("Failed to create GsGlesbuffer");
-                                state.output_buffer = Some(GsBufferType::RAW(allocator));
-                            }
-                            GstVideoInfo::DMA(base_info) => {
-                                let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
-                                    .expect("Failed to create GsDmaBuf");
-                                state.output_buffer = Some(GsBufferType::DMA(allocator));
-                            }
-                            #[cfg(feature = "cuda")]
-                            GstVideoInfo::CUDA(base_info) => {
-                                let egl_display = state
-                                    .renderer
-                                    .egl_context()
-                                    .display()
-                                    .get_display_handle()
-                                    .handle;
-                                let allocator = GsCUDABuf::new(
-                                    render_node.unwrap(),
-                                    base_info.cuda_context,
-                                    base_info.video_info,
-                                    Arc::new(Mutex::new(None)),
-                                    &egl_display,
-                                )
-                                .expect("Failed to create GsCUDABuf");
-                                state.output_buffer = Some(GsBufferType::CUDA(allocator));
-                            }
-                        },
-                        RenderTarget::Software => {
-                            let allocator =
-                                GsGlesbuffer::new(&mut state.renderer, base_info.clone())
-                                    .expect("Failed to create GsGlesbuffer");
-                            state.output_buffer = Some(GsBufferType::RAW(allocator));
-                        }
-                    }
-
-                    let new_size = size
-                        .to_f64()
-                        .to_logical(output.current_scale().fractional_scale())
-                        .to_i32_round();
-                    for window in state.space.elements() {
-                        let toplevel = window.toplevel().unwrap();
-                        let max_size = Rectangle::from_size(
-                            with_states(toplevel.wl_surface(), |states| {
-                                states
-                                    .data_map
-                                    .get::<XdgToplevelSurfaceData>()
-                                    .map(|_attrs| {
-                                        states
-                                            .cached_state
-                                            .get::<SurfaceCachedState>()
-                                            .current()
-                                            .max_size
-                                    })
-                            })
-                            .unwrap_or(new_size),
-                        );
-
-                        let new_size = max_size
-                            .intersection(Rectangle::from_size(new_size))
-                            .map(|rect| rect.size);
-                        toplevel.with_pending_state(|state| {
-                            state.size = new_size;
-                            state.states.set(XdgState::Fullscreen);
-                            state.states.set(XdgState::Activated);
-                        });
-                        toplevel.send_configure();
-                    }
+                    apply_video_info(state, video_info, &render_target, render_node.clone());
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
