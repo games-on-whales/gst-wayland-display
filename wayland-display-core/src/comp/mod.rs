@@ -299,13 +299,11 @@ pub(crate) fn init(
         .insert_source(command_src, move |event, _, state| {
             match event {
                 Event::Msg(Command::VideoInfo(video_info)) => {
-                    // Only change the output if it's not running already
-                    // TODO: properly support automatic resolution switching with DMA buffers
-                    if state.output.is_some() {
+                    let output_already_running = state.output.is_some();
+                    if output_already_running {
                         tracing::info!(
-                            "Output already running, ignoring newly negotiated video info"
+                            "Output already running, updating with newly negotiated video info"
                         );
-                        return;
                     }
                     let base_info: VideoInfo = video_info.clone().into();
                     debug!(
@@ -342,7 +340,9 @@ pub(crate) fn init(
                     output.set_preferred(mode);
                     let dtr = OutputDamageTracker::from_output(&output);
 
-                    state.space.map_output(&output, (0, 0));
+                    if !output_already_running {
+                        state.space.map_output(&output, (0, 0));
+                    }
                     state.dtr = Some(dtr);
                     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
                     state.pointer_location = position;
