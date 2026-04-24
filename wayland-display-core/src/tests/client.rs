@@ -243,40 +243,6 @@ impl WaylandClient {
         self.state.output_events.as_mut()
     }
 
-    pub fn has_output(&self) -> bool {
-        self.state.output.is_some()
-    }
-
-    /// The most recent `wl_output.mode` event, if one has arrived. Compositor emits
-    /// one on bind and one per mode change.
-    pub fn latest_mode(&self) -> Option<(u32, i32, i32, i32)> {
-        self.state.output_events.iter().rev().find_map(|e| match e {
-            wl_output::Event::Mode {
-                flags,
-                width,
-                height,
-                refresh,
-            } => Some((
-                match flags {
-                    WEnum::Value(f) => f.bits(),
-                    WEnum::Unknown(u) => *u,
-                },
-                *width,
-                *height,
-                *refresh,
-            )),
-            _ => None,
-        })
-    }
-
-    /// The most recent toplevel configure seen on the first window.
-    pub fn latest_configure(&self) -> Option<Configure> {
-        self.state
-            .windows
-            .first()
-            .and_then(|w| w.configures_received.last().map(|(_, c)| c.clone()))
-    }
-
     /// Number of toplevel `configure` events received on the first window.
     pub fn configure_count(&self) -> usize {
         self.state
