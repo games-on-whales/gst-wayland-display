@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use wayland_backend::client::Backend;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_display::WlDisplay;
-use wayland_client::protocol::{wl_callback, wl_pointer, wl_region};
+use wayland_client::protocol::{wl_callback, wl_output, wl_pointer, wl_region};
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop,
     protocol::{
@@ -60,6 +60,8 @@ struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     windows: Vec<Window>,
     pub mouse_events: Vec<MouseEvents>,
+    pub output: Option<wl_output::WlOutput>,
+    pub output_events: Vec<wl_output::Event>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -137,6 +139,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
                     );
                 }
+                "wl_output" => {
+                    // The compositor only advertises wl_output after the first
+                    // VideoInfo has created it, so this branch may fire well after
+                    // initial registry enumeration.
+                    state.output =
+                        Some(registry.bind::<wl_output::WlOutput, _, _>(name, version, qh, ()));
+                }
                 _ => {}
             }
         }
@@ -181,6 +190,8 @@ impl WaylandClient {
             keyboard: None,
             windows: Vec::new(),
             mouse_events: Vec::new(),
+            output: None,
+            output_events: Vec::new(),
         };
 
         WaylandClient {
@@ -224,6 +235,21 @@ impl WaylandClient {
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
         self.state.mouse_events.as_mut()
+    }
+
+    /// All `wl_output` events received so far (geometry, mode, scale, done, name,
+    /// description). Ownership stays with the client; callers `drain` or inspect.
+    pub fn get_output_events(&mut self) -> &mut Vec<wl_output::Event> {
+        self.state.output_events.as_mut()
+    }
+
+    /// Number of toplevel `configure` events received on the first window.
+    pub fn configure_count(&self) -> usize {
+        self.state
+            .windows
+            .first()
+            .map(|w| w.configures_received.len())
+            .unwrap_or(0)
     }
 
     /// Call this to start receiving Relative events in `get_client_events()`
@@ -526,6 +552,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     ) {
         tracing::debug!("{:?}", event);
         state.mouse_events.push(MouseEvents::Pointer(event));
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        state.output_events.push(event);
     }
 }
 
