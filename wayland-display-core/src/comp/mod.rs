@@ -405,17 +405,14 @@ pub(crate) fn init(
     let mut event_loop = EventLoop::<State>::try_new().expect("Unable to create event_loop");
 
     let display = Display::<State>::new().unwrap();
+    let dh = display.handle();
+    dh.set_default_max_buffer_size(10 * 1024 * 1024);
     // init input backend
     let libinput_context = Libinput::new_from_path(NixInterface);
     let input_context = libinput_context.clone();
     let libinput_backend = LibinputInputBackend::new(libinput_context);
 
-    let mut state = State::new(
-        &render_target,
-        &display.handle(),
-        &input_context,
-        event_loop.handle(),
-    );
+    let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
 
     // init event loop
     state
