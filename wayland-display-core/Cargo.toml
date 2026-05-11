@@ -21,8 +21,9 @@ gst.workspace = true
 gst-video.workspace = true
 tracing.workspace = true
 once_cell.workspace = true
-wayland-backend = "0.3.10"
-wayland-scanner = "0.31.6"
+wayland-backend = "0.3.15"
+wayland-server = { version = "0.31.13", features = ["libwayland_1_23"] }
+wayland-scanner = "0.31.10"
 gstreamer-allocators = { version = "0.23.2", package = "gstreamer-allocators", features = ["v1_24", "v1_16"] }
 libloading = { version = "0.8.9", optional = true }
 
