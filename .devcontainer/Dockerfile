@@ -27,7 +27,7 @@ RUN apt-get update -y \
                libwayland-dev libwayland-server0 libinput-dev libxkbcommon-dev libgbm-dev \
                librust-gstreamer-allocators-dev
 
-ARG RUST_VERSION=1.89.0
+ARG RUST_VERSION=1.96.0
 ENV RUST_VERSION=$RUST_VERSION
 ENV PATH="$HOME/.cargo/bin:${PATH}"
 

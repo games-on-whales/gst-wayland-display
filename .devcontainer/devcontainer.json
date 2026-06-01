@@ -5,11 +5,7 @@
     "dockerfile": "Dockerfile"
   },
   "features": {},
-  "runArgs": ["--runtime=nvidia"],
-  "hostRequirements": {
-    "gpu": true
-  },
-  "privileged": true,
+  "runArgs": ["--device", "nvidia.com/gpu=all"],
   "containerEnv": {
     "XDG_RUNTIME_DIR": "/home/retro/"
   },
