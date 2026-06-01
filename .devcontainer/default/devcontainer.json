@@ -1,11 +1,11 @@
 {
-  "name": "gst-wayland-comp-dev",
+  "name": "gst-wayland-comp-dev (default)",
   "build": {
-    "context": "..",
-    "dockerfile": "Dockerfile"
+    "context": "../..",
+    "dockerfile": "../Dockerfile"
   },
   "features": {},
-  "runArgs": ["--device", "nvidia.com/gpu=all"],
+  "privileged": true,
   "containerEnv": {
     "XDG_RUNTIME_DIR": "/home/retro/"
   },

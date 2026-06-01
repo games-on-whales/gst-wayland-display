@@ -27,8 +27,6 @@ RUN apt-get update -y \
                libwayland-dev libwayland-server0 libinput-dev libxkbcommon-dev libgbm-dev \
                librust-gstreamer-allocators-dev
 
-ARG RUST_VERSION=1.96.0
-ENV RUST_VERSION=$RUST_VERSION
 ENV PATH="$HOME/.cargo/bin:${PATH}"
 
 USER $UNAME
@@ -38,8 +36,5 @@ RUN <<_INSTALL_RUST
 set -e
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-rustup install $RUST_VERSION
-rustup default $RUST_VERSION
-
 cargo install cargo-c
 _INSTALL_RUST
