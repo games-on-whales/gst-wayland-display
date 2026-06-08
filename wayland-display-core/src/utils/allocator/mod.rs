@@ -161,34 +161,15 @@ impl GsCUDABuf {
         let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
         let mut dma_allocator = DmabufAllocator(allocator);
 
-        // NVIDIA driver 6xx exports render buffers as block-linear, which the CUDA
-        // copy path turns into black frames (wolf#417). Try a LINEAR buffer first
-        // (the EGL->CUDA import + copy handle linear correctly); fall back to the
-        // negotiated modifier if the driver won't allocate linear.
-        let result = match dma_allocator.create_buffer(
+        // The NVIDIA EGL only imports block-linear dmabufs (linear fails
+        // eglCreateImageKHR with BAD_PARAMETER), so keep the negotiated modifier.
+        let modifiers = [drm_modifier];
+        let result = dma_allocator.create_buffer(
             video_info.width(),
             video_info.height(),
             drm_fourcc,
-            &[DrmModifier::Linear],
-        ) {
-            Ok(buf) => {
-                tracing::info!("Allocated LINEAR CUDA render buffer");
-                Ok(buf)
-            }
-            Err(e) => {
-                tracing::info!(
-                    "LINEAR render buffer unavailable ({}), falling back to {:?}",
-                    e,
-                    drm_modifier
-                );
-                dma_allocator.create_buffer(
-                    video_info.width(),
-                    video_info.height(),
-                    drm_fourcc,
-                    &[drm_modifier],
-                )
-            }
-        };
+            &modifiers,
+        );
 
         match result {
             Ok(buffer) => {
