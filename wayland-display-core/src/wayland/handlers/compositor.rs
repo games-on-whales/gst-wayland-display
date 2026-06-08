@@ -6,6 +6,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
         wayland_server::{
             Client,
+            Resource,
             protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
         },
     },
