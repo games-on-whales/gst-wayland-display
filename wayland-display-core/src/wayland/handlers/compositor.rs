@@ -12,7 +12,12 @@ use smithay::{
     utils::SERIAL_COUNTER,
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
+        compositor::{
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, add_blocker, add_pre_commit_hook, with_states,
+        },
+        dmabuf::get_dmabuf,
+        drm_syncobj::DrmSyncobjCachedState,
         seat::WaylandFocus,
         shell::xdg::{SurfaceCachedState, XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
@@ -31,6 +36,48 @@ impl CompositorHandler for State {
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
         &client.get_data::<ClientState>().unwrap().compositor_state
+    }
+
+    fn new_surface(&mut self, surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            let mut acquire_point = None;
+            let maybe_dmabuf = with_states(surface, |surface_data| {
+                acquire_point.clone_from(
+                    &surface_data
+                        .cached_state
+                        .get::<DrmSyncobjCachedState>()
+                        .pending()
+                        .acquire_point,
+                );
+                surface_data
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .pending()
+                    .buffer
+                    .as_ref()
+                    .and_then(|assignment| match assignment {
+                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
+                        _ => None,
+                    })
+            });
+            if maybe_dmabuf.is_some() {
+                if let Some(acquire_point) = acquire_point {
+                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
+                        if let Some(client) = surface.client() {
+                            let res = state.handle.insert_source(source, move |_, _, data| {
+                                let dh = data.dh.clone();
+                                data.client_compositor_state(&client)
+                                    .blocker_cleared(data, &dh);
+                                Ok(())
+                            });
+                            if res.is_ok() {
+                                add_blocker(surface, blocker);
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn commit(&mut self, surface: &WlSurface) {
