@@ -502,7 +502,7 @@ pub(crate) fn copy_to_gst_buffer(
 
     // Diagnostic: surface the EGL frame layout so we can tell array (de-tiled) from
     // pitched (raw, breaks on block-linear). See wolf#417.
-    tracing::debug!(
+    tracing::info!(
         "EGL frame: type={} egl_color_format={} cu_format={} plane_count={} pitch={} {}x{}",
         egl_frame.frame_type,
         egl_frame.egl_color_format,

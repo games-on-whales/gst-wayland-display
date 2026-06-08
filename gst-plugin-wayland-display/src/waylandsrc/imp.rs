@@ -677,12 +677,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     .expect("failed to configure CUDA pool");
 
                 let updated_size = pool.get_updated_size().expect("failed to get updated size");
-                // The pool is configured but inactive; without this, acquire returns
-                // GST_FLOW_FLUSHING (-2) and we silently fall back to per-frame direct
-                // allocation every frame. See wolf#417.
-                if let Err(e) = pool.activate() {
-                    tracing::warn!("Failed to activate CUDA pool: {}", e);
-                }
                 tracing::info!("Configured CUDA buffer pool");
 
                 // This will update the query and activate the pool internally
