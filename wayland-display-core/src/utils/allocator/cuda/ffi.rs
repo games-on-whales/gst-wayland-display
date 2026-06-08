@@ -500,6 +500,19 @@ pub(crate) fn copy_to_gst_buffer(
 
     let _cuda_context_guard = CudaContextGuard::new(cuda_context)?;
 
+    // Diagnostic: surface the EGL frame layout so we can tell array (de-tiled) from
+    // pitched (raw, breaks on block-linear). See wolf#417.
+    tracing::debug!(
+        "EGL frame: type={} egl_color_format={} cu_format={} plane_count={} pitch={} {}x{}",
+        egl_frame.frame_type,
+        egl_frame.egl_color_format,
+        egl_frame.cu_format,
+        egl_frame.plane_count,
+        egl_frame.pitch,
+        egl_frame.width,
+        egl_frame.height
+    );
+
     // Copy from EGL frame to GStreamer memory for each plane
     for plane in 0..egl_frame.plane_count as usize {
         let mut copy_params: CUDA_MEMCPY2D = unsafe { std::mem::zeroed() };
