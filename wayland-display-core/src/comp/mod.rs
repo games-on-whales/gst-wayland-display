@@ -107,7 +107,7 @@ pub struct State {
     pub(crate) output_buffer: Option<GsBufferType>,
     render_node: Option<DrmNode>,
     pub renderer: GlesRenderer,
-    dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
+    dmabuf_global: Option<(DmabufGlobal, Option<GlobalId>)>,
     last_render: Option<Instant>,
 
     // management
@@ -178,25 +178,51 @@ impl State {
             let dmabuf_default_feedback =
                 DmabufFeedbackBuilder::new(node.dev_id(), formats.clone()).build();
 
-            let dmabuf_global = if let Ok(default_feedback) = dmabuf_default_feedback {
-                dmabuf_state.create_global_with_default_feedback::<State>(&dh, &default_feedback)
-            } else {
-                tracing::warn!("Failed to create default feedback for dmabuf, falling back to v3");
-                dmabuf_state.create_global::<State>(&dh, formats.clone())
-            };
+            let (dmabuf_global, has_default_feedback) =
+                if let Ok(default_feedback) = dmabuf_default_feedback {
+                    (
+                        dmabuf_state
+                            .create_global_with_default_feedback::<State>(&dh, &default_feedback),
+                        true,
+                    )
+                } else {
+                    tracing::warn!(
+                        "Failed to create default feedback for dmabuf, falling back to v3"
+                    );
+                    (dmabuf_state.create_global::<State>(&dh, formats.clone()), false)
+                };
 
             match renderer.bind_wl_display(&dh) {
                 Ok(_) => tracing::info!("EGL hardware-acceleration enabled"),
                 Err(err) => tracing::info!(?err, "Failed to initialize EGL hardware-acceleration"),
             }
 
-            // wl_drm (mesa protocol, so we don't need EGL_WL_bind_display)
-            let wl_drm_global = create_drm_global::<State>(
-                &dh,
-                node.dev_path().expect("Failed to determine DrmNode path?"),
-                formats.clone(),
-                &dmabuf_global,
-            );
+            // wl_drm is a legacy mesa protocol superseded by zwp_linux_dmabuf_v1
+            // v4 feedback for device discovery. Advertising both globals breaks
+            // nested wlroots compositors (e.g. sway): wlroots binds both, each
+            // path reports a render device, and the duplicate trips
+            // `assert(wl->drm_render_name == NULL)` in backend/wayland/backend.c.
+            // Mutter and KWin dropped wl_drm entirely; only advertise it when
+            // dmabuf v4 feedback is unavailable, or when explicitly requested
+            // for old clients via GST_WAYLAND_DISPLAY_ADVERTISE_WL_DRM=1.
+            let advertise_wl_drm = std::env::var("GST_WAYLAND_DISPLAY_ADVERTISE_WL_DRM")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+
+            let wl_drm_global = if advertise_wl_drm || !has_default_feedback {
+                Some(create_drm_global::<State>(
+                    &dh,
+                    node.dev_path().expect("Failed to determine DrmNode path?"),
+                    formats.clone(),
+                    &dmabuf_global,
+                ))
+            } else {
+                tracing::info!(
+                    "Skipping legacy wl_drm global (dmabuf v4 feedback active); \
+                     set GST_WAYLAND_DISPLAY_ADVERTISE_WL_DRM=1 to restore it"
+                );
+                None
+            };
 
             Some((dmabuf_global, wl_drm_global))
         } else {
