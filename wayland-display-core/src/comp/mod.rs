@@ -207,28 +207,34 @@ impl State {
         };
 
         let drm_syncobj_state = if let RenderTarget::Hardware(node) = render_target {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(node.dev_path().expect("Failed to determine DrmNode path?"))
-            {
-                Ok(file) => {
-                    let device_fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
-                    if supports_syncobj_eventfd(&device_fd) {
-                        tracing::info!("Enabling explicit sync (linux-drm-syncobj-v1)");
-                        Some(DrmSyncobjState::new::<State>(&dh, device_fd))
-                    } else {
+            match node.dev_path() {
+                Some(path) => match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        let device_fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+                        if supports_syncobj_eventfd(&device_fd) {
+                            tracing::info!("Enabling explicit sync (linux-drm-syncobj-v1)");
+                            Some(DrmSyncobjState::new::<State>(&dh, device_fd))
+                        } else {
+                            tracing::warn!(
+                                "DRM device does not support syncobj eventfd; explicit sync disabled"
+                            );
+                            None
+                        }
+                    }
+                    Err(err) => {
                         tracing::warn!(
-                            "DRM device does not support syncobj eventfd; explicit sync disabled"
+                            ?err,
+                            "Failed to open render node for syncobj; explicit sync disabled"
                         );
                         None
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "Failed to open render node for syncobj; explicit sync disabled"
-                    );
+                },
+                None => {
+                    tracing::warn!("Render node has no device path; explicit sync disabled");
                     None
                 }
             }
