@@ -3,10 +3,10 @@ use smithay::{
     delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
     reexports::{
+        calloop::Interest,
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
         wayland_server::{
-            Client,
-            Resource,
+            Client, Resource,
             protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
         },
     },
@@ -61,7 +61,8 @@ impl CompositorHandler for State {
                         _ => None,
                     })
             });
-            if maybe_dmabuf.is_some() {
+            if let Some(dmabuf) = maybe_dmabuf {
+                // Explicit sync: block the commit on the client's acquire timeline point.
                 if let Some(acquire_point) = acquire_point {
                     if let Ok((blocker, source)) = acquire_point.generate_blocker() {
                         if let Some(client) = surface.client() {
@@ -73,7 +74,23 @@ impl CompositorHandler for State {
                             });
                             if res.is_ok() {
                                 add_blocker(surface, blocker);
+                                return;
                             }
+                        }
+                    }
+                }
+                // Implicit sync fallback: the client isn't using linux-drm-syncobj-v1,
+                // so block on the dmabuf's implicit read-fence instead.
+                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                    if let Some(client) = surface.client() {
+                        let res = state.handle.insert_source(source, move |_, _, data| {
+                            let dh = data.dh.clone();
+                            data.client_compositor_state(&client)
+                                .blocker_cleared(data, &dh);
+                            Ok(())
+                        });
+                        if res.is_ok() {
+                            add_blocker(surface, blocker);
                         }
                     }
                 }
