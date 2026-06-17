@@ -12,7 +12,7 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
@@ -34,6 +34,8 @@ pub struct WaylandDisplaySrc {
     settings: Mutex<Settings>,
     command_tx: Sender<Command>,
     command_rx: Mutex<Option<Channel<Command>>>,
+    /// Set by unlock() to abort a pending await-listener wait in negotiate().
+    await_abort: AtomicBool,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -44,6 +46,7 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx,
             command_rx: Mutex::new(Some(command_rx)),
+            await_abort: AtomicBool::new(false),
         }
     }
 }
@@ -53,6 +56,7 @@ pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
+    await_listener: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -274,6 +278,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("await-listener")
+                    .nick("Await downstream listener")
+                    .blurb(
+                        "Defer caps negotiation until downstream advertises concrete caps (i.e. a \
+                         consumer is connected). This lets the output format be chosen jointly with \
+                         the consumer instead of fixing an arbitrary default before anything is \
+                         connected. Intended for decoupled setups (e.g. behind an interpipesink) \
+                         where the producer starts before the consumer. The wayland compositor runs \
+                         regardless, so the application can render while negotiation is deferred.",
+                    )
+                    .default_value(false)
+                    .build(),
             ]
         });
 
@@ -337,6 +353,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 settings.disable_intel_workaround =
                     value.get::<bool>().expect("Type checked upstream");
             }
+            "await-listener" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.await_listener = value.get::<bool>().expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -370,6 +390,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "disable-intel-workaround" => {
                 let settings = self.settings.lock().unwrap();
                 settings.disable_intel_workaround.to_value()
+            }
+            "await-listener" => {
+                let settings = self.settings.lock().unwrap();
+                settings.await_listener.to_value()
             }
             _ => unreachable!(),
         }
@@ -608,7 +632,60 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn negotiate(&self) -> Result<(), gst::LoggableError> {
+        let await_listener = self.settings.lock().unwrap().await_listener;
+        if await_listener {
+            let Some(src_pad) = self.obj().static_pad("src") else {
+                return self.parent_negotiate();
+            };
+            // Fixing caps with no consumer connected would force an arbitrary
+            // default format that a consumer attaching later might be unable to
+            // ingest (the classic symptom is a converter such as vapostproc
+            // rejecting the chosen drm-format with not-negotiated). Defer until a
+            // consumer is connected, then negotiate jointly so the format is one
+            // both sides support.
+            //
+            // Detection: with nothing connected, the downstream caps query is
+            // answered transparently by the decoupling element (e.g. an
+            // interpipesink with no listeners), reflecting only static elements
+            // like a capsfilter. When a consumer connects it intersects its own
+            // caps in, changing the answer. We watch for that change rather than
+            // inspecting formats, so this stays fully format-agnostic. The
+            // wayland compositor runs on its own thread, so the application keeps
+            // rendering while we wait.
+            self.await_abort.store(false, Ordering::SeqCst);
+            let baseline = src_pad.peer_query_caps(None);
+            tracing::debug!("await-listener: baseline downstream caps {}", baseline);
+            loop {
+                if self.await_abort.load(Ordering::SeqCst) {
+                    return Err(gst::loggable_error!(
+                        CAT,
+                        "Negotiation aborted while awaiting a downstream consumer"
+                    ));
+                }
+                let peer = src_pad.peer_query_caps(None);
+                if !peer.is_empty() && peer != baseline {
+                    tracing::info!(
+                        "Downstream caps changed (consumer connected), negotiating jointly: {}",
+                        peer
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
         self.parent_negotiate()
+    }
+
+    fn unlock(&self) -> Result<(), gst::ErrorMessage> {
+        // Interrupt a pending await-listener wait in negotiate() so state
+        // changes (e.g. shutdown) don't block on a consumer that never arrives.
+        self.await_abort.store(true, Ordering::SeqCst);
+        self.parent_unlock()
+    }
+
+    fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
+        self.await_abort.store(false, Ordering::SeqCst);
+        self.parent_unlock_stop()
     }
 
     fn event(&self, event: &Event) -> bool {
