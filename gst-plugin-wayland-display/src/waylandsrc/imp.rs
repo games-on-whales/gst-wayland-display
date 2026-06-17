@@ -12,8 +12,9 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(feature = "cuda")]
+use std::sync::atomic::AtomicPtr;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 #[cfg(feature = "cuda")]
@@ -34,8 +35,17 @@ pub struct WaylandDisplaySrc {
     settings: Mutex<Settings>,
     command_tx: Sender<Command>,
     command_rx: Mutex<Option<Channel<Command>>>,
-    /// Set by unlock() to abort a pending await-listener wait in negotiate().
-    await_abort: AtomicBool,
+    /// Coordinates the await-listener wait in negotiate(). `abort` is set by
+    /// unlock() to break the wait; the condvar is notified by event() when a
+    /// downstream RECONFIGURE arrives and by unlock() on abort, so negotiate()
+    /// parks on the event instead of busy-polling.
+    await_state: Mutex<AwaitState>,
+    await_cv: Condvar,
+}
+
+#[derive(Default)]
+struct AwaitState {
+    abort: bool,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -46,7 +56,8 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx,
             command_rx: Mutex::new(Some(command_rx)),
-            await_abort: AtomicBool::new(false),
+            await_state: Mutex::new(AwaitState::default()),
+            await_cv: Condvar::new(),
         }
     }
 }
@@ -652,16 +663,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             // inspecting formats, so this stays fully format-agnostic. The
             // wayland compositor runs on its own thread, so the application keeps
             // rendering while we wait.
-            self.await_abort.store(false, Ordering::SeqCst);
+            self.await_state.lock().unwrap().abort = false;
             let baseline = src_pad.peer_query_caps(None);
             tracing::debug!("await-listener: baseline downstream caps {}", baseline);
             loop {
-                if self.await_abort.load(Ordering::SeqCst) {
-                    return Err(gst::loggable_error!(
-                        CAT,
-                        "Negotiation aborted while awaiting a downstream consumer"
-                    ));
-                }
                 let peer = src_pad.peer_query_caps(None);
                 if !peer.is_empty() && peer != baseline {
                     tracing::info!(
@@ -670,7 +675,22 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     );
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let guard = self.await_state.lock().unwrap();
+                if guard.abort {
+                    return Err(gst::loggable_error!(
+                        CAT,
+                        "Negotiation aborted while awaiting a downstream consumer"
+                    ));
+                }
+                // Park until event() signals a downstream RECONFIGURE or
+                // unlock() aborts. The timeout is a safety net: RECONFIGURE is
+                // not guaranteed to cross a decoupling boundary (e.g.
+                // interpipe), so re-check the caps query periodically rather
+                // than relying on the event alone.
+                let _ = self
+                    .await_cv
+                    .wait_timeout(guard, std::time::Duration::from_millis(500))
+                    .unwrap();
             }
         }
         self.parent_negotiate()
@@ -679,16 +699,24 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     fn unlock(&self) -> Result<(), gst::ErrorMessage> {
         // Interrupt a pending await-listener wait in negotiate() so state
         // changes (e.g. shutdown) don't block on a consumer that never arrives.
-        self.await_abort.store(true, Ordering::SeqCst);
+        self.await_state.lock().unwrap().abort = true;
+        self.await_cv.notify_all();
         self.parent_unlock()
     }
 
     fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
-        self.await_abort.store(false, Ordering::SeqCst);
+        self.await_state.lock().unwrap().abort = false;
         self.parent_unlock_stop()
     }
 
     fn event(&self, event: &Event) -> bool {
+        // A downstream RECONFIGURE is the real trigger for the await-listener
+        // wait in negotiate(): wake it so it re-checks the caps query
+        // immediately instead of waiting out the poll fallback.
+        if let gst::EventView::Reconfigure(_) = event.view() {
+            let _guard = self.await_state.lock().unwrap();
+            self.await_cv.notify_all();
+        }
         if self.handle_event(&event) {
             return true;
         }
