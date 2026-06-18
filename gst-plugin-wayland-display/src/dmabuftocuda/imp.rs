@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gst::glib;
@@ -34,6 +34,9 @@ pub struct DmabufToCuda {
     uploader: Mutex<Option<CudaUploader>>,
     cuda_context: Mutex<Option<Arc<Mutex<CUDAContext>>>>,
     cuda_raw_ptr: AtomicPtr<GstCudaContext>,
+    // Set while acquiring the context, so the re-entrant set_context that
+    // gst_cuda_ensure_element_context triggers doesn't create a second wrapper.
+    acquiring: AtomicBool,
 }
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
@@ -52,10 +55,20 @@ impl DmabufToCuda {
         }
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
         let raw = self.cuda_raw_ptr.as_ptr();
-        match CUDAContext::new_from_gstreamer(&elem, -1, raw) {
+        // gst_cuda_ensure_element_context re-enters set_context; block it from
+        // creating a competing wrapper for the same context.
+        self.acquiring.store(true, Ordering::SeqCst);
+        let result = CUDAContext::new_from_gstreamer(&elem, -1, raw);
+        self.acquiring.store(false, Ordering::SeqCst);
+        match result {
             Ok(ctx) => {
+                let mut guard = self.cuda_context.lock().unwrap();
+                // A re-entrant set_context may already have stored one.
+                if let Some(existing) = guard.as_ref() {
+                    return Some(existing.clone());
+                }
                 let arc = Arc::new(Mutex::new(ctx));
-                *self.cuda_context.lock().unwrap() = Some(arc.clone());
+                *guard = Some(arc.clone());
                 Some(arc)
             }
             Err(e) => {
@@ -191,9 +204,10 @@ impl ElementImpl for DmabufToCuda {
     }
 
     fn set_context(&self, context: &gst::Context) {
-        // Only build a context if we don't already have one; creating a transient
-        // CUDAContext just to drop it churns refs on the shared handle.
-        {
+        // Skip while ensure_cuda_context is mid-acquire: gst_cuda_ensure_element_context
+        // re-enters here, and creating a second wrapper for the same context would
+        // over-unref it at teardown. Also skip if we already have one.
+        if !self.acquiring.load(Ordering::SeqCst) {
             let mut guard = self.cuda_context.lock().unwrap();
             if guard.is_none() {
                 let elem = self.obj().upcast_ref::<gst::Element>().to_owned();

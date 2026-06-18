@@ -280,6 +280,11 @@ pub struct CUDAContext {
 
 impl Drop for CUDAContext {
     fn drop(&mut self) {
+        // Release the CUDA stream first: destroying a stream pushes its parent
+        // context, which must still be a valid GstCudaContext at that point.
+        // Dropping the context before the stream triggers GST_IS_CUDA_CONTEXT
+        // failures (and a use-after-free) during teardown.
+        self.stream = None;
         unsafe {
             gst::ffi::gst_object_unref(self.ptr as *mut gst::ffi::GstObject);
         }
