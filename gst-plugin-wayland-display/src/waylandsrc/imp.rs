@@ -586,14 +586,22 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // NV12 and the in-process GLES converter produces it directly (no downstream
         // vapostproc/cudaconvertscale). The converter emits LINEAR planes.
         if self.settings.lock().unwrap().nv12 {
-            let mut nv12_caps = gst_video::VideoCapsBuilder::new()
-                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
-                .format(VideoFormat::DmaDrm)
-                .field("drm-format", "NV12")
-                .height_range(..i32::MAX)
-                .width_range(..i32::MAX)
-                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
-                .build();
+            // Advertise NV12 DMABuf with both LINEAR ("NV12") and the i915 Y-tiled
+            // modifier. Consumers pick what they import: AMD VA takes LINEAR, Intel
+            // VA wants the tiled one. Nv12Target allocates planes with whichever
+            // modifier negotiation settles on.
+            let build = |drm: &str| {
+                gst_video::VideoCapsBuilder::new()
+                    .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                    .format(VideoFormat::DmaDrm)
+                    .field("drm-format", drm)
+                    .height_range(..i32::MAX)
+                    .width_range(..i32::MAX)
+                    .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                    .build()
+            };
+            let mut nv12_caps = build("NV12:0x0100000000000002");
+            nv12_caps.merge(build("NV12"));
             if let Some(filter) = filter {
                 nv12_caps = nv12_caps.intersect(filter);
             }

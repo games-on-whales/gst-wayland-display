@@ -144,11 +144,25 @@ unsafe fn draw(gl: &ffi::Gles2, prog: &GlProgram, vbo: u32, tex: u32, w: i32, h:
     gl.DrawArrays(ffi::TRIANGLES, 0, 6);
 }
 
-fn alloc_plane(render_node: DrmNode, fourcc: DrmFourcc, w: u32, h: u32) -> Option<Dmabuf> {
+fn alloc_plane(render_node: DrmNode, fourcc: DrmFourcc, w: u32, h: u32, modifier: Modifier) -> Option<Dmabuf> {
     let gbm = new_gbm_device(render_node)?;
     let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
     let mut dma = DmabufAllocator(allocator);
-    dma.create_buffer(w, h, fourcc, &[Modifier::Linear]).ok()
+    // Try the requested modifier; for i915 Y-tiled, GBM often needs the 4-tiled
+    // code instead (same workaround as GsDmaBuf); finally fall back to LINEAR.
+    let mut tries = vec![modifier];
+    if modifier == Modifier::I915_y_tiled {
+        tries.push(Modifier::from(0x0100000000000009));
+    }
+    if modifier != Modifier::Linear {
+        tries.push(Modifier::Linear);
+    }
+    for m in tries {
+        if let Ok(buf) = dma.create_buffer(w, h, fourcc, &[m]) {
+            return Some(buf);
+        }
+    }
+    None
 }
 
 /// Holds the intermediate RGB target, the two NV12 plane buffers, the compiled
@@ -180,8 +194,11 @@ impl Nv12Target {
                 (w as i32, h as i32).into(),
             )
             .ok()?;
-        let y = alloc_plane(render_node, DrmFourcc::R8, w, h)?;
-        let uv = alloc_plane(render_node, DrmFourcc::Gr88, w / 2, h / 2)?;
+        // Allocate the planes with the negotiated modifier (LINEAR on AMD,
+        // i915 Y-tiled on Intel) so the result is importable by that vendor's VA.
+        let modifier = Modifier::from(video_info.modifier());
+        let y = alloc_plane(render_node, DrmFourcc::R8, w, h, modifier)?;
+        let uv = alloc_plane(render_node, DrmFourcc::Gr88, w / 2, h / 2, modifier)?;
 
         let gl = renderer
             .with_context(|gl| unsafe {
