@@ -142,6 +142,24 @@ impl Drop for EGLImage {
     }
 }
 
+/// Convert an already-filled external dmabuf (e.g. the NV12 buffer the compositor
+/// produced) into a CUDAMemory gst buffer, importing it via EGLImage and copying
+/// each plane on-GPU. This is the "convert to CUDA late" step for the Nvidia encode
+/// branch: the dmabuf flows through the system unchanged across all vendors, and
+/// only the Nvidia consumer maps it into CUDA right before the encoder. Works for
+/// any plane layout EGLImage::from handles (NV12 today, P010 for 10-bit/HDR).
+pub fn external_dmabuf_to_cuda_buffer(
+    dmabuf: &Dmabuf,
+    video_info: VideoInfoDmaDrm,
+    egl_display: &EGLDisplay,
+    cuda_context: &CUDAContext,
+    buffer_pool: Option<&CUDABufferPool>,
+) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+    let egl_image = EGLImage::from(dmabuf, egl_display)?;
+    let cuda_image = CUDAImage::from(egl_image, cuda_context)?;
+    cuda_image.to_gst_buffer(video_info, cuda_context, buffer_pool)
+}
+
 pub const CAPS_FEATURE_MEMORY_CUDA_MEMORY: &str = "memory:CUDAMemory"; // TODO: get it from FFI from gstcudamemory.h (https://github.com/GStreamer/gstreamer/blob/9d6abcc18cc9a60a212966a2daaf4a1af243f5da/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h#L113-L121)
 
 pub fn init_cuda() -> Result<(), String> {

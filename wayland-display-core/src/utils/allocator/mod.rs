@@ -868,6 +868,81 @@ mod tests {
         assert_eq!(buf_meta.n_planes(), 1);
     }
 
+    /// Validates the "convert to CUDA late" step on real Nvidia hardware: the
+    /// compositor produces an NV12 dmabuf, which is reconstructed into a single
+    /// 2-plane NV12 dmabuf and imported into CUDA via EGLImage, then copied
+    /// plane-by-plane into a CUDAMemory buffer ready for nvh265enc. Nvidia only.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_nv12_to_cuda() {
+        test_init();
+        cuda::init_cuda().expect("Failed to initialize CUDA");
+        let node_path =
+            std::env::var("NV12_TEST_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let render_node = DrmNode::from_path(&node_path).expect("render node");
+        let mut renderer = setup_renderer(Some(render_node));
+        let (w, h) = (256u32, 256u32);
+
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(VideoFormat::DmaDrm)
+            .field("drm-format", "NV12")
+            .width(w as i32)
+            .height(h as i32)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let video_info = VideoInfoDmaDrm::from_caps(&caps).expect("video info");
+
+        // Produce the NV12 dmabuf via the compositor converter, then reconstruct
+        // it into a single 2-plane NV12 dmabuf (what the encoder-branch element
+        // would build from an incoming gst buffer).
+        let tgt = Nv12Target::new(&mut renderer, render_node, video_info.clone())
+            .expect("nv12 target");
+        render_into(&mut renderer, &mut tgt.rgb.clone(), w as i32, h as i32);
+        tgt.convert(&mut renderer).expect("convert");
+        let nv12 = tgt.as_nv12_dmabuf().expect("reconstruct nv12 dmabuf");
+
+        // Late conversion: NV12 dmabuf -> CUDAMemory.
+        let cuda_ctx = CUDAContext::new(0).expect("cuda context");
+        let cuda_caps = gst_video::VideoCapsBuilder::new()
+            .features([cuda::CAPS_FEATURE_MEMORY_CUDA_MEMORY])
+            .format(VideoFormat::Nv12)
+            .width(w as i32)
+            .height(h as i32)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let pool = CUDABufferPool::new(&cuda_ctx).expect("pool");
+        pool.configure(
+            &cuda_caps,
+            cuda_ctx.stream().expect("cuda stream"),
+            video_info.size() as u32,
+            0,
+            0,
+        )
+        .expect("configure pool");
+        pool.activate().expect("activate pool");
+
+        let egl_display = renderer.egl_context().display().get_display_handle().handle;
+        let gst_buffer = cuda::external_dmabuf_to_cuda_buffer(
+            &nv12,
+            video_info.clone(),
+            &egl_display,
+            &cuda_ctx,
+            Some(&pool),
+        )
+        .expect("dmabuf -> cuda");
+
+        let nv12_size = (w * h + w * h / 2) as usize;
+        println!(
+            "nv12->cuda OK: buffer size = {} (>= NV12 {})",
+            gst_buffer.size(),
+            nv12_size
+        );
+        assert!(gst_buffer.size() >= nv12_size, "CUDA NV12 buffer too small");
+    }
+
     #[test]
     fn test_gst_video_format_conversions() {
         test_init();
