@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod device;
+pub mod nv12;
 pub mod renderer;
 pub mod video_info;
 
