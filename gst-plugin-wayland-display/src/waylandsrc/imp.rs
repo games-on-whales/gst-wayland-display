@@ -584,12 +584,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     fn caps(&self, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
         // NV12 output mode: advertise only an NV12 DMABuf so the source negotiates
         // NV12 and the in-process GLES converter produces it directly (no downstream
-        // vapostproc/cudaconvertscale). The converter emits LINEAR planes.
+        // vapostproc/cudaconvertscale). Both NV12 planes are rendered as R8, so the
+        // NV12 buffer carries a modifier the GPU supports for R8 (Intel tiled, AMD
+        // LINEAR, Nvidia block-linear). Advertise those actual modifiers so the
+        // negotiated caps match what the converter produces.
         if self.settings.lock().unwrap().nv12 {
-            // Advertise NV12 DMABuf with both LINEAR ("NV12") and the i915 Y-tiled
-            // modifier. Consumers pick what they import: AMD VA takes LINEAR, Intel
-            // VA wants the tiled one. Nv12Target allocates planes with whichever
-            // modifier negotiation settles on.
             let build = |drm: &str| {
                 gst_video::VideoCapsBuilder::new()
                     .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
@@ -600,8 +599,48 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
                     .build()
             };
-            let mut nv12_caps = build("NV12:0x0100000000000002");
-            nv12_caps.merge(build("NV12"));
+
+            // Derive NV12 drm-format strings from the GPU's R8 modifiers (same
+            // workaround mapping as the RGB path). Falls back to the static Intel
+            // tiled + LINEAR pair when the compositor isn't up yet.
+            let mut drm_formats: Vec<String> = Vec::new();
+            {
+                let state = self.state.lock().unwrap();
+                if let Some(state) = state.as_ref() {
+                    let disable_workaround = self.settings.lock().unwrap().disable_intel_workaround;
+                    for format in state.display.get_supported_dma_formats() {
+                        if format.code.to_string().trim() != "R8" {
+                            continue;
+                        }
+                        let s = match format.modifier {
+                            DrmModifier::Linear => Some("NV12".to_string()),
+                            DrmModifier::Invalid => None,
+                            DrmModifier::Unrecognized(0x0100000000000009) if !disable_workaround => {
+                                let m: u64 = DrmModifier::I915_y_tiled.into();
+                                Some(format!("NV12:0x{:016x}", m))
+                            }
+                            m => {
+                                let m: u64 = m.into();
+                                Some(format!("NV12:0x{:016x}", m))
+                            }
+                        };
+                        if let Some(s) = s {
+                            if !drm_formats.contains(&s) {
+                                drm_formats.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            if drm_formats.is_empty() {
+                drm_formats = vec!["NV12:0x0100000000000002".into(), "NV12".into()];
+            }
+
+            let mut iter = drm_formats.iter();
+            let mut nv12_caps = build(iter.next().unwrap());
+            for s in iter {
+                nv12_caps.merge(build(s));
+            }
             if let Some(filter) = filter {
                 nv12_caps = nv12_caps.intersect(filter);
             }
