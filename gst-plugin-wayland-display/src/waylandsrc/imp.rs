@@ -582,6 +582,24 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn caps(&self, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
+        // NV12 output mode: advertise only an NV12 DMABuf so the source negotiates
+        // NV12 and the in-process GLES converter produces it directly (no downstream
+        // vapostproc/cudaconvertscale). The converter emits LINEAR planes.
+        if self.settings.lock().unwrap().nv12 {
+            let mut nv12_caps = gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .field("drm-format", "NV12")
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            if let Some(filter) = filter {
+                nv12_caps = nv12_caps.intersect(filter);
+            }
+            return Some(nv12_caps);
+        }
+
         let mut caps = VideoCapsBuilder::new()
             .format(VideoFormat::Rgbx)
             .height_range(..i32::MAX)
