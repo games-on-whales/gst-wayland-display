@@ -68,6 +68,10 @@ pub struct Settings {
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
     await_listener: bool,
+    // Opt-in: produce NV12 directly from the compositor (GLES RGB->NV12 conversion)
+    // so the source outputs an encoder-ready DMABuf and no downstream converter is
+    // needed. Default off while the conversion path is built out.
+    nv12: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -301,6 +305,16 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("nv12")
+                    .nick("NV12 output")
+                    .blurb(
+                        "Produce NV12 directly from the compositor via an in-process GLES \
+                         RGB->NV12 conversion, so the source outputs an encoder-ready DMABuf and \
+                         no downstream converter (vapostproc/cudaconvertscale) is required. \
+                         Default off while this path is built out.",
+                    )
+                    .default_value(false)
+                    .build(),
             ]
         });
 
@@ -368,6 +382,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let mut settings = self.settings.lock().unwrap();
                 settings.await_listener = value.get::<bool>().expect("Type checked upstream");
             }
+            "nv12" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.nv12 = value.get::<bool>().expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -405,6 +423,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "await-listener" => {
                 let settings = self.settings.lock().unwrap();
                 settings.await_listener.to_value()
+            }
+            "nv12" => {
+                let settings = self.settings.lock().unwrap();
+                settings.nv12.to_value()
             }
             _ => unreachable!(),
         }
