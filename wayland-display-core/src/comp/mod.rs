@@ -85,7 +85,9 @@ use crate::utils::allocator::{
     gst_video_format_to_drm_modifier, new_gbm_device,
 };
 use crate::utils::device::gpu::GPUDevice;
+use crate::utils::nv12::Nv12Target;
 use crate::utils::renderer::setup_renderer;
+use smithay::reexports::drm::buffer::DrmFourcc;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
 
 #[derive(Debug, Default)]
@@ -368,9 +370,18 @@ pub(crate) fn apply_video_info(
                 state.output_buffer = Some(GsBufferType::RAW(allocator));
             }
             GstVideoInfo::DMA(base_info) => {
-                let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
-                    .expect("Failed to create GsDmaBuf");
-                state.output_buffer = Some(GsBufferType::DMA(allocator));
+                // NV12 is produced by the in-process GLES RGB->NV12 converter
+                // (render to RGB intermediate, convert to NV12 planes) so the
+                // source emits an encoder-ready buffer with no downstream convert.
+                if gst_video_format_to_drm_fourcc(&base_info) == Some(DrmFourcc::Nv12) {
+                    let nv12 = Nv12Target::new(&mut state.renderer, render_node.unwrap(), base_info)
+                        .expect("Failed to create Nv12Target");
+                    state.output_buffer = Some(GsBufferType::NV12(nv12));
+                } else {
+                    let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)
+                        .expect("Failed to create GsDmaBuf");
+                    state.output_buffer = Some(GsBufferType::DMA(allocator));
+                }
             }
             #[cfg(feature = "cuda")]
             GstVideoInfo::CUDA(base_info) => {

@@ -2,6 +2,7 @@
 pub mod cuda;
 
 use crate::DrmModifier;
+use crate::utils::nv12::Nv12Target;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
 use gst::Buffer as GstBuffer;
@@ -202,6 +203,7 @@ impl GsCUDABuf {
 pub enum GsBufferType {
     RAW(GsGlesbuffer),
     DMA(GsDmaBuf),
+    NV12(Nv12Target),
     #[cfg(feature = "cuda")]
     CUDA(GsCUDABuf),
 }
@@ -229,6 +231,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         match self {
             GsBufferType::RAW(buffer) => renderer.bind(&mut buffer.buffer),
             GsBufferType::DMA(buffer) => renderer.bind(&mut buffer.buffer),
+            // NV12: render the scene into the RGB intermediate; conversion to the
+            // NV12 planes happens in to_gs_buffer().
+            GsBufferType::NV12(buffer) => renderer.bind(&mut buffer.rgb),
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => renderer.bind(&mut buffer.buffer),
         }
@@ -340,6 +345,10 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     }
                 }
                 Ok(gst_buffer)
+            }
+            GsBufferType::NV12(buffer) => {
+                buffer.convert(renderer)?;
+                buffer.to_gst_buffer()
             }
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
@@ -460,6 +469,10 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 }
                 Ok(gst_buffer)
             }
+            GsBufferType::NV12(buffer) => {
+                buffer.convert(renderer)?;
+                buffer.to_gst_buffer()
+            }
         }
     }
 
@@ -467,6 +480,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         match self {
             GsBufferType::RAW(buffer) => VideoInfoTypes::VideoInfo(buffer.video_info.clone()),
             GsBufferType::DMA(buffer) => VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone()),
+            GsBufferType::NV12(buffer) => {
+                VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())
+            }
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
                 VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())

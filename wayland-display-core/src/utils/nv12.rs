@@ -12,7 +12,7 @@
 //! as a 2-memory NV12 gst buffer.
 
 use gst::Buffer as GstBuffer;
-use gst_video::{VideoFormat, VideoMeta};
+use gst_video::{VideoFormat, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags};
@@ -53,6 +53,7 @@ void main() {
     gl_FragColor = vec4(u, v, 0.0, 1.0);
 }";
 
+#[derive(Debug, Clone)]
 pub struct Nv12Shaders {
     pub y: GlesTexProgram,
     pub uv: GlesTexProgram,
@@ -79,46 +80,60 @@ fn alloc_plane(
     dma.create_buffer(w, h, fourcc, &[Modifier::Linear]).ok()
 }
 
-/// Holds the intermediate RGB target and the two NV12 plane buffers.
+/// Holds the intermediate RGB target, the two NV12 plane buffers, the compiled
+/// conversion shaders, and the negotiated NV12 video info.
+#[derive(Debug, Clone)]
 pub struct Nv12Target {
     pub rgb: GlesTexture,
     pub y: Dmabuf,
     pub uv: Dmabuf,
     pub width: u32,
     pub height: u32,
+    pub video_info: VideoInfoDmaDrm,
+    shaders: Nv12Shaders,
     gst_allocator: DmaBufAllocator,
 }
 
 impl Nv12Target {
-    pub fn new(renderer: &mut GlesRenderer, render_node: DrmNode, w: u32, h: u32) -> Option<Self> {
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        render_node: DrmNode,
+        video_info: VideoInfoDmaDrm,
+    ) -> Option<Self> {
         use smithay::backend::renderer::Offscreen;
+        let w = video_info.width();
+        let h = video_info.height();
         let rgb: GlesTexture = renderer
             .create_buffer(Fourcc::Abgr8888, (w as i32, h as i32).into())
             .ok()?;
         let y = alloc_plane(render_node, DrmFourcc::R8, w, h)?;
         let uv = alloc_plane(render_node, DrmFourcc::Gr88, w / 2, h / 2)?;
+        let shaders = Nv12Shaders::compile(renderer).ok()?;
         Some(Nv12Target {
             rgb,
             y,
             uv,
             width: w,
             height: h,
+            video_info,
+            shaders,
             gst_allocator: DmaBufAllocator::new(),
         })
     }
 
     /// Convert the already-rendered RGB texture into the Y and UV plane buffers.
-    pub fn convert(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        shaders: &Nv12Shaders,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    /// Takes `&self` (the cheap `Dmabuf` handles are cloned to bind) so it fits
+    /// the `GsBuffer::to_gs_buffer(&self, ...)` contract.
+    pub fn convert(&self, renderer: &mut GlesRenderer) -> Result<(), Box<dyn std::error::Error>> {
         let (w, h) = (self.width as i32, self.height as i32);
         let rgb = self.rgb.clone();
+        let shaders = &self.shaders;
+        let mut y_plane = self.y.clone();
+        let mut uv_plane = self.uv.clone();
 
         // Y plane: full res.
         {
-            let mut target = renderer.bind(&mut self.y)?;
+            let mut target = renderer.bind(&mut y_plane)?;
             let mut frame = renderer.render(&mut target, (w, h).into(), Transform::Normal)?;
             frame.render_texture_from_to(
                 &rgb,
@@ -136,7 +151,7 @@ impl Nv12Target {
         // UV plane: half res (bilinear downscale subsamples chroma).
         {
             let (uw, uh) = (w / 2, h / 2);
-            let mut target = renderer.bind(&mut self.uv)?;
+            let mut target = renderer.bind(&mut uv_plane)?;
             let mut frame = renderer.render(&mut target, (uw, uh).into(), Transform::Normal)?;
             frame.render_texture_from_to(
                 &rgb,
@@ -207,9 +222,18 @@ mod tests {
         let render_node =
             DrmNode::from_path("/dev/dri/renderD129").expect("render node"); // Intel on pve
         let mut renderer = setup_renderer(Some(render_node));
-        let shaders = Nv12Shaders::compile(&mut renderer).expect("compile shaders");
         let (w, h) = (64u32, 64u32);
-        let mut tgt = Nv12Target::new(&mut renderer, render_node, w, h).expect("nv12 target");
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(VideoFormat::DmaDrm)
+            .field("drm-format", "NV12")
+            .width(w as i32)
+            .height(h as i32)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let video_info = VideoInfoDmaDrm::from_caps(&caps).expect("video info");
+        let tgt = Nv12Target::new(&mut renderer, render_node, video_info).expect("nv12 target");
 
         // Render a solid colour into the RGB intermediate: R=48 G=96 B=192 (the
         // value used in the va/cuda crossing tests -> expected Y ~= 96).
@@ -228,7 +252,7 @@ mod tests {
             frame.finish().expect("finish").wait().expect("wait");
         }
 
-        tgt.convert(&mut renderer, &shaders).expect("convert");
+        tgt.convert(&mut renderer).expect("convert");
         let buf = tgt.to_gst_buffer().expect("gst buffer");
 
         // Read back the Y plane (memory 0) and check luma ~= 96.
