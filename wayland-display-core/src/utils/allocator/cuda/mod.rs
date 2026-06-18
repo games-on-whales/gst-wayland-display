@@ -160,6 +160,98 @@ pub fn external_dmabuf_to_cuda_buffer(
     cuda_image.to_gst_buffer(video_info, cuda_context, buffer_pool)
 }
 
+/// Owns an EGLDisplay and turns incoming NV12 DMABuf gst buffers into CUDAMemory
+/// gst buffers - the "convert to CUDA late" step for the Nvidia encode branch. This
+/// keeps all smithay/EGL handling in the core so the gst plugin only deals with gst
+/// and CUDA types.
+pub struct CudaUploader {
+    egl: std::sync::Arc<smithay::backend::egl::EGLDisplay>,
+}
+
+// The EGLDisplay is Send+Sync (it lives in the shared EGL_DISPLAYS cache).
+unsafe impl Send for CudaUploader {}
+
+impl CudaUploader {
+    /// Create an uploader bound to the given render node (or auto-selected when None).
+    pub fn new(render_node_path: Option<&str>) -> Self {
+        let node = render_node_path
+            .and_then(|p| smithay::backend::drm::DrmNode::from_path(p).ok());
+        CudaUploader {
+            egl: crate::utils::renderer::setup_egl_display(node),
+        }
+    }
+
+    /// Reconstruct the incoming NV12 dmabuf gst buffer into a single 2-plane Dmabuf
+    /// and convert it to a CUDAMemory gst buffer.
+    pub fn upload(
+        &self,
+        inbuf: &gst::BufferRef,
+        in_info: &VideoInfoDmaDrm,
+        cuda_context: &CUDAContext,
+        buffer_pool: Option<&CUDABufferPool>,
+    ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        let dmabuf =
+            reconstruct_nv12_dmabuf(inbuf, in_info).ok_or("failed to reconstruct NV12 dmabuf")?;
+        let raw_display = self.egl.get_display_handle().handle;
+        external_dmabuf_to_cuda_buffer(
+            &dmabuf,
+            in_info.clone(),
+            &raw_display,
+            cuda_context,
+            buffer_pool,
+        )
+    }
+}
+
+/// Rebuild a single 2-plane NV12 Dmabuf from a gst buffer's dmabuf memories (the
+/// inverse of Nv12Target::to_gst_buffer). Handles both the 2-memory layout the
+/// compositor produces (one plane per fd) and a single contiguous memory.
+fn reconstruct_nv12_dmabuf(inbuf: &gst::BufferRef, in_info: &VideoInfoDmaDrm) -> Option<Dmabuf> {
+    use smithay::backend::allocator::dmabuf::DmabufFlags;
+    use smithay::reexports::drm::buffer::DrmFourcc;
+    use smithay::reexports::gbm::Modifier;
+    use std::os::fd::BorrowedFd;
+
+    let width = in_info.width();
+    let height = in_info.height();
+    let modifier = Modifier::from(in_info.modifier());
+    let vmeta = inbuf.meta::<VideoMeta>();
+    let stride = |plane: usize| -> u32 {
+        vmeta
+            .as_ref()
+            .map(|m| m.stride()[plane] as u32)
+            .unwrap_or(width)
+    };
+    let offset = |plane: usize| -> u32 {
+        vmeta.as_ref().map(|m| m.offset()[plane] as u32).unwrap_or(0)
+    };
+
+    let n_mem = inbuf.n_memory();
+    let mut builder = Dmabuf::builder(
+        (width as i32, height as i32),
+        DrmFourcc::Nv12,
+        modifier,
+        DmabufFlags::empty(),
+    );
+    for plane in 0..2usize {
+        let (mem, off) = if n_mem >= 2 {
+            (inbuf.peek_memory(plane), 0u32)
+        } else {
+            (inbuf.peek_memory(0), offset(plane))
+        };
+        let raw_fd =
+            unsafe { gstreamer_allocators::ffi::gst_dmabuf_memory_get_fd(mem.as_ptr() as *mut _) };
+        if raw_fd < 0 {
+            return None;
+        }
+        let owned = unsafe { BorrowedFd::borrow_raw(raw_fd) }
+            .try_clone_to_owned()
+            .ok()?;
+        builder.add_plane(owned, plane as u32, off, stride(plane));
+    }
+    builder.build()
+}
+
 pub const CAPS_FEATURE_MEMORY_CUDA_MEMORY: &str = "memory:CUDAMemory"; // TODO: get it from FFI from gstcudamemory.h (https://github.com/GStreamer/gstreamer/blob/9d6abcc18cc9a60a212966a2daaf4a1af243f5da/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h#L113-L121)
 
 pub fn init_cuda() -> Result<(), String> {

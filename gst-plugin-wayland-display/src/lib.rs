@@ -4,9 +4,13 @@ use waylanddisplaycore::utils::allocator::cuda;
 
 pub mod utils;
 mod waylandsrc;
+#[cfg(feature = "cuda")]
+mod dmabuftocuda;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     waylandsrc::register(plugin)?;
+    #[cfg(feature = "cuda")]
+    dmabuftocuda::register(plugin)?;
     tracing_subscriber::fmt::try_init().ok();
     #[cfg(feature = "cuda")]
     match cuda::init_cuda() {
