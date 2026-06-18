@@ -198,9 +198,9 @@ fn alloc_plane(
     let mut dma = DmabufAllocator(allocator);
     // Try the GPU's supported render modifiers in order; Nvidia rejects EGLImage
     // import of INVALID/LINEAR planes and needs an explicit block-linear modifier,
-    // so we allocate with what the renderer reports it can render to. For the i915
-    // Y-tiled modifier GBM often needs the 4-tiled code (same workaround as the RGB
-    // path). LINEAR is a last resort for vendors (AMD) that accept it.
+    // so we allocate only with what the renderer reports it can render to. For the
+    // i915 Y-tiled modifier GBM often needs the 4-tiled code (same workaround as the
+    // RGB path). LINEAR is only an empty-list safety net.
     let mut tries: Vec<Modifier> = Vec::new();
     for m in mods {
         tries.push(*m);
@@ -208,7 +208,7 @@ fn alloc_plane(
             tries.push(Modifier::from(0x0100000000000009));
         }
     }
-    if !tries.contains(&Modifier::Linear) {
+    if tries.is_empty() {
         tries.push(Modifier::Linear);
     }
     for m in tries {
@@ -265,12 +265,17 @@ impl Nv12Target {
             v
         };
         // Both planes are R8: Y is W x H, UV is W x H/2 holding interleaved Cb/Cr.
-        // Honor the negotiated modifier first so the produced buffer matches the
-        // advertised caps, then fall back to the GPU's other render modifiers.
+        // Allocate only with modifiers the renderer can render to. If the negotiated
+        // modifier is one of them, honor it first so the produced buffer matches the
+        // advertised caps; otherwise ignore it (e.g. a LINEAR-negotiated buffer on
+        // Nvidia, which GBM allocates but the EGL cannot render to) and use a
+        // render-capable modifier.
         let mut r8_mods = mods_for(DrmFourcc::R8);
         let negotiated = Modifier::from(video_info.modifier());
-        r8_mods.retain(|m| *m != negotiated);
-        r8_mods.insert(0, negotiated);
+        if r8_mods.contains(&negotiated) {
+            r8_mods.retain(|m| *m != negotiated);
+            r8_mods.insert(0, negotiated);
+        }
         let y = alloc_plane(render_node, DrmFourcc::R8, w, h, &r8_mods)?;
         let uv = alloc_plane(render_node, DrmFourcc::R8, w, h / 2, &r8_mods)?;
 
@@ -327,6 +332,28 @@ impl Nv12Target {
             frame.finish()?.wait()?;
         }
         Ok(())
+    }
+
+    /// Reconstruct the two R8 planes into a single 2-plane NV12 `Dmabuf` (Y as
+    /// plane 0, UV as plane 1, each keeping its own fd). This is what the late
+    /// dmabuf->CUDA step imports via EGLImage; the encoder-branch element builds
+    /// the equivalent from an incoming gst buffer's dmabuf memories.
+    pub fn as_nv12_dmabuf(&self) -> Option<Dmabuf> {
+        use smithay::backend::allocator::dmabuf::DmabufFlags;
+        let modifier = self.y.format().modifier;
+        let y_stride = self.y.strides().next()?;
+        let uv_stride = self.uv.strides().next()?;
+        let y_fd = self.y.handles().next()?.as_fd().try_clone_to_owned().ok()?;
+        let uv_fd = self.uv.handles().next()?.as_fd().try_clone_to_owned().ok()?;
+        let mut builder = Dmabuf::builder(
+            (self.width as i32, self.height as i32),
+            DrmFourcc::Nv12,
+            modifier,
+            DmabufFlags::empty(),
+        );
+        builder.add_plane(y_fd, 0, 0, y_stride);
+        builder.add_plane(uv_fd, 1, 0, uv_stride);
+        builder.build()
     }
 
     /// Export the two planes as a single NV12 gst buffer (2 memories).
