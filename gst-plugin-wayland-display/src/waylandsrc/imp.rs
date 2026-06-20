@@ -1529,6 +1529,99 @@ mod tests {
         );
     }
 
+    /// Run a gst-launch description to EOS, failing on any bus ERROR. A failure to
+    /// negotiate or to import the source's NV12 dmabuf into the encoder surfaces as
+    /// an ERROR (this is exactly how Ale's PR #35 bug manifested:
+    /// `vaCreateSurfaces: resource allocation failed` -> "Failed to import the
+    /// input frame"), so treating ERROR as fatal makes this a real regression guard
+    /// for the byte-safe-modifier fix. Reaching EOS means all `num-buffers` frames
+    /// negotiated, imported and encoded.
+    fn run_pipeline_to_eos(desc: &str) {
+        use gst::prelude::*;
+        // Make `waylanddisplaysrc` (and `dmabuftocuda`) resolvable by parse::launch.
+        crate::plugin_register_static().ok();
+        let pipeline = gst::parse::launch_full(desc, None, gst::ParseFlags::empty())
+            .expect("parse pipeline")
+            .downcast::<gst::Pipeline>()
+            .expect("not a pipeline");
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("set state Playing");
+        let bus = pipeline.bus().expect("pipeline bus");
+        let mut saw_eos = false;
+        for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
+            match msg.view() {
+                gst::MessageView::Eos(..) => {
+                    saw_eos = true;
+                    break;
+                }
+                gst::MessageView::Error(err) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    panic!(
+                        "pipeline error from {:?}: {} ({:?})",
+                        err.src().map(|s| s.path_string()),
+                        err.error(),
+                        err.debug()
+                    );
+                }
+                _ => {}
+            }
+        }
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("set state Null");
+        assert!(saw_eos, "pipeline timed out before EOS (no frames encoded)");
+    }
+
+    /// End-to-end VA encode: the source produces NV12 directly and a real VA
+    /// encoder imports it. This is Ale's PR #35 pipeline minus the forced
+    /// capsfilter -- with the byte-safe-modifier fix the source advertises a
+    /// modifier it can actually produce (LINEAR on AMD), vapostproc retiles to the
+    /// encoder's native layout, and the import no longer fails. Select the GPU with
+    /// `NV12_VA_NODE` to cover AMD and Intel from the same test. `#[ignore]` keeps
+    /// it out of the headless CI run (CI still compiles it); run it locally with
+    /// `cargo test -p gst-plugin-wayland-display -- --ignored`.
+    #[test]
+    #[ignore = "needs a GPU render node + VA encoder; set NV12_VA_NODE and run with --ignored"]
+    fn test_nv12_va_encode_pipeline() {
+        test_init();
+        let Ok(node) = std::env::var("NV12_VA_NODE") else {
+            eprintln!("skip: set NV12_VA_NODE=/dev/dri/renderDNNN (AMD or Intel) to run this");
+            return;
+        };
+        for f in ["vapostproc", "vah265enc"] {
+            if gst::ElementFactory::find(f).is_none() {
+                eprintln!("skip: {f} not available in this GStreamer install");
+                return;
+            }
+        }
+        run_pipeline_to_eos(&format!(
+            "waylanddisplaysrc nv12=true render-node={node} num-buffers=30 \
+             ! vapostproc ! vah265enc ! fakesink sync=false"
+        ));
+    }
+
+    /// End-to-end Nvidia encode via the late dmabuf->CUDA path (the proven
+    /// `dmabuftocuda ! nvh265enc` pipeline). Guards that the byte-safe-modifier
+    /// change didn't regress Nvidia, where the source keeps its block-linear
+    /// modifier and CUDA does the retile. Node via `NV12_CUDA_NODE` (default
+    /// renderD128). `#[ignore]` + the `cuda` feature keep it out of CI.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs an Nvidia render node + nvcodec; run with --features cuda --ignored"]
+    fn test_nv12_cuda_encode_pipeline() {
+        test_init();
+        let node = std::env::var("NV12_CUDA_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        if gst::ElementFactory::find("nvh265enc").is_none() {
+            eprintln!("skip: nvh265enc not available in this GStreamer install");
+            return;
+        }
+        run_pipeline_to_eos(&format!(
+            "waylanddisplaysrc nv12=true num-buffers=30 \
+             ! dmabuftocuda render-node={node} ! nvh265enc ! fakesink sync=false"
+        ));
+    }
+
     #[test]
     fn test_r8_modifier_is_byte_safe() {
         use super::r8_modifier_is_byte_safe;
