@@ -192,6 +192,21 @@ unsafe fn draw(gl: &ffi::Gles2, prog: &GlProgram, vbo: u32, tex: u32, w: i32, h:
     gl.DrawArrays(ffi::TRIANGLES, 0, 6);
 }
 
+/// Whether an R8 modifier survives the R8->NV12 plane reinterpretation. The
+/// converter renders each NV12 plane as an independent R8 dmabuf and then
+/// reinterprets it as the Y/UV plane; that is byte-layout-correct only when the
+/// tiling is byte-granular and bpp-independent:
+///   - LINEAR: byte-exact on every vendor.
+///   - Intel (i915) tiling: byte-granular, so a 1bpp R8 tile and a 2bpp NV12
+///     chroma tile of the same byte width swizzle identically.
+/// AMD GFX9+ and Nvidia block-linear tilings are element-size aware (e.g. AMD
+/// encodes a different PIPE_XOR_BITS for 1bpp vs 2bpp), so an R8 plane is not a
+/// valid NV12 plane under them -- VA rejects the import. The vendor lives in the
+/// top byte of the modifier; 0x01 is Intel.
+fn is_byte_safe_modifier(m: Modifier) -> bool {
+    m == Modifier::Linear || (u64::from(m) >> 56) as u8 == 0x01
+}
+
 fn alloc_plane(
     render_node: DrmNode,
     fourcc: DrmFourcc,
@@ -271,12 +286,20 @@ impl Nv12Target {
             v
         };
         // Both planes are R8: Y is W x H, UV is W x H/2 holding interleaved Cb/Cr.
-        // Allocate only with modifiers the renderer can render to. If the negotiated
-        // modifier is one of them, honor it first so the produced buffer matches the
-        // advertised caps; otherwise ignore it (e.g. a LINEAR-negotiated buffer on
-        // Nvidia, which GBM allocates but the EGL cannot render to) and use a
-        // render-capable modifier.
+        // Allocate only with modifiers the renderer can render to. The R8->NV12
+        // reinterpretation is byte-correct only under byte-granular tilings, so when
+        // the GPU offers a byte-safe modifier (AMD: LINEAR; Intel: tiled) restrict to
+        // those -- this is what keeps the produced buffer matching the byte-safe NV12
+        // caps we advertise. Keep the element-aware modifiers only when nothing
+        // byte-safe exists (Nvidia renders R8 block-linear only; there the NV12 dmabuf
+        // is consumed via dmabuftocuda, which retiles in CUDA). Then, if the negotiated
+        // modifier survives, honor it first so the buffer matches the advertised caps;
+        // otherwise use a render-capable modifier (e.g. a LINEAR-negotiated buffer on
+        // Nvidia, which GBM allocates but the EGL cannot render to).
         let mut r8_mods = mods_for(DrmFourcc::R8);
+        if r8_mods.iter().any(|m| is_byte_safe_modifier(*m)) {
+            r8_mods.retain(|m| is_byte_safe_modifier(*m));
+        }
         let negotiated = Modifier::from(video_info.modifier());
         if r8_mods.contains(&negotiated) {
             r8_mods.retain(|m| *m != negotiated);
