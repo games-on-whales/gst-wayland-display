@@ -7,16 +7,21 @@ jobs:
   build-test:
     name: cargo build & test
     runs-on: ubuntu-latest
+    # The crate links libwayland with the `libwayland_1_23` feature, so it needs
+    # wayland >= 1.23 at link time. ubuntu-latest runners ship 1.22, so build
+    # inside a newer image that has it.
+    container: ubuntu:25.04
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates \
             libwayland-dev libxkbcommon-dev libinput-dev libudev-dev libseat-dev \
-            libgbm-dev libdrm-dev libegl-dev libgles-dev libgl1-mesa-dev \
+            libgbm-dev libdrm-dev libgl-dev libegl-dev libgles-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - uses: actions/checkout@v4
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
