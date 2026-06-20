@@ -87,8 +87,8 @@ use crate::utils::allocator::{
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::nv12::Nv12Target;
 use crate::utils::renderer::setup_renderer;
-use smithay::reexports::drm::buffer::DrmFourcc;
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
+use smithay::reexports::drm::buffer::DrmFourcc;
 
 #[derive(Debug, Default)]
 pub struct ClientState {
@@ -374,8 +374,9 @@ pub(crate) fn apply_video_info(
                 // (render to RGB intermediate, convert to NV12 planes) so the
                 // source emits an encoder-ready buffer with no downstream convert.
                 if gst_video_format_to_drm_fourcc(&base_info) == Some(DrmFourcc::Nv12) {
-                    let nv12 = Nv12Target::new(&mut state.renderer, render_node.unwrap(), base_info)
-                        .expect("Failed to create Nv12Target");
+                    let nv12 =
+                        Nv12Target::new(&mut state.renderer, render_node.unwrap(), base_info)
+                            .expect("Failed to create Nv12Target");
                     state.output_buffer = Some(GsBufferType::NV12(nv12));
                 } else {
                     let allocator = GsDmaBuf::new(render_node.unwrap(), base_info)

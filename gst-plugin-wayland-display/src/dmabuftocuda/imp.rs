@@ -11,7 +11,8 @@ use gst_video::{VideoFormat, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
 
 use waylanddisplaycore::utils::allocator::cuda::{
-    self, CAPS_FEATURE_MEMORY_CUDA_MEMORY, CUDABufferPool, CUDAContext, CudaUploader, GstCudaContext,
+    self, CAPS_FEATURE_MEMORY_CUDA_MEMORY, CUDABufferPool, CUDAContext, CudaUploader,
+    GstCudaContext,
 };
 
 #[derive(Default)]
@@ -82,7 +83,9 @@ impl DmabufToCuda {
         let neg_guard = self.negotiated.lock().unwrap();
         let neg = neg_guard.as_ref().ok_or(gst::FlowError::NotNegotiated)?;
         let uploader_guard = self.uploader.lock().unwrap();
-        let uploader = uploader_guard.as_ref().ok_or(gst::FlowError::NotNegotiated)?;
+        let uploader = uploader_guard
+            .as_ref()
+            .ok_or(gst::FlowError::NotNegotiated)?;
         let cuda_guard = self.cuda_context.lock().unwrap();
         let cuda_arc = cuda_guard.as_ref().ok_or(gst::FlowError::NotNegotiated)?;
         let ctx = cuda_arc.lock().unwrap();

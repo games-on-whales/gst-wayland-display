@@ -165,7 +165,14 @@ unsafe fn draw(gl: &ffi::Gles2, prog: &GlProgram, vbo: u32, tex: u32, w: i32, h:
     gl.BindBuffer(ffi::ARRAY_BUFFER, vbo);
     let stride = 4 * std::mem::size_of::<f32>() as i32;
     gl.EnableVertexAttribArray(prog.a_pos);
-    gl.VertexAttribPointer(prog.a_pos, 2, ffi::FLOAT, ffi::FALSE, stride, std::ptr::null());
+    gl.VertexAttribPointer(
+        prog.a_pos,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        stride,
+        std::ptr::null(),
+    );
     gl.EnableVertexAttribArray(prog.a_uv);
     gl.VertexAttribPointer(
         prog.a_uv,
@@ -328,7 +335,8 @@ impl Nv12Target {
             let (uw, uh) = (w, h / 2);
             let mut target = renderer.bind(&mut uv_plane)?;
             let mut frame = renderer.render(&mut target, (uw, uh).into(), Transform::Normal)?;
-            frame.with_context(|gl| unsafe { draw(gl, &gl_state.uv, gl_state.vbo, tex, uw, uh) })?;
+            frame
+                .with_context(|gl| unsafe { draw(gl, &gl_state.uv, gl_state.vbo, tex, uw, uh) })?;
             frame.finish()?.wait()?;
         }
         Ok(())
@@ -344,7 +352,13 @@ impl Nv12Target {
         let y_stride = self.y.strides().next()?;
         let uv_stride = self.uv.strides().next()?;
         let y_fd = self.y.handles().next()?.as_fd().try_clone_to_owned().ok()?;
-        let uv_fd = self.uv.handles().next()?.as_fd().try_clone_to_owned().ok()?;
+        let uv_fd = self
+            .uv
+            .handles()
+            .next()?
+            .as_fd()
+            .try_clone_to_owned()
+            .ok()?;
         let mut builder = Dmabuf::builder(
             (self.width as i32, self.height as i32),
             DrmFourcc::Nv12,
@@ -469,7 +483,10 @@ mod tests {
         let near = |a: i32, t: i32| (a - t).abs() <= 12;
         if linear {
             assert!((avg - 96).abs() <= 8, "Y luma off: {avg}");
-            assert!(near(b0, 177) && near(b1, 100), "UV chroma off: [{b0}, {b1}]");
+            assert!(
+                near(b0, 177) && near(b1, 100),
+                "UV chroma off: [{b0}, {b1}]"
+            );
         }
     }
 }

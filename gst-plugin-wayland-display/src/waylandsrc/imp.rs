@@ -615,7 +615,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                         let s = match format.modifier {
                             DrmModifier::Linear => Some("NV12".to_string()),
                             DrmModifier::Invalid => None,
-                            DrmModifier::Unrecognized(0x0100000000000009) if !disable_workaround => {
+                            DrmModifier::Unrecognized(0x0100000000000009)
+                                if !disable_workaround =>
+                            {
                                 let m: u64 = DrmModifier::I915_y_tiled.into();
                                 Some(format!("NV12:0x{:016x}", m))
                             }

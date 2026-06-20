@@ -2,9 +2,9 @@
 pub mod cuda;
 
 use crate::DrmModifier;
-use crate::utils::nv12::Nv12Target;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
+use crate::utils::nv12::Nv12Target;
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
@@ -897,8 +897,8 @@ mod tests {
         // Produce the NV12 dmabuf via the compositor converter, then reconstruct
         // it into a single 2-plane NV12 dmabuf (what the encoder-branch element
         // would build from an incoming gst buffer).
-        let tgt = Nv12Target::new(&mut renderer, render_node, video_info.clone())
-            .expect("nv12 target");
+        let tgt =
+            Nv12Target::new(&mut renderer, render_node, video_info.clone()).expect("nv12 target");
         render_into(&mut renderer, &mut tgt.rgb.clone(), w as i32, h as i32);
         tgt.convert(&mut renderer).expect("convert");
         let nv12 = tgt.as_nv12_dmabuf().expect("reconstruct nv12 dmabuf");

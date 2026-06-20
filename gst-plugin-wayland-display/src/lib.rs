@@ -2,10 +2,10 @@ use gst::glib;
 #[cfg(feature = "cuda")]
 use waylanddisplaycore::utils::allocator::cuda;
 
-pub mod utils;
-mod waylandsrc;
 #[cfg(feature = "cuda")]
 mod dmabuftocuda;
+pub mod utils;
+mod waylandsrc;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     waylandsrc::register(plugin)?;

@@ -174,8 +174,7 @@ unsafe impl Send for CudaUploader {}
 impl CudaUploader {
     /// Create an uploader bound to the given render node (or auto-selected when None).
     pub fn new(render_node_path: Option<&str>) -> Self {
-        let node = render_node_path
-            .and_then(|p| smithay::backend::drm::DrmNode::from_path(p).ok());
+        let node = render_node_path.and_then(|p| smithay::backend::drm::DrmNode::from_path(p).ok());
         CudaUploader {
             egl: crate::utils::renderer::setup_egl_display(node),
         }
@@ -223,7 +222,10 @@ fn reconstruct_nv12_dmabuf(inbuf: &gst::BufferRef, in_info: &VideoInfoDmaDrm) ->
             .unwrap_or(width)
     };
     let offset = |plane: usize| -> u32 {
-        vmeta.as_ref().map(|m| m.offset()[plane] as u32).unwrap_or(0)
+        vmeta
+            .as_ref()
+            .map(|m| m.offset()[plane] as u32)
+            .unwrap_or(0)
     };
 
     let n_mem = inbuf.n_memory();
