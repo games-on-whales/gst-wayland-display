@@ -596,40 +596,20 @@ impl WaylandDisplaySrc {
                 .build()
         };
 
-        // The R8->NV12 reinterpretation is byte-correct only for byte-granular
-        // tilings (LINEAR everywhere, Intel), so an element-aware R8 modifier (AMD
-        // GFX9+, Nvidia block-linear) is NOT a valid NV12 modifier -- advertising it
-        // lets VA negotiate a layout we cannot actually produce, and the import
-        // fails. When the GPU offers a byte-safe modifier (AMD: LINEAR; Intel: tiled)
-        // advertise only those. Fall back to the element-aware modifiers only when
-        // nothing byte-safe exists (Nvidia, where the NV12 dmabuf is consumed via
-        // dmabuftocuda, which retiles in CUDA). On AMD this collapses to bare NV12
-        // (LINEAR) and a downstream vapostproc retiles to the encoder's native modifier.
-        let mut byte_safe: Vec<String> = Vec::new();
-        let mut tiled: Vec<String> = Vec::new();
+        let mut drm_formats: Vec<String> = Vec::new();
         {
             let state = self.state.lock().unwrap();
             if let Some(state) = state.as_ref() {
                 let disable_workaround = self.effective_disable_intel_workaround(state);
                 for format in state.display.get_supported_dma_formats() {
                     if let Some(s) = r8_to_nv12_drm_format(&format, disable_workaround) {
-                        let bucket = if r8_modifier_is_byte_safe(format.modifier) {
-                            &mut byte_safe
-                        } else {
-                            &mut tiled
-                        };
-                        if !bucket.contains(&s) {
-                            bucket.push(s);
+                        if !drm_formats.contains(&s) {
+                            drm_formats.push(s);
                         }
                     }
                 }
             }
         }
-        let drm_formats = if byte_safe.is_empty() {
-            tiled
-        } else {
-            byte_safe
-        };
 
         // Until the compositor is up we don't know the GPU's real R8 modifiers.
         // gst-launch links pads at parse time (before start()), so caps() is
@@ -1141,15 +1121,6 @@ fn r8_to_nv12_drm_format(format: &DrmFormat, disable_workaround: bool) -> Option
     drm_to_gst_format(format, disable_workaround).map(|s| format!("NV12{}", &s[4..]))
 }
 
-/// Whether an R8 modifier is byte-layout-correct to reinterpret as an NV12 plane
-/// (see `Nv12Target`): LINEAR (every vendor) and Intel (i915) tiling are
-/// byte-granular, so the R8 swizzle equals the NV12 plane swizzle. AMD GFX9+ and
-/// Nvidia block-linear tilings are element-size aware and are not byte-safe. The
-/// vendor lives in the top byte of the modifier; 0x01 is Intel.
-fn r8_modifier_is_byte_safe(modifier: DrmModifier) -> bool {
-    modifier == DrmModifier::Linear || (u64::from(modifier) >> 56) as u8 == 0x01
-}
-
 fn gst_button_to_msg(button: i32, state: ButtonState) -> Option<Command> {
     match button as u32 {
         // X11 buttons are internally mapped to some values
@@ -1574,12 +1545,10 @@ mod tests {
     }
 
     /// End-to-end VA encode: the source produces NV12 directly and a real VA
-    /// encoder imports it. This is Ale's PR #35 pipeline minus the forced
-    /// capsfilter -- with the byte-safe-modifier fix the source advertises a
-    /// modifier it can actually produce (LINEAR on AMD), vapostproc retiles to the
-    /// encoder's native layout, and the import no longer fails. Select the GPU with
-    /// `NV12_VA_NODE` to cover AMD and Intel from the same test. `#[ignore]` keeps
-    /// it out of the headless CI run (CI still compiles it); run it locally with
+    /// encoder consumes it through vapostproc. This is Ale's PR #35 pipeline, made
+    /// to work by forcing vapostproc to emit a VA surface (see the inline note on
+    /// the `VAMemory` cap). Select the GPU with `NV12_VA_NODE`. `#[ignore]` keeps it
+    /// out of the headless CI run (CI still compiles it); run it locally with
     /// `cargo test -p gst-plugin-wayland-display -- --ignored`.
     #[test]
     #[ignore = "needs a GPU render node + VA encoder; set NV12_VA_NODE and run with --ignored"]
@@ -1589,23 +1558,40 @@ mod tests {
             eprintln!("skip: set NV12_VA_NODE=/dev/dri/renderDNNN (AMD or Intel) to run this");
             return;
         };
-        for f in ["vapostproc", "vah265enc"] {
-            if gst::ElementFactory::find(f).is_none() {
-                eprintln!("skip: {f} not available in this GStreamer install");
-                return;
-            }
+        if gst::ElementFactory::find("vapostproc").is_none() {
+            eprintln!("skip: vapostproc not available in this GStreamer install");
+            return;
         }
+        // AMD/radeonsi exposes the full-slice `vah265enc`; Intel only exposes the
+        // low-power `vah265lpenc`. Either exercises the same negotiation + VA import
+        // path, so pick whichever this GPU registered.
+        let Some(enc) = ["vah265enc", "vah265lpenc"]
+            .into_iter()
+            .find(|e| gst::ElementFactory::find(e).is_some())
+        else {
+            eprintln!("skip: no VA H.265 encoder (vah265enc/vah265lpenc) available");
+            return;
+        };
+        // The `video/x-raw(memory:VAMemory)` cap between vapostproc and the encoder
+        // is load-bearing: without it vapostproc goes passthrough (its sink caps
+        // already match the source's NV12 dmabuf), the encoder tries to import our
+        // dmabuf directly into an encode surface, and VA rejects it ("Failed to
+        // import the input frame" / "Failed to create the reconstruct picture" --
+        // exactly PR #35). Forcing a VA surface makes vapostproc do a real import +
+        // upload, handing the encoder a surface it accepts. Verified on Intel
+        // (renderD129, iHD); on AMD the source cannot produce a VA-importable NV12
+        // at all (see PR notes), so this test is effectively Intel-only today.
         run_pipeline_to_eos(&format!(
             "waylanddisplaysrc nv12=true render-node={node} num-buffers=30 \
-             ! vapostproc ! vah265enc ! fakesink sync=false"
+             ! vapostproc ! video/x-raw(memory:VAMemory) ! {enc} ! h265parse ! fakesink sync=false"
         ));
     }
 
     /// End-to-end Nvidia encode via the late dmabuf->CUDA path (the proven
-    /// `dmabuftocuda ! nvh265enc` pipeline). Guards that the byte-safe-modifier
-    /// change didn't regress Nvidia, where the source keeps its block-linear
-    /// modifier and CUDA does the retile. Node via `NV12_CUDA_NODE` (default
-    /// renderD128). `#[ignore]` + the `cuda` feature keep it out of CI.
+    /// `dmabuftocuda ! nvh265enc` pipeline). On Nvidia the NV12 dmabuf is consumed
+    /// by CUDA rather than VA, so it sidesteps the VA-import problem entirely. Node
+    /// via `NV12_CUDA_NODE` (default renderD128). `#[ignore]` + the `cuda` feature
+    /// keep it out of CI.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs an Nvidia render node + nvcodec; run with --features cuda --ignored"]
@@ -1619,38 +1605,6 @@ mod tests {
         run_pipeline_to_eos(&format!(
             "waylanddisplaysrc nv12=true num-buffers=30 \
              ! dmabuftocuda render-node={node} ! nvh265enc ! fakesink sync=false"
-        ));
-    }
-
-    #[test]
-    fn test_r8_modifier_is_byte_safe() {
-        use super::r8_modifier_is_byte_safe;
-        use waylanddisplaycore::DrmModifier;
-
-        // LINEAR is byte-exact on every vendor.
-        assert!(r8_modifier_is_byte_safe(DrmModifier::Linear));
-
-        // Intel (i915) tiling is byte-granular -> safe. Both the y-tiled modifier
-        // and the raw 4-tiled code (vendor byte 0x01) qualify.
-        assert!(r8_modifier_is_byte_safe(DrmModifier::I915_y_tiled));
-        assert!(r8_modifier_is_byte_safe(DrmModifier::Unrecognized(
-            0x0100000000000009
-        )));
-
-        // AMD GFX9+ tiling is element-size aware -> NOT safe. This is the exact
-        // R8 modifier the renderer advertises in Ale's PR #35 report; reusing it
-        // as an NV12 modifier (0x..082305) is what made vaCreateSurfaces fail.
-        assert!(!r8_modifier_is_byte_safe(DrmModifier::Unrecognized(
-            0x0200000000042305
-        )));
-        assert!(!r8_modifier_is_byte_safe(DrmModifier::Unrecognized(
-            0x0200000000082305
-        )));
-
-        // Nvidia block-linear is also element-size aware -> NOT safe (the dmabuf
-        // is retiled later in CUDA, not reinterpreted as NV12 directly).
-        assert!(!r8_modifier_is_byte_safe(
-            DrmModifier::Nvidia_16bx2_block_eight_gob
         ));
     }
 }
