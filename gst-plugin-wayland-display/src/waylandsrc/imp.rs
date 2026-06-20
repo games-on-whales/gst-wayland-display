@@ -554,6 +554,83 @@ impl ElementImpl for WaylandDisplaySrc {
     }
 }
 
+impl WaylandDisplaySrc {
+    /// Refine the configured `disable-intel-workaround` flag: only DG2 (Alchemist)
+    /// Intel GPUs actually need the 4-tiled->y-tiled modifier remap; Battlemage and
+    /// later, and every non-Intel GPU, don't. Shared by the RGB and NV12 caps paths
+    /// so they stay consistent.
+    fn effective_disable_intel_workaround(&self, state: &State) -> bool {
+        let mut disable = self.settings.lock().unwrap().disable_intel_workaround;
+        if !disable {
+            if let Some(render_device) = state.display.get_render_device() {
+                if *render_device.pci_vendor() == PCIVendor::Intel {
+                    if !render_device.device_name().contains("DG2") {
+                        tracing::info!("Disabling workaround for non-Alchemist (DG2) Intel GPU");
+                        disable = true;
+                    } else {
+                        tracing::info!("Enabling workaround for Alchemist (DG2) Intel GPU");
+                    }
+                }
+            }
+        }
+        disable
+    }
+
+    /// Build the NV12 DMABuf caps advertised in NV12 output mode. Both NV12 planes
+    /// are rendered as R8, so the buffer carries a modifier the GPU supports for R8
+    /// (Intel tiled, AMD LINEAR, Nvidia block-linear). We derive the advertised
+    /// drm-formats from the GPU's R8 modifiers via the same `drm_to_gst_format`
+    /// mapping the RGB path uses -- only the format token differs (R8 -> NV12) -- so
+    /// the negotiated caps match what the converter produces. Falls back to the
+    /// static Intel tiled + LINEAR pair when the compositor isn't up yet.
+    fn nv12_caps(&self, filter: Option<&gst::Caps>) -> gst::Caps {
+        let build = |drm: &str| {
+            gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .field("drm-format", drm)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build()
+        };
+
+        let mut drm_formats: Vec<String> = Vec::new();
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(state) = state.as_ref() {
+                let disable_workaround = self.effective_disable_intel_workaround(state);
+                for format in state.display.get_supported_dma_formats() {
+                    if format.code.to_string().trim() != "R8" {
+                        continue;
+                    }
+                    // Reuse the RGB path's modifier->drm-format mapping, then swap the
+                    // R8 token (always the first 4 chars, space-padded) for NV12.
+                    if let Some(r8) = drm_to_gst_format(&format, disable_workaround) {
+                        let s = format!("NV12{}", &r8[4..]);
+                        if !drm_formats.contains(&s) {
+                            drm_formats.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        if drm_formats.is_empty() {
+            drm_formats = vec!["NV12:0x0100000000000002".into(), "NV12".into()];
+        }
+
+        let mut iter = drm_formats.iter();
+        let mut caps = build(iter.next().unwrap());
+        for s in iter {
+            caps.merge(build(s));
+        }
+        if let Some(filter) = filter {
+            caps = caps.intersect(filter);
+        }
+        caps
+    }
+}
+
 impl BaseSrcImpl for WaylandDisplaySrc {
     #[cfg(feature = "cuda")]
     fn query(&self, query: &mut gst::QueryRef) -> bool {
@@ -584,69 +661,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     fn caps(&self, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
         // NV12 output mode: advertise only an NV12 DMABuf so the source negotiates
         // NV12 and the in-process GLES converter produces it directly (no downstream
-        // vapostproc/cudaconvertscale). Both NV12 planes are rendered as R8, so the
-        // NV12 buffer carries a modifier the GPU supports for R8 (Intel tiled, AMD
-        // LINEAR, Nvidia block-linear). Advertise those actual modifiers so the
-        // negotiated caps match what the converter produces.
+        // vapostproc/cudaconvertscale).
         if self.settings.lock().unwrap().nv12 {
-            let build = |drm: &str| {
-                gst_video::VideoCapsBuilder::new()
-                    .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
-                    .format(VideoFormat::DmaDrm)
-                    .field("drm-format", drm)
-                    .height_range(..i32::MAX)
-                    .width_range(..i32::MAX)
-                    .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
-                    .build()
-            };
-
-            // Derive NV12 drm-format strings from the GPU's R8 modifiers (same
-            // workaround mapping as the RGB path). Falls back to the static Intel
-            // tiled + LINEAR pair when the compositor isn't up yet.
-            let mut drm_formats: Vec<String> = Vec::new();
-            {
-                let state = self.state.lock().unwrap();
-                if let Some(state) = state.as_ref() {
-                    let disable_workaround = self.settings.lock().unwrap().disable_intel_workaround;
-                    for format in state.display.get_supported_dma_formats() {
-                        if format.code.to_string().trim() != "R8" {
-                            continue;
-                        }
-                        let s = match format.modifier {
-                            DrmModifier::Linear => Some("NV12".to_string()),
-                            DrmModifier::Invalid => None,
-                            DrmModifier::Unrecognized(0x0100000000000009)
-                                if !disable_workaround =>
-                            {
-                                let m: u64 = DrmModifier::I915_y_tiled.into();
-                                Some(format!("NV12:0x{:016x}", m))
-                            }
-                            m => {
-                                let m: u64 = m.into();
-                                Some(format!("NV12:0x{:016x}", m))
-                            }
-                        };
-                        if let Some(s) = s {
-                            if !drm_formats.contains(&s) {
-                                drm_formats.push(s);
-                            }
-                        }
-                    }
-                }
-            }
-            if drm_formats.is_empty() {
-                drm_formats = vec!["NV12:0x0100000000000002".into(), "NV12".into()];
-            }
-
-            let mut iter = drm_formats.iter();
-            let mut nv12_caps = build(iter.next().unwrap());
-            for s in iter {
-                nv12_caps.merge(build(s));
-            }
-            if let Some(filter) = filter {
-                nv12_caps = nv12_caps.intersect(filter);
-            }
-            return Some(nv12_caps);
+            return Some(self.nv12_caps(filter));
         }
 
         let mut caps = VideoCapsBuilder::new()
@@ -673,26 +690,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let gst_dma_formats: Vec<String> = match state.as_ref() {
             None => Default::default(),
             Some(state) => {
-                let dma_formats = state.display.get_supported_dma_formats();
-
-                let settings = self.settings.lock().unwrap();
-                let mut disable_workaround = settings.disable_intel_workaround;
-                if let Some(render_device) = state.display.get_render_device() {
-                    // Only enable workaround for DG2 (Alchemist) Intel GPUs, Battlemage and later
-                    // have reportedly no issues with the DRM modifier and don't require workaround.
-                    if !disable_workaround && *render_device.pci_vendor() == PCIVendor::Intel {
-                        if !render_device.device_name().contains("DG2") {
-                            tracing::info!(
-                                "Disabling workaround for non-Alchemist (DG2) Intel GPU"
-                            );
-                            disable_workaround = true;
-                        } else if !disable_workaround {
-                            tracing::info!("Enabling workaround for Alchemist (DG2) Intel GPU");
-                        }
-                    }
-                }
-
-                dma_formats
+                let disable_workaround = self.effective_disable_intel_workaround(state);
+                state
+                    .display
+                    .get_supported_dma_formats()
                     .iter()
                     .filter_map(|format| drm_to_gst_format(format, disable_workaround))
                     .collect()

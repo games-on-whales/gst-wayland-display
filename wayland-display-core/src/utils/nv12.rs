@@ -104,6 +104,15 @@ struct GlState {
     vbo: u32,
 }
 
+/// Read a GLES info log (shader compile or program link) into a String. `get` is
+/// the matching `glGet{Shader,Program}InfoLog` call, already bound to its object.
+unsafe fn info_log(get: impl FnOnce(i32, *mut i32, *mut u8)) -> String {
+    let mut buf = [0u8; 512];
+    let mut len = 0i32;
+    get(512, &mut len as *mut i32, buf.as_mut_ptr());
+    String::from_utf8_lossy(&buf[..len.max(0) as usize]).into_owned()
+}
+
 unsafe fn compile(gl: &ffi::Gles2, frag: &str) -> GlProgram {
     let mk = |ty: u32, src: &str| -> u32 {
         let s = gl.CreateShader(ty);
@@ -119,13 +128,8 @@ unsafe fn compile(gl: &ffi::Gles2, frag: &str) -> GlProgram {
         let mut ok = 0i32;
         gl.GetShaderiv(sh, ffi::COMPILE_STATUS, &mut ok);
         if ok == 0 {
-            let mut buf = [0u8; 512];
-            let mut len = 0i32;
-            gl.GetShaderInfoLog(sh, 512, &mut len, buf.as_mut_ptr() as *mut _);
-            tracing::error!(
-                "nv12 {label} shader compile failed: {}",
-                String::from_utf8_lossy(&buf[..len.max(0) as usize])
-            );
+            let log = info_log(|n, len, ptr| gl.GetShaderInfoLog(sh, n, len, ptr as *mut _));
+            tracing::error!("nv12 {label} shader compile failed: {log}");
         }
     }
     let program = gl.CreateProgram();
@@ -139,13 +143,8 @@ unsafe fn compile(gl: &ffi::Gles2, frag: &str) -> GlProgram {
     let cpos = CString::new("a_pos").unwrap();
     let cuv = CString::new("a_uv").unwrap();
     if linked == 0 {
-        let mut buf = [0u8; 512];
-        let mut len = 0i32;
-        gl.GetProgramInfoLog(program, 512, &mut len, buf.as_mut_ptr() as *mut _);
-        tracing::error!(
-            "nv12 program link failed: {}",
-            String::from_utf8_lossy(&buf[..len.max(0) as usize])
-        );
+        let log = info_log(|n, len, ptr| gl.GetProgramInfoLog(program, n, len, ptr as *mut _));
+        tracing::error!("nv12 program link failed: {log}");
     }
     let ctex = CString::new("tex").unwrap();
     let cw = CString::new("u_w").unwrap();
@@ -343,9 +342,11 @@ impl Nv12Target {
     }
 
     /// Reconstruct the two R8 planes into a single 2-plane NV12 `Dmabuf` (Y as
-    /// plane 0, UV as plane 1, each keeping its own fd). This is what the late
-    /// dmabuf->CUDA step imports via EGLImage; the encoder-branch element builds
-    /// the equivalent from an incoming gst buffer's dmabuf memories.
+    /// plane 0, UV as plane 1, each keeping its own fd). Test-only: it stands in
+    /// for the production path (`to_gst_buffer` followed by the late dmabuf->CUDA
+    /// element's `reconstruct_nv12_dmabuf`) so a unit test can feed the CUDA
+    /// converter a 2-plane NV12 dmabuf without a running pipeline.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn as_nv12_dmabuf(&self) -> Option<Dmabuf> {
         use smithay::backend::allocator::dmabuf::DmabufFlags;
         let modifier = self.y.format().modifier;
