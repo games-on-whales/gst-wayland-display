@@ -157,8 +157,17 @@ unsafe fn compile(gl: &ffi::Gles2, frag: &str) -> GlProgram {
     }
 }
 
-unsafe fn draw(gl: &ffi::Gles2, prog: &GlProgram, vbo: u32, tex: u32, w: i32, h: i32) {
-    gl.Viewport(0, 0, w, h);
+unsafe fn draw(
+    gl: &ffi::Gles2,
+    prog: &GlProgram,
+    vbo: u32,
+    tex: u32,
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+) {
+    gl.Viewport(x0, y0, w, h);
     gl.Disable(ffi::BLEND);
     gl.UseProgram(prog.program);
     gl.BindBuffer(ffi::ARRAY_BUFFER, vbo);
@@ -230,8 +239,11 @@ fn alloc_plane(
 #[derive(Debug, Clone)]
 pub struct Nv12Target {
     pub rgb: GlesTexture,
-    pub y: Dmabuf,
-    pub uv: Dmabuf,
+    /// Single R8 dmabuf of W x (H + H/2): the Y plane occupies the top H rows,
+    /// the interleaved UV plane the bottom H/2 rows. Exported as a one-fd NV12
+    /// (plane 0 at offset 0, plane 1 at offset stride*H) so a VA encoder can
+    /// import it directly, with no vapostproc in between.
+    plane: Dmabuf,
     pub width: u32,
     pub height: u32,
     pub video_info: VideoInfoDmaDrm,
@@ -282,8 +294,8 @@ impl Nv12Target {
             r8_mods.retain(|m| *m != negotiated);
             r8_mods.insert(0, negotiated);
         }
-        let y = alloc_plane(render_node, DrmFourcc::R8, w, h, &r8_mods)?;
-        let uv = alloc_plane(render_node, DrmFourcc::R8, w, h / 2, &r8_mods)?;
+        // One bo holding both planes: Y (W x H) stacked over UV (W x H/2).
+        let plane = alloc_plane(render_node, DrmFourcc::R8, w, h + h / 2, &r8_mods)?;
 
         let gl = renderer
             .with_context(|gl| unsafe {
@@ -306,8 +318,7 @@ impl Nv12Target {
 
         Some(Nv12Target {
             rgb,
-            y,
-            uv,
+            plane,
             width: w,
             height: h,
             video_info,
@@ -316,28 +327,26 @@ impl Nv12Target {
         })
     }
 
-    /// Convert the already-rendered RGB texture into the Y and UV plane buffers.
+    /// Convert the already-rendered RGB texture into the Y and UV regions of the
+    /// single output bo: Y into the top H rows, interleaved UV into the bottom H/2
+    /// rows, in one bound framebuffer.
     pub fn convert(&self, renderer: &mut GlesRenderer) -> Result<(), Box<dyn std::error::Error>> {
         let (w, h) = (self.width as i32, self.height as i32);
+        let total_h = h + h / 2;
         let tex = self.rgb.tex_id();
         let gl_state = self.gl;
-        let mut y_plane = self.y.clone();
-        let mut uv_plane = self.uv.clone();
+        let mut plane = self.plane.clone();
 
-        {
-            let mut target = renderer.bind(&mut y_plane)?;
-            let mut frame = renderer.render(&mut target, (w, h).into(), Transform::Normal)?;
-            frame.with_context(|gl| unsafe { draw(gl, &gl_state.y, gl_state.vbo, tex, w, h) })?;
-            frame.finish()?.wait()?;
-        }
-        {
-            let (uw, uh) = (w, h / 2);
-            let mut target = renderer.bind(&mut uv_plane)?;
-            let mut frame = renderer.render(&mut target, (uw, uh).into(), Transform::Normal)?;
-            frame
-                .with_context(|gl| unsafe { draw(gl, &gl_state.uv, gl_state.vbo, tex, uw, uh) })?;
-            frame.finish()?.wait()?;
-        }
+        let mut target = renderer.bind(&mut plane)?;
+        let mut frame = renderer.render(&mut target, (w, total_h).into(), Transform::Normal)?;
+        frame.with_context(|gl| unsafe {
+            // This bind maps GL window row y directly to memory row y (no flip), so
+            // Y goes to viewport rows [0,H) (memory rows [0,H)) and UV to rows
+            // [H, 3H/2) (memory rows [H, 3H/2)) -- the NV12 plane order.
+            draw(gl, &gl_state.y, gl_state.vbo, tex, 0, 0, w, h);
+            draw(gl, &gl_state.uv, gl_state.vbo, tex, 0, h, w, h / 2);
+        })?;
+        frame.finish()?.wait()?;
         Ok(())
     }
 
@@ -349,53 +358,57 @@ impl Nv12Target {
     #[cfg(all(test, feature = "cuda"))]
     pub fn as_nv12_dmabuf(&self) -> Option<Dmabuf> {
         use smithay::backend::allocator::dmabuf::DmabufFlags;
-        let modifier = self.y.format().modifier;
-        let y_stride = self.y.strides().next()?;
-        let uv_stride = self.uv.strides().next()?;
-        let y_fd = self.y.handles().next()?.as_fd().try_clone_to_owned().ok()?;
-        let uv_fd = self
-            .uv
+        let modifier = self.plane.format().modifier;
+        let stride = self.plane.strides().next()?;
+        let y_fd = self
+            .plane
             .handles()
             .next()?
             .as_fd()
             .try_clone_to_owned()
             .ok()?;
+        let uv_fd = self
+            .plane
+            .handles()
+            .next()?
+            .as_fd()
+            .try_clone_to_owned()
+            .ok()?;
+        let y_size = stride * self.height;
         let mut builder = Dmabuf::builder(
             (self.width as i32, self.height as i32),
             DrmFourcc::Nv12,
             modifier,
             DmabufFlags::empty(),
         );
-        builder.add_plane(y_fd, 0, 0, y_stride);
-        builder.add_plane(uv_fd, 1, 0, uv_stride);
+        builder.add_plane(y_fd, 0, 0, stride);
+        builder.add_plane(uv_fd, 1, y_size, stride);
         builder.build()
     }
 
-    /// Export the two planes as a single NV12 gst buffer (2 memories).
+    /// Export the single bo as a one-memory NV12 gst buffer: plane 0 (Y) at offset
+    /// 0, plane 1 (UV) at offset stride*H, both within the same fd. This is the
+    /// single-allocation layout a VA encoder can import directly.
     pub fn to_gst_buffer(&self) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         let mut buf = GstBuffer::new();
-        let y_stride = self.y.strides().next().unwrap_or(self.width) as i32;
-        let uv_stride = self.uv.strides().next().unwrap_or(self.width) as i32;
-        let y_size = (y_stride as usize) * (self.height as usize);
+        let stride = self.plane.strides().next().unwrap_or(self.width) as i32;
+        let y_size = (stride as usize) * (self.height as usize);
 
         {
             let b = buf.get_mut().unwrap();
-            for plane in [&self.y, &self.uv] {
-                plane.handles().for_each(|handle| {
-                    let fd = handle.as_raw_fd();
-                    let size = smithay::reexports::rustix::fs::seek(
-                        &handle.as_fd(),
-                        smithay::reexports::rustix::fs::SeekFrom::End(0),
-                    )
-                    .unwrap() as usize;
-                    let mem = unsafe {
-                        self.gst_allocator
-                            .alloc_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE)
-                            .expect("alloc dmabuf memory")
-                    };
-                    b.append_memory(mem);
-                });
-            }
+            let handle = self.plane.handles().next().ok_or("nv12 plane has no fd")?;
+            let fd = handle.as_raw_fd();
+            let size = smithay::reexports::rustix::fs::seek(
+                &handle.as_fd(),
+                smithay::reexports::rustix::fs::SeekFrom::End(0),
+            )
+            .unwrap() as usize;
+            let mem = unsafe {
+                self.gst_allocator
+                    .alloc_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE)
+                    .expect("alloc dmabuf memory")
+            };
+            b.append_memory(mem);
             VideoMeta::add_full(
                 b,
                 gst_video::VideoFrameFlags::empty(),
@@ -403,7 +416,7 @@ impl Nv12Target {
                 self.width,
                 self.height,
                 &[0usize, y_size],
-                &[y_stride, uv_stride],
+                &[stride, stride],
             )?;
         }
         Ok(buf)
@@ -455,32 +468,35 @@ mod tests {
 
         tgt.convert(&mut renderer).expect("convert");
         let buf = tgt.to_gst_buffer().expect("gst buffer");
-        assert_eq!(buf.n_memory(), 2, "NV12 buffer should have Y + UV memories");
+        assert_eq!(
+            buf.n_memory(),
+            1,
+            "single-bo NV12 buffer should have 1 memory"
+        );
 
         // CPU readback is only meaningful for a LINEAR layout; tiled/block-linear
         // planes (Intel, Nvidia) read back as raw tiles, so byte-exact assertions
         // only run on LINEAR. Correctness on tiled vendors is covered by the e2e
         // encode test. Reaching here without an EGLImage error already proves the
         // converter renders to importable planes on this GPU.
-        let linear = u64::from(tgt.y.format().modifier) == u64::from(Modifier::Linear);
+        let linear = u64::from(tgt.plane.format().modifier) == u64::from(Modifier::Linear);
 
-        let mem0 = buf.peek_memory(0);
-        let mapped = mem0.map_readable().expect("map Y");
+        // One memory: Y plane at [0, stride*H), UV plane at [stride*H, ..).
+        let stride = tgt.plane.strides().next().unwrap() as usize;
+        let y_size = stride * h as usize;
+        let mapped = buf.peek_memory(0).map_readable().expect("map nv12");
         let data = mapped.as_slice();
-        let y_stride = tgt.y.strides().next().unwrap() as usize;
         let mut sum = 0u64;
         let n = 16usize;
         for i in 0..n {
-            sum += data[i * y_stride + 10] as u64;
+            sum += data[i * stride + 10] as u64;
         }
         let avg = (sum / n as u64) as i32;
-        println!("nv12 Y avg = {avg} (expected ~96), linear={linear}");
-        drop(mapped);
-
-        let uv = buf.peek_memory(1).map_readable().expect("map UV");
-        let uvd = uv.as_slice();
-        let (b0, b1) = (uvd[0] as i32, uvd[1] as i32);
-        println!("nv12 UV[0]={b0} UV[1]={b1} (expected Cb~177, Cr~100), linear={linear}");
+        let (b0, b1) = (data[y_size] as i32, data[y_size + 1] as i32);
+        println!(
+            "nv12 Y avg = {avg} (expected ~96), UV[0]={b0} UV[1]={b1} \
+             (expected Cb~177, Cr~100), linear={linear}"
+        );
         let near = |a: i32, t: i32| (a - t).abs() <= 12;
         if linear {
             assert!((avg - 96).abs() <= 8, "Y luma off: {avg}");
