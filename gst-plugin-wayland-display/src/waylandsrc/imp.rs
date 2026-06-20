@@ -601,13 +601,7 @@ impl WaylandDisplaySrc {
             if let Some(state) = state.as_ref() {
                 let disable_workaround = self.effective_disable_intel_workaround(state);
                 for format in state.display.get_supported_dma_formats() {
-                    if format.code.to_string().trim() != "R8" {
-                        continue;
-                    }
-                    // Reuse the RGB path's modifier->drm-format mapping, then swap the
-                    // R8 token (always the first 4 chars, space-padded) for NV12.
-                    if let Some(r8) = drm_to_gst_format(&format, disable_workaround) {
-                        let s = format!("NV12{}", &r8[4..]);
+                    if let Some(s) = r8_to_nv12_drm_format(&format, disable_workaround) {
                         if !drm_formats.contains(&s) {
                             drm_formats.push(s);
                         }
@@ -1092,6 +1086,19 @@ fn drm_to_gst_format(format: &DrmFormat, disable_workaround: bool) -> Option<Str
     }
 }
 
+/// Map a GPU R8 DMABuf format to the NV12 drm-format string advertised in NV12
+/// output mode. Both NV12 planes are rendered as R8, so the buffer carries an R8
+/// modifier; we reuse the RGB path's `drm_to_gst_format` mapping (including the
+/// i915 4-tiled workaround) and swap the R8 token (always the first 4 chars,
+/// space-padded) for NV12. Returns None for non-R8 formats and for modifiers
+/// `drm_to_gst_format` rejects (e.g. Invalid).
+fn r8_to_nv12_drm_format(format: &DrmFormat, disable_workaround: bool) -> Option<String> {
+    if format.code.to_string().trim() != "R8" {
+        return None;
+    }
+    drm_to_gst_format(format, disable_workaround).map(|s| format!("NV12{}", &s[4..]))
+}
+
 fn gst_button_to_msg(button: i32, state: ButtonState) -> Option<Command> {
     match button as u32 {
         // X11 buttons are internally mapped to some values
@@ -1415,6 +1422,59 @@ mod tests {
                 false
             ),
             Some("RA24:0x0300000000000013".to_string())
+        );
+    }
+
+    #[test]
+    fn test_r8_to_nv12_drm_format() {
+        use waylanddisplaycore::DrmModifier;
+        use waylanddisplaycore::Fourcc;
+        let r8 = |modifier| DrmFormat {
+            code: Fourcc::R8,
+            modifier,
+        };
+
+        // R8 LINEAR -> bare NV12 (no modifier suffix).
+        assert_eq!(
+            super::r8_to_nv12_drm_format(&r8(DrmModifier::Linear), false),
+            Some("NV12".to_string())
+        );
+
+        // An explicit (e.g. Nvidia block-linear) R8 modifier carries through.
+        let nv: u64 = DrmModifier::Nvidia_16bx2_block_eight_gob.into();
+        assert_eq!(
+            super::r8_to_nv12_drm_format(&r8(DrmModifier::Nvidia_16bx2_block_eight_gob), false),
+            Some(format!("NV12:0x{nv:016x}"))
+        );
+
+        // i915 4-tiled workaround: with the workaround ON the 4-tiled code is
+        // remapped to y-tiled; with it OFF (non-DG2 Intel) the raw code is kept.
+        // This is the path the DG2 refinement fix guards.
+        let four_tiled = DrmModifier::Unrecognized(0x0100000000000009);
+        let y_tiled: u64 = DrmModifier::I915_y_tiled.into();
+        assert_eq!(
+            super::r8_to_nv12_drm_format(&r8(four_tiled), false),
+            Some(format!("NV12:0x{y_tiled:016x}"))
+        );
+        assert_eq!(
+            super::r8_to_nv12_drm_format(&r8(four_tiled), true),
+            Some("NV12:0x0100000000000009".to_string())
+        );
+
+        // Non-R8 formats and Invalid modifiers are not advertised.
+        assert_eq!(
+            super::r8_to_nv12_drm_format(
+                &DrmFormat {
+                    code: Fourcc::Abgr8888,
+                    modifier: DrmModifier::Linear
+                },
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            super::r8_to_nv12_drm_format(&r8(DrmModifier::Invalid), false),
+            None
         );
     }
 }

@@ -1,0 +1,33 @@
+name: "Rust build & test"
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    name: cargo build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libinput-dev libudev-dev libseat-dev \
+            libgbm-dev libdrm-dev libegl-dev libgles-dev libgl1-mesa-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # Compile every crate and all targets (tests included) so a build break is
+      # caught anywhere in the workspace.
+      - name: Build (workspace, all targets)
+        run: cargo build --workspace --all-targets
+
+      # The wayland-display-core tests need a real DRM render node (setup_renderer /
+      # GBM) and can't run on a headless runner; the build step above still
+      # type-checks them. Here we run the hardware-free tests in the gst plugin
+      # crate (caps + drm-format mapping).
+      - name: Test (hardware-free)
+        run: cargo test -p gst-plugin-wayland-display
