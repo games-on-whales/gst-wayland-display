@@ -581,8 +581,9 @@ impl WaylandDisplaySrc {
     /// (Intel tiled, AMD LINEAR, Nvidia block-linear). We derive the advertised
     /// drm-formats from the GPU's R8 modifiers via the same `drm_to_gst_format`
     /// mapping the RGB path uses -- only the format token differs (R8 -> NV12) -- so
-    /// the negotiated caps match what the converter produces. Falls back to the
-    /// static Intel tiled + LINEAR pair when the compositor isn't up yet.
+    /// the negotiated caps match what the converter produces. Falls back to a
+    /// generic, modifier-agnostic DMABuf cap (no drm-format constraint) when the
+    /// compositor isn't up yet, so the initial pad link succeeds on any GPU.
     fn nv12_caps(&self, filter: Option<&gst::Caps>) -> gst::Caps {
         let build = |drm: &str| {
             gst_video::VideoCapsBuilder::new()
@@ -609,15 +610,36 @@ impl WaylandDisplaySrc {
                 }
             }
         }
-        if drm_formats.is_empty() {
-            drm_formats = vec!["NV12:0x0100000000000002".into(), "NV12".into()];
-        }
 
-        let mut iter = drm_formats.iter();
-        let mut caps = build(iter.next().unwrap());
-        for s in iter {
-            caps.merge(build(s));
-        }
+        // Until the compositor is up we don't know the GPU's real R8 modifiers.
+        // gst-launch links pads at parse time (before start()), so caps() is
+        // first queried with state == None. Pinning a specific modifier here is
+        // wrong on any GPU whose render modifier differs (e.g. the old Intel
+        // Y-tiled + LINEAR pair never intersects AMD's NV12:0x02..2305; note a
+        // bare "NV12" drm-format means LINEAR, not "any modifier", so it
+        // wouldn't help either). Advertise a DMABuf cap with no drm-format
+        // field at all, as the RGB path already does: an absent field is
+        // unconstrained and intersects with whatever modifier downstream
+        // offers. The actual format/modifier is fixed later in negotiate(),
+        // once state is up and the branch above yields the real per-GPU
+        // drm-formats.
+        let mut caps = if drm_formats.is_empty() {
+            gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build()
+        } else {
+            let mut iter = drm_formats.iter();
+            let mut caps = build(iter.next().unwrap());
+            for s in iter {
+                caps.merge(build(s));
+            }
+            caps
+        };
+
         if let Some(filter) = filter {
             caps = caps.intersect(filter);
         }
