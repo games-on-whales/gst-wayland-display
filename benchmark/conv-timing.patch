@@ -1,0 +1,66 @@
+diff --git a/wayland-display-core/src/utils/allocator/mod.rs b/wayland-display-core/src/utils/allocator/mod.rs
+index 03906f0..fe8336c 100644
+--- a/wayland-display-core/src/utils/allocator/mod.rs
++++ b/wayland-display-core/src/utils/allocator/mod.rs
+@@ -24,6 +24,35 @@ use std::fs::File;
+ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+ use std::sync::{Arc, Mutex};
+ 
++/// Benchmark-only: records per-frame source-thread conversion cost (the time
++/// VulkanNv12::convert spends, incl. any GPU wait) and logs running stats every 60
++/// frames. Enabled with CONV_TIMING=1. Identical across code versions so it can isolate
++/// the pipelining levers' effect on the producer's critical path.
++fn record_convert_time(d: std::time::Duration) {
++    use std::sync::OnceLock;
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    if !*ENABLED.get_or_init(|| std::env::var("CONV_TIMING").is_ok()) {
++        return;
++    }
++    static STATS: OnceLock<Mutex<(u128, u128, u128, u128)>> = OnceLock::new();
++    let us = d.as_micros();
++    let m = STATS.get_or_init(|| Mutex::new((0, 0, 0, u128::MAX)));
++    let mut g = m.lock().unwrap();
++    g.0 += 1; // count
++    g.1 += us; // sum
++    g.2 = g.2.max(us); // max
++    g.3 = g.3.min(us); // min
++    if g.0 % 60 == 0 {
++        tracing::info!(
++            "CONVTIMING n={} avg={}us min={}us max={}us",
++            g.0,
++            g.1 / g.0,
++            g.3,
++            g.2
++        );
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct GsGlesbuffer {
+     buffer: GlesRenderbuffer,
+@@ -396,8 +425,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
+             }
+             GsBufferType::NV12(buffer) => {
+                 let mut v = buffer.vulkan.lock().unwrap();
++                let _t = std::time::Instant::now();
+                 v.convert(&buffer.rgba)?;
+-                v.to_gst_buffer()
++                let out = v.to_gst_buffer();
++                record_convert_time(_t.elapsed());
++                out
+             }
+             #[cfg(feature = "cuda")]
+             GsBufferType::CUDA(buffer) => {
+@@ -520,8 +552,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
+             }
+             GsBufferType::NV12(buffer) => {
+                 let mut v = buffer.vulkan.lock().unwrap();
++                let _t = std::time::Instant::now();
+                 v.convert(&buffer.rgba)?;
+-                v.to_gst_buffer()
++                let out = v.to_gst_buffer();
++                record_convert_time(_t.elapsed());
++                out
+             }
+         }
+     }
