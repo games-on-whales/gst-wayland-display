@@ -101,6 +101,21 @@ In order to support this we leverage `gst-cuda-1.0` which adds a single build de
 At runtime, you'll need to have access to `libcuda.so` but only to access and use `CUDAMemory`; you can still use
 `DMABuf` when running this plugin on a platform that doesn't support it.
 
+### NV12 dmabuf → CUDA (`dmabuftocuda`)
+
+For the Vulkan NV12 path, the source emits an **NV12 DMABuf** (converted in-process by the Vulkan
+converter) and `dmabuftocuda` imports it into CUDA late, right before the encoder — also gated behind the
+`cuda` feature:
+
+```bash
+gst-launch-1.0 waylanddisplaysrc ! 'video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1920,height=1080,framerate=60/1' ! queue ! dmabuftocuda ! nvh265enc ! nvh265dec ! autovideosink
+```
+
+The `! queue !` before `dmabuftocuda` is recommended: it runs the source's render+convert and the
+DMABuf→CUDA import on separate threads. `dmabuftocuda` caches the EGLImage/CUDA registration per
+DMABuf (the converter cycles a small ring), so the per-frame cost is just the CUDA copy and the element
+is no longer a serial bottleneck — but the `queue` still lets the two stages overlap.
+
 ## Run without a GPU
 
 If you don't have a GPU, you can still run this plugin without it; just use the option `render_node=software` to enable it. Example pipeline:

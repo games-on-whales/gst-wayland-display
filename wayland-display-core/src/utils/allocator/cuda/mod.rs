@@ -4,7 +4,7 @@ use gst::glib::ffi as glib_ffi;
 use gst::glib::translate::ToGlibPtr;
 use gst::query::Allocation;
 use gst::{Buffer as GstBuffer, Context, Element, QueryRef};
-use gst_video::{VideoInfoDmaDrm, VideoMeta};
+use gst_video::{VideoFormat, VideoInfoDmaDrm, VideoMeta};
 use smithay::backend::allocator::Buffer;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::egl;
@@ -142,6 +142,158 @@ impl Drop for EGLImage {
     }
 }
 
+/// Convert an already-filled external dmabuf (e.g. the NV12 buffer the compositor
+/// produced) into a CUDAMemory gst buffer, importing it via EGLImage and copying
+/// each plane on-GPU. This is the "convert to CUDA late" step for the Nvidia encode
+/// branch: the dmabuf flows through the system unchanged across all vendors, and
+/// only the Nvidia consumer maps it into CUDA right before the encoder. Works for
+/// any plane layout EGLImage::from handles (NV12 today, P010 for 10-bit/HDR).
+pub fn external_dmabuf_to_cuda_buffer(
+    dmabuf: &Dmabuf,
+    video_info: VideoInfoDmaDrm,
+    egl_display: &EGLDisplay,
+    cuda_context: &CUDAContext,
+    buffer_pool: Option<&CUDABufferPool>,
+) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+    let egl_image = EGLImage::from(dmabuf, egl_display)?;
+    let cuda_image = CUDAImage::from(egl_image, cuda_context)?;
+    cuda_image.to_gst_buffer(video_info, cuda_context, buffer_pool)
+}
+
+/// Owns an EGLDisplay and turns incoming NV12 DMABuf gst buffers into CUDAMemory
+/// gst buffers - the "convert to CUDA late" step for the Nvidia encode branch. This
+/// keeps all smithay/EGL handling in the core so the gst plugin only deals with gst
+/// and CUDA types.
+pub struct CudaUploader {
+    egl: std::sync::Arc<smithay::backend::egl::EGLDisplay>,
+    /// EGLImage + CUDA registration cache keyed by the input dmabuf's primary fd. The
+    /// upstream converter cycles a small ring of dmabufs (one fd per ring slot), so an
+    /// incoming buffer's fd is one of a handful of stable values. Caching turns the
+    /// per-frame `eglCreateImageKHR` + `cuGraphicsEGLRegisterImage` (both expensive) into
+    /// a one-time cost per ring slot; per frame we only re-map and copy the
+    /// (updated-in-place) registered image. The registration stays valid because it maps
+    /// the dmabuf memory, which the converter overwrites in place each frame.
+    cache: std::sync::Mutex<std::collections::HashMap<i32, CUDAImage>>,
+}
+
+// The EGLDisplay is Send+Sync (it lives in the shared EGL_DISPLAYS cache); the cached
+// CUDAImages are only ever touched under the element's serialising lock.
+unsafe impl Send for CudaUploader {}
+
+impl CudaUploader {
+    /// Create an uploader bound to the given render node (or auto-selected when None).
+    pub fn new(render_node_path: Option<&str>) -> Self {
+        let node = render_node_path.and_then(|p| smithay::backend::drm::DrmNode::from_path(p).ok());
+        CudaUploader {
+            egl: crate::utils::renderer::setup_egl_display(node),
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Convert the incoming NV12 dmabuf gst buffer into a CUDAMemory gst buffer, reusing a
+    /// cached EGLImage/CUDA registration for the buffer's fd when possible.
+    pub fn upload(
+        &self,
+        inbuf: &gst::BufferRef,
+        in_info: &VideoInfoDmaDrm,
+        cuda_context: &CUDAContext,
+        buffer_pool: Option<&CUDABufferPool>,
+    ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        let key = dmabuf_primary_fd(inbuf).ok_or("no dmabuf fd on input buffer")?;
+        let mut cache = self.cache.lock().unwrap();
+        if !cache.contains_key(&key) {
+            let dmabuf = reconstruct_nv12_dmabuf(inbuf, in_info)
+                .ok_or("failed to reconstruct NV12 dmabuf")?;
+            let raw_display = self.egl.get_display_handle().handle;
+            let egl_image = EGLImage::from(&dmabuf, &raw_display)?;
+            let cuda_image = CUDAImage::from(egl_image, cuda_context)?;
+            cache.insert(key, cuda_image);
+        }
+        // Per frame: re-map the cached registration (reflects the converter's in-place
+        // write) and copy into a fresh pooled CUDA buffer.
+        cache
+            .get(&key)
+            .unwrap()
+            .to_gst_buffer(in_info.clone(), cuda_context, buffer_pool)
+    }
+}
+
+/// The fd backing a gst buffer's first dmabuf memory -- the cache key (stable per
+/// converter ring slot).
+fn dmabuf_primary_fd(inbuf: &gst::BufferRef) -> Option<i32> {
+    let mem = inbuf.peek_memory(0);
+    let fd = unsafe { gstreamer_allocators::ffi::gst_dmabuf_memory_get_fd(mem.as_ptr() as *mut _) };
+    if fd < 0 { None } else { Some(fd) }
+}
+
+/// Rebuild a single 2-plane NV12 Dmabuf from a gst buffer's dmabuf memories (the
+/// inverse of Nv12Target::to_gst_buffer). Handles both the 2-memory layout the
+/// compositor produces (one plane per fd) and a single contiguous memory.
+pub(crate) fn reconstruct_nv12_dmabuf(
+    inbuf: &gst::BufferRef,
+    in_info: &VideoInfoDmaDrm,
+) -> Option<Dmabuf> {
+    use smithay::backend::allocator::dmabuf::DmabufFlags;
+    use smithay::reexports::drm::buffer::DrmFourcc;
+    use smithay::reexports::gbm::Modifier;
+    use std::os::fd::BorrowedFd;
+
+    let width = in_info.width();
+    let height = in_info.height();
+    let modifier = Modifier::from(in_info.modifier());
+    let vmeta = inbuf.meta::<VideoMeta>();
+    // Only 2-plane NV12 is supported. Bail cleanly (caller turns this into a
+    // FlowError) rather than indexing past the plane arrays below if a non-NV12
+    // buffer ever reaches here -- e.g. a single-plane RGBA buffer.
+    if let Some(m) = vmeta.as_ref() {
+        if m.format() != VideoFormat::Nv12 || m.n_planes() < 2 {
+            tracing::warn!(
+                "reconstruct_nv12_dmabuf: expected 2-plane NV12, got {:?} with {} plane(s)",
+                m.format(),
+                m.n_planes()
+            );
+            return None;
+        }
+    }
+    let stride = |plane: usize| -> u32 {
+        vmeta
+            .as_ref()
+            .map(|m| m.stride()[plane] as u32)
+            .unwrap_or(width)
+    };
+    let offset = |plane: usize| -> u32 {
+        vmeta
+            .as_ref()
+            .map(|m| m.offset()[plane] as u32)
+            .unwrap_or(0)
+    };
+
+    let n_mem = inbuf.n_memory();
+    let mut builder = Dmabuf::builder(
+        (width as i32, height as i32),
+        DrmFourcc::Nv12,
+        modifier,
+        DmabufFlags::empty(),
+    );
+    for plane in 0..2usize {
+        let (mem, off) = if n_mem >= 2 {
+            (inbuf.peek_memory(plane), 0u32)
+        } else {
+            (inbuf.peek_memory(0), offset(plane))
+        };
+        let raw_fd =
+            unsafe { gstreamer_allocators::ffi::gst_dmabuf_memory_get_fd(mem.as_ptr() as *mut _) };
+        if raw_fd < 0 {
+            return None;
+        }
+        let owned = unsafe { BorrowedFd::borrow_raw(raw_fd) }
+            .try_clone_to_owned()
+            .ok()?;
+        builder.add_plane(owned, plane as u32, off, stride(plane));
+    }
+    builder.build()
+}
+
 pub const CAPS_FEATURE_MEMORY_CUDA_MEMORY: &str = "memory:CUDAMemory"; // TODO: get it from FFI from gstcudamemory.h (https://github.com/GStreamer/gstreamer/blob/9d6abcc18cc9a60a212966a2daaf4a1af243f5da/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h#L113-L121)
 
 pub fn init_cuda() -> Result<(), String> {
@@ -170,6 +322,11 @@ pub struct CUDAContext {
 
 impl Drop for CUDAContext {
     fn drop(&mut self) {
+        // Release the CUDA stream first: destroying a stream pushes its parent
+        // context, which must still be a valid GstCudaContext at that point.
+        // Dropping the context before the stream triggers GST_IS_CUDA_CONTEXT
+        // failures (and a use-after-free) during teardown.
+        self.stream = None;
         unsafe {
             gst::ffi::gst_object_unref(self.ptr as *mut gst::ffi::GstObject);
         }

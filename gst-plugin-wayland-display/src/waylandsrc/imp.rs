@@ -909,22 +909,37 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     tracing::info!(
                         "Acquiring a CudaContext from the pipeline, you can manually set the `cuda-device-id` property to override this behavior"
                     );
-                    let cuda_raw_ptr = {
+                    let (cuda_raw_ptr, already_have) = {
                         let settings = self.settings.lock().unwrap();
-                        settings.cuda_raw_ptr.as_ptr()
+                        (
+                            settings.cuda_raw_ptr.as_ptr(),
+                            settings.cuda_context.is_some(),
+                        )
                     };
-                    match CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) {
-                        Ok(cuda_context) => {
-                            let mut settings = self.settings.lock().unwrap();
-                            if settings.cuda_context.is_none() {
-                                tracing::info!("Acquired a CudaContext via new_from_gstreamer");
-                                settings.cuda_context = Some(Arc::new(Mutex::new(cuda_context)));
-                            } else {
-                                tracing::info!("Acquired a CudaContext via set_context");
+                    // Only actively acquire when set_context hasn't already provided one.
+                    // Calling new_from_gstreamer when the element already has a context is a
+                    // ref-neutral no-op that hands back a *second* CUDAContext aliasing the
+                    // kept one (it owns no ref); dropping that alias would gst_object_unref a
+                    // ref we don't own, free the context early, and crash teardown when the
+                    // GstContext structure later unrefs the now-dead object.
+                    if already_have {
+                        tracing::info!("Acquired a CudaContext via set_context");
+                    } else {
+                        match CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) {
+                            Ok(cuda_context) => {
+                                let mut settings = self.settings.lock().unwrap();
+                                if settings.cuda_context.is_none() {
+                                    tracing::info!("Acquired a CudaContext via new_from_gstreamer");
+                                    settings.cuda_context =
+                                        Some(Arc::new(Mutex::new(cuda_context)));
+                                } else {
+                                    // set_context won a race; this is an unowned alias.
+                                    std::mem::forget(cuda_context);
+                                }
                             }
-                        }
-                        Err(err) => {
-                            gst::warning!(CAT, "Failed to acquire a CudaContext: {}", err);
+                            Err(err) => {
+                                gst::warning!(CAT, "Failed to acquire a CudaContext: {}", err);
+                            }
                         }
                     }
                 }

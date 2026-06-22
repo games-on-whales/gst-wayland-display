@@ -19,13 +19,16 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
         .expect("Unable to find EGLDevice for drm-node")
 }
 
-pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
+/// Create (or reuse) the EGLDisplay for a render node, shared with `setup_renderer`
+/// via the EGL_DISPLAYS cache. Used by the late dmabuf->CUDA element, which needs an
+/// EGLDisplay to import dmabufs but no GlesRenderer.
+pub fn setup_egl_display(render_node: Option<DrmNode>) -> Arc<EGLDisplay> {
     let mut displays = EGL_DISPLAYS.lock().unwrap();
     let maybe_display = displays
         .get(&render_node)
         .and_then(|weak_display| weak_display.upgrade());
 
-    let egl = match maybe_display {
+    match maybe_display {
         Some(display) => display,
         None => {
             let device = match render_node.as_ref() {
@@ -45,7 +48,11 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             displays.insert(render_node, Arc::downgrade(&display));
             display
         }
-    };
+    }
+}
+
+pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
+    let egl = setup_egl_display(render_node);
     let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
     let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
     renderer

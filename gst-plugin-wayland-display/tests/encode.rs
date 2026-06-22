@@ -152,6 +152,27 @@ fn intel_va_encode_to_eos() {
     .expect("Intel VA encode");
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an Nvidia GPU + cuda feature + nvcodec; run via ci/harness.sh gpu"]
+fn nvidia_cuda_encode_to_eos() {
+    init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no Nvidia render node")
+    };
+    if !have("nvh265enc") || !have("dmabuftocuda") {
+        skip!("no nvh265enc/dmabuftocuda");
+    }
+    // Explicit resolution: nvh265enc has no width floor, so an unconstrained
+    // pipeline fixates to 1x1 and the converter builds 1x1 images.
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} num-buffers=20 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1280,height=720,framerate=60/1 ! \
+         dmabuftocuda render-node={node} ! nvh265enc ! fakesink"
+    ))
+    .expect("Nvidia CUDA encode");
+}
+
 /// The converter advertises a usable NV12 modifier set for a present GPU --
 /// the precondition for any encoder negotiating with the source.
 #[test]
