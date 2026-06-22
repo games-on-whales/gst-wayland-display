@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-cuda = ["dep:libloading"]
+cuda = []
 
 [dependencies]
 gst.workspace = true
@@ -25,7 +25,14 @@ wayland-backend = "0.3.15"
 wayland-server = { version = "0.31.13", features = ["libwayland_1_23"] }
 wayland-scanner = "0.31.10"
 gstreamer-allocators = { version = "0.23.2", package = "gstreamer-allocators", features = ["v1_24", "v1_16"] }
-libloading = { version = "0.8.9", optional = true }
+libloading = "0.8.9"
+# Vulkan, for the cross-vendor RGBA->NV12 converter (imports the compositor's RGBA
+# dmabuf, runs a compute shader, exports a LINEAR NV12 dmabuf the encoders import
+# zero-copy). Loaded dynamically so a missing loader is a runtime, not link, error.
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+# For attaching a sync_file to the exported dmabuf (DMA_BUF_IOCTL_IMPORT_SYNC_FILE),
+# so implicit-sync consumers (VA encoders) track our Vulkan write.
+libc = "0.2"
 
 [build-dependencies]
 pkg-config = "0.3"

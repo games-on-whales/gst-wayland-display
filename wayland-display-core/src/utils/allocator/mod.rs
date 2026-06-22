@@ -4,6 +4,9 @@ pub mod cuda;
 use crate::DrmModifier;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
+use crate::utils::device::PCIVendor;
+use crate::utils::device::gpu::GPUDevice;
+use crate::utils::vulkan_nv12::VulkanNv12;
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
@@ -11,6 +14,7 @@ use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
 use smithay::backend::drm::DrmNode;
+#[cfg(feature = "cuda")]
 use smithay::backend::egl::ffi::egl::types::EGLDisplay;
 use smithay::backend::renderer::gles::{GlesError, GlesRenderbuffer, GlesRenderer, GlesTarget};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
@@ -127,6 +131,77 @@ impl GsDmaBuf {
     }
 }
 
+/// NV12 output via the Vulkan converter: the compositor renders the scene into
+/// `rgba` (a GLES-renderable RGBA dmabuf), then [`VulkanNv12`] imports it, runs the
+/// RGBA->NV12 compute shader, and exports an NV12 dmabuf (the negotiated modifier --
+/// DCC on AMD, LINEAR elsewhere) for the encoders.
+#[derive(Debug, Clone)]
+pub struct GsNv12Buf {
+    /// GLES render target (RGBA); also the Vulkan converter's input dmabuf.
+    pub rgba: Dmabuf,
+    vulkan: Arc<Mutex<VulkanNv12>>,
+    /// The negotiated NV12 video info.
+    video_info: VideoInfoDmaDrm,
+}
+
+impl GsNv12Buf {
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        render_node: DrmNode,
+        video_info: VideoInfoDmaDrm,
+    ) -> Option<Self> {
+        let (w, h) = (video_info.width(), video_info.height());
+        // RGBA render-target modifier candidates the GLES renderer supports (INVALID last).
+        let formats =
+            <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
+        let mut mods: Vec<Modifier> = formats
+            .iter()
+            .filter(|f| f.code == DrmFourcc::Abgr8888)
+            .map(|f| f.modifier)
+            .collect();
+        mods.sort_by_key(|m| *m == Modifier::Invalid);
+        let gbm = new_gbm_device(render_node)?;
+        let mut dma = DmabufAllocator(GbmAllocator::new(gbm, GbmBufferFlags::RENDERING));
+
+        // Pick the RGBA modifier. VulkanNv12 imports this buffer on the GPU that produced it.
+        //  - Nvidia: keep the GPU's preferred modifier -- its Vulkan imports its own
+        //    block-linear RGBA, and forcing LINEAR makes the import fail (no frames).
+        //  - Everyone else: prefer LINEAR. On AMD the preferred Abgr8888 modifier is
+        //    DCC-compressed, and a DCC render target is mis-sampled when VulkanNv12 imports
+        //    it cross-API on radv -- the cursor overlay (drawn last) is silently dropped from
+        //    the converted NV12. This buffer is a transient render-once/import-once
+        //    intermediate, so DCC buys nothing; LINEAR avoids it and imports cleanly (and is
+        //    no slower in practice). Fall back to the other modifiers if LINEAR won't allocate.
+        let is_nvidia = matches!(
+            GPUDevice::try_from(render_node).map(|d| *d.pci_vendor() == PCIVendor::NVIDIA),
+            Ok(true)
+        );
+        let order: Vec<Modifier> = if is_nvidia {
+            mods.iter()
+                .copied()
+                .chain(std::iter::once(Modifier::Linear))
+                .collect()
+        } else {
+            std::iter::once(Modifier::Linear)
+                .chain(mods.iter().copied())
+                .collect()
+        };
+        let rgba = order
+            .iter()
+            .find_map(|m| dma.create_buffer(w, h, DrmFourcc::Abgr8888, &[*m]).ok())?;
+        tracing::debug!(
+            "GsNv12Buf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
+            rgba.format().modifier
+        );
+        let vulkan = VulkanNv12::new(render_node, video_info.clone())?;
+        Some(GsNv12Buf {
+            rgba,
+            vulkan: Arc::new(Mutex::new(vulkan)),
+            video_info,
+        })
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct GsCUDABuf {
@@ -202,6 +277,7 @@ impl GsCUDABuf {
 pub enum GsBufferType {
     RAW(GsGlesbuffer),
     DMA(GsDmaBuf),
+    NV12(GsNv12Buf),
     #[cfg(feature = "cuda")]
     CUDA(GsCUDABuf),
 }
@@ -229,6 +305,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         match self {
             GsBufferType::RAW(buffer) => renderer.bind(&mut buffer.buffer),
             GsBufferType::DMA(buffer) => renderer.bind(&mut buffer.buffer),
+            // NV12 mode renders the scene into the RGBA dmabuf; Vulkan converts it
+            // to NV12 in to_gs_buffer().
+            GsBufferType::NV12(buffer) => renderer.bind(&mut buffer.rgba),
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => renderer.bind(&mut buffer.buffer),
         }
@@ -340,6 +419,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     }
                 }
                 Ok(gst_buffer)
+            }
+            GsBufferType::NV12(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba)?;
+                v.to_gst_buffer()
             }
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
@@ -460,6 +544,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 }
                 Ok(gst_buffer)
             }
+            GsBufferType::NV12(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba)?;
+                v.to_gst_buffer()
+            }
         }
     }
 
@@ -467,6 +556,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         match self {
             GsBufferType::RAW(buffer) => VideoInfoTypes::VideoInfo(buffer.video_info.clone()),
             GsBufferType::DMA(buffer) => VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone()),
+            GsBufferType::NV12(buffer) => {
+                VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())
+            }
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
                 VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())
@@ -537,6 +629,36 @@ mod tests {
     use crate::utils::tests::test_init;
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
+
+    /// Skip the current hardware-gated test (print why, return).
+    macro_rules! skip {
+        ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
+    }
+
+    /// A render node whose kernel driver is one of `drivers`, for hardware-gated
+    /// tests -- so they target the right GPU on a multi-GPU host instead of a
+    /// hardcoded `renderD12x` that may be a different vendor.
+    fn pick_render_node(drivers: &[&str]) -> Option<DrmNode> {
+        for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("renderD") {
+                continue;
+            }
+            let drv = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/uevent"))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("DRIVER=").map(str::to_owned))
+                })
+                .unwrap_or_default();
+            if drivers.iter().any(|d| *d == drv) {
+                if let Ok(node) = DrmNode::from_path(format!("/dev/dri/{name}")) {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    }
 
     /// Adapted from: https://github.com/games-on-whales/smithay/blob/master/examples/buffer_test.rs#L277
     /// Produces a 2x2 grid of colored rectangles:
@@ -642,11 +764,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a gbm-capable AMD/Intel GPU; run via ci/harness.sh gpu"]
     fn test_dmabuf() {
         test_init();
 
-        let render_node =
-            DrmNode::from_path("/dev/dri/renderD128").expect("Failed to create render node");
+        let Some(render_node) = pick_render_node(&["amdgpu", "radeon", "i915", "xe"]) else {
+            skip!("no gbm-capable (AMD/Intel) render node");
+        };
         let mut renderer = setup_renderer(Some(render_node));
         let w = 10;
         let h = 10;
@@ -673,7 +797,9 @@ mod tests {
         );
 
         let raw_buffer = GsDmaBuf::new(render_node, drm_video_info);
-        assert!(raw_buffer.is_some());
+        if raw_buffer.is_none() {
+            skip!("GsDmaBuf RGBA/LINEAR allocation unsupported on this GPU");
+        }
 
         let mut buffer = GsBufferType::DMA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
@@ -734,14 +860,18 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "needs an Nvidia GPU + CUDA; run via ci/harness.sh gpu"]
     fn test_cuda_buffer() {
         test_init();
-        cuda::init_cuda().expect("Failed to initialize CUDA");
+        if cuda::init_cuda().is_err() {
+            skip!("CUDA not available");
+        }
         let w = 100;
         let h = 100;
 
-        let render_node =
-            DrmNode::from_path("/dev/dri/renderD129").expect("Failed to create render node");
+        let Some(render_node) = pick_render_node(&["nvidia"]) else {
+            skip!("no Nvidia render node");
+        };
         let mut renderer = setup_renderer(Some(render_node));
         let caps = gst_video::VideoCapsBuilder::new()
             .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
@@ -799,7 +929,9 @@ mod tests {
             Arc::new(Mutex::new(Some(buffer_pool))),
             &egl_display,
         );
-        assert!(raw_buffer.is_some());
+        if raw_buffer.is_none() {
+            skip!("GsCUDABuf allocation unsupported on this GPU");
+        }
 
         let mut buffer = GsBufferType::CUDA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();

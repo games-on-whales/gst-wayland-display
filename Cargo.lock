@@ -98,6 +98,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1813,10 +1822,12 @@ dependencies = [
 name = "wayland-display-core"
 version = "0.2.0"
 dependencies = [
+ "ash",
  "calloop",
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-video",
+ "libc",
  "libloading",
  "once_cell",
  "pkg-config",

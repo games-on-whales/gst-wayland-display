@@ -475,22 +475,46 @@ impl ElementImpl for WaylandDisplaySrc {
         }
     }
 
-    #[cfg(feature = "cuda")]
     fn set_context(&self, context: &Context) {
-        let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-        let cuda_raw_ptr = {
+        // Absorb a downstream VA encoder's GstVaDisplay context so our NV12 buffers can
+        // attach VA surfaces on the same display (best-effort).
+        let render_path = {
             let settings = self.settings.lock().unwrap();
-            settings.cuda_raw_ptr.as_ptr()
+            settings
+                .render_node
+                .clone()
+                .unwrap_or_else(|| "/dev/dri/renderD128".into())
         };
-        match CUDAContext::new_from_set_context(&elem, &context, -1, cuda_raw_ptr) {
-            Ok(ctx) => {
-                let mut settings = self.settings.lock().unwrap();
-                if settings.cuda_context.is_none() {
-                    settings.cuda_context = Some(Arc::new(Mutex::new(ctx)));
+        // Only a real DRM node backs a GstVaDisplay; skip the "software" (llvmpipe) target
+        // and any other non-`/dev/dri/` render-node value.
+        if render_path.starts_with("/dev/dri/") {
+            let elem_ptr =
+                self.obj().upcast_ref::<gst::Element>().as_ptr() as *mut std::ffi::c_void;
+            let ctx_ptr = context.as_ptr() as *mut std::ffi::c_void;
+            waylanddisplaycore::utils::va_share::handle_set_context(
+                elem_ptr,
+                ctx_ptr,
+                &render_path,
+            );
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+            let cuda_raw_ptr = {
+                let settings = self.settings.lock().unwrap();
+                settings.cuda_raw_ptr.as_ptr()
+            };
+            match CUDAContext::new_from_set_context(&elem, &context, -1, cuda_raw_ptr) {
+                Ok(ctx) => {
+                    let mut settings = self.settings.lock().unwrap();
+                    if settings.cuda_context.is_none() {
+                        settings.cuda_context = Some(Arc::new(Mutex::new(ctx)));
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create CUDA context: {}", e);
+                Err(e) => {
+                    tracing::warn!("Failed to create CUDA context: {}", e);
+                }
             }
         }
         self.parent_set_context(context)
@@ -598,6 +622,45 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     .build();
                 caps.merge(dmabuf_caps);
             }
+        }
+
+        // NV12 via the in-process Vulkan converter: the compositor renders RGBA and
+        // Vulkan converts to an NV12 dmabuf. Advertise every NV12 modifier this GPU's
+        // Vulkan can export, so negotiation intersects with the encoder's accepted
+        // modifiers (e.g. the AMD VA tiled modifier) and the converter then exports
+        // that exact modifier -- no LINEAR-vs-tiled mismatch, no guessing. (modifier 0
+        // == LINEAR, advertised as bare "NV12"; INVALID is skipped.)
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+        // Query the same GPU the converter will run on (the compositor's render node), so
+        // the advertised modifiers match what we can actually export in a multi-GPU host.
+        let nv12_minor = {
+            let path = self
+                .settings
+                .lock()
+                .unwrap()
+                .render_node
+                .clone()
+                .unwrap_or_else(|| "/dev/dri/renderD128".into());
+            waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&path)
+        };
+        for &m in waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(nv12_minor) {
+            if m == DRM_FORMAT_MOD_INVALID {
+                continue;
+            }
+            let drm = if m == 0 {
+                "NV12".to_string()
+            } else {
+                format!("NV12:0x{m:016x}")
+            };
+            let nv12_caps = gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .field("drm-format", drm)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            caps.merge(nv12_caps);
         }
 
         if let Some(filter) = filter {
@@ -792,6 +855,17 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 )
             ));
         };
+
+        // For a downstream VA encoder, adopt its GstVaDisplay so our NV12 buffers can
+        // carry a VA surface on the *same* display -- the encoder then reuses one surface
+        // instead of importing (and leaking) a new one every frame. Best-effort.
+        if let Some(path) = render_node
+            .as_deref()
+            .filter(|p| p.starts_with("/dev/dri/"))
+        {
+            let elem_ptr = elem.as_ptr() as *mut std::ffi::c_void;
+            waylanddisplaycore::utils::va_share::ensure_shared_display(elem_ptr, path);
+        }
 
         #[cfg(feature = "cuda")]
         match display.get_render_device() {
@@ -1221,5 +1295,83 @@ mod tests {
             ),
             Some("RA24:0x0300000000000013".to_string())
         );
+    }
+
+    /// Run a gst-launch description to EOS, failing on any bus ERROR. Reusable
+    /// integration harness: a negotiation, import, or encode failure surfaces as a
+    /// bus ERROR, so treating ERROR as fatal makes any pipeline a real regression
+    /// guard. Reaching EOS means every `num-buffers` frame negotiated and encoded.
+    fn run_pipeline_to_eos(desc: &str) {
+        use gst::prelude::*;
+        // Make `waylanddisplaysrc` resolvable by parse::launch in the test process.
+        crate::plugin_register_static().ok();
+        let pipeline = gst::parse::launch_full(desc, None, gst::ParseFlags::empty())
+            .expect("parse pipeline")
+            .downcast::<gst::Pipeline>()
+            .expect("not a pipeline");
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("set state Playing");
+        let bus = pipeline.bus().expect("pipeline bus");
+        let mut saw_eos = false;
+        for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
+            match msg.view() {
+                gst::MessageView::Eos(..) => {
+                    saw_eos = true;
+                    break;
+                }
+                gst::MessageView::Error(err) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    panic!(
+                        "pipeline error from {:?}: {} ({:?})",
+                        err.src().map(|s| s.path_string()),
+                        err.error(),
+                        err.debug()
+                    );
+                }
+                _ => {}
+            }
+        }
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("set state Null");
+        assert!(saw_eos, "pipeline timed out before EOS (no frames encoded)");
+    }
+
+    /// Tier-1 Vulkan encode path: the compositor's RGBA dmabuf is imported into
+    /// Vulkan, color-converted to NV12, and encoded by the Vulkan video encoder.
+    /// The NV12 surface stays inside Vulkan -- no cross-API dmabuf round-trip and no
+    /// modifier negotiation, since the Vulkan driver owns the encode-source layout.
+    /// `#[ignore]` + env-gated; run locally once a gst build provides `vulkanh265enc`
+    /// (Debian's gst-plugins-bad does not yet build the Vulkan video encoders):
+    ///   VULKAN_ENC_NODE=/dev/dri/renderDNNN \
+    ///     cargo test -p gst-plugin-wayland-display -- --ignored test_vulkan_encode_pipeline
+    #[test]
+    #[ignore = "needs a GPU + Vulkan video encoder (vulkanh265enc); set VULKAN_ENC_NODE and run with --ignored"]
+    fn test_vulkan_encode_pipeline() {
+        test_init();
+        let Ok(node) = std::env::var("VULKAN_ENC_NODE") else {
+            eprintln!("skip: set VULKAN_ENC_NODE=/dev/dri/renderDNNN to run this");
+            return;
+        };
+        // gst's Vulkan video encoders aren't built in many distros yet; skip cleanly.
+        let Some(enc) = ["vulkanh265enc", "vulkanh264enc"]
+            .into_iter()
+            .find(|e| gst::ElementFactory::find(e).is_some())
+        else {
+            eprintln!(
+                "skip: no Vulkan video encoder (vulkanh265enc/vulkanh264enc) in this gst build"
+            );
+            return;
+        };
+        let parse = if enc.contains("265") {
+            "h265parse"
+        } else {
+            "h264parse"
+        };
+        run_pipeline_to_eos(&format!(
+            "waylanddisplaysrc render-node={node} num-buffers=30 \
+             ! vulkanupload ! vulkancolorconvert ! {enc} ! {parse} ! fakesink sync=false"
+        ));
     }
 }
