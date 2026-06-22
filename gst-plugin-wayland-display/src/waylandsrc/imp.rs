@@ -485,9 +485,7 @@ impl ElementImpl for WaylandDisplaySrc {
                 .clone()
                 .unwrap_or_else(|| "/dev/dri/renderD128".into())
         };
-        // Only a real DRM node backs a GstVaDisplay; skip the "software" (llvmpipe) target
-        // and any other non-`/dev/dri/` render-node value.
-        if render_path.starts_with("/dev/dri/") {
+        if render_node_backs_va_display(&render_path) {
             let elem_ptr =
                 self.obj().upcast_ref::<gst::Element>().as_ptr() as *mut std::ffi::c_void;
             let ctx_ptr = context.as_ptr() as *mut std::ffi::c_void;
@@ -859,12 +857,17 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // For a downstream VA encoder, adopt its GstVaDisplay so our NV12 buffers can
         // carry a VA surface on the *same* display -- the encoder then reuses one surface
         // instead of importing (and leaking) a new one every frame. Best-effort.
-        if let Some(path) = render_node
-            .as_deref()
-            .filter(|p| p.starts_with("/dev/dri/"))
-        {
+        //
+        // Resolve the same node the compositor falls back to when `render-node` is unset
+        // (see WaylandDisplay::new_with_channel), so VA sharing engages on the default
+        // path too -- otherwise the encoder imports (and leaks) a surface per frame and
+        // starves its reconstruct pool after a few frames.
+        let va_node = render_node
+            .clone()
+            .unwrap_or_else(|| "/dev/dri/renderD128".into());
+        if render_node_backs_va_display(&va_node) {
             let elem_ptr = elem.as_ptr() as *mut std::ffi::c_void;
-            waylanddisplaycore::utils::va_share::ensure_shared_display(elem_ptr, path);
+            waylanddisplaycore::utils::va_share::ensure_shared_display(elem_ptr, &va_node);
         }
 
         #[cfg(feature = "cuda")]
@@ -944,6 +947,12 @@ impl PushSrcImpl for WaylandDisplaySrc {
             state.display.frame().map(CreateSuccess::NewBuffer)
         })
     }
+}
+
+/// A `/dev/dri/*` render node backs a real `GstVaDisplay`; the `software` (llvmpipe)
+/// target and any other value do not, so VA-display sharing is skipped for them.
+fn render_node_backs_va_display(path: &str) -> bool {
+    path.starts_with("/dev/dri/")
 }
 
 fn drm_to_gst_format(format: &DrmFormat, disable_workaround: bool) -> Option<String> {
