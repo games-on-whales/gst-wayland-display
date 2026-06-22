@@ -53,6 +53,7 @@ pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
+    nv12: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -274,6 +275,15 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("nv12")
+                    .nick("Prefer NV12 output")
+                    .blurb(
+                        "Advertise the Vulkan-converted NV12 dmabuf formats first, so a \
+                         format-agnostic downstream (e.g. an interpipesink) negotiates NV12 \
+                         instead of RGBA. RGBA stays offered as a fallback.",
+                    )
+                    .default_value(false)
+                    .build(),
             ]
         });
 
@@ -337,6 +347,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 settings.disable_intel_workaround =
                     value.get::<bool>().expect("Type checked upstream");
             }
+            "nv12" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.nv12 = value.get::<bool>().expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -370,6 +384,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "disable-intel-workaround" => {
                 let settings = self.settings.lock().unwrap();
                 settings.disable_intel_workaround.to_value()
+            }
+            "nv12" => {
+                let settings = self.settings.lock().unwrap();
+                settings.nv12.to_value()
             }
             _ => unreachable!(),
         }
@@ -641,6 +659,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .unwrap_or_else(|| "/dev/dri/renderD128".into());
             waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&path)
         };
+        let mut nv12_caps = gst::Caps::new_empty();
         for &m in waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(nv12_minor) {
             if m == DRM_FORMAT_MOD_INVALID {
                 continue;
@@ -650,7 +669,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             } else {
                 format!("NV12:0x{m:016x}")
             };
-            let nv12_caps = gst_video::VideoCapsBuilder::new()
+            let one = gst_video::VideoCapsBuilder::new()
                 .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
                 .format(VideoFormat::DmaDrm)
                 .field("drm-format", drm)
@@ -658,8 +677,21 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
                 .build();
-            caps.merge(nv12_caps);
+            nv12_caps.merge(one);
         }
+
+        // With `nv12` set, offer the NV12 formats first so a format-agnostic downstream
+        // (e.g. an unconstrained interpipesink, as in Wolf) fixates on NV12 instead of
+        // RGBA; RGBA stays appended as a fallback. Default: RGBA first (current behaviour),
+        // with NV12 still offered for encoders that request it directly.
+        let prefer_nv12 = self.settings.lock().unwrap().nv12;
+        let mut caps = if prefer_nv12 {
+            nv12_caps.merge(caps);
+            nv12_caps
+        } else {
+            caps.merge(nv12_caps);
+            caps
+        };
 
         if let Some(filter) = filter {
             caps = caps.intersect(filter);
