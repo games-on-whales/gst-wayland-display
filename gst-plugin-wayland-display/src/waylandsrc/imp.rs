@@ -537,6 +537,65 @@ impl ElementImpl for WaylandDisplaySrc {
     }
 }
 
+impl WaylandDisplaySrc {
+    /// Guard the NV12 export path: refuse a negotiated modifier the Vulkan converter can't
+    /// export, so a bad negotiation fails here with a clear error instead of green/garbled
+    /// frames downstream. Non-NV12 DMA caps (the compositor's RGBA dmabuf) pass untouched.
+    fn check_nv12_export(
+        &self,
+        caps: &gst::Caps,
+        info: &VideoInfoDmaDrm,
+    ) -> Result<(), gst::LoggableError> {
+        let is_nv12 = caps
+            .structure(0)
+            .and_then(|s| s.get::<String>("drm-format").ok())
+            .is_some_and(|f| f.starts_with("NV12"));
+        if !is_nv12 {
+            return Ok(());
+        }
+        let (render_path, prefer_nv12) = {
+            let s = self.settings.lock().unwrap();
+            (
+                s.render_node
+                    .clone()
+                    .unwrap_or_else(|| "/dev/dri/renderD128".into()),
+                s.nv12,
+            )
+        };
+        let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&render_path);
+        let modifier = info.modifier();
+        let exportable = waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(minor);
+        let encoder_pref = waylanddisplaycore::utils::va_query::import_nv12_modifier(&render_path);
+        tracing::info!(
+            "waylandsrc: NV12 export modifier {modifier:#x} on {render_path} \
+             (encoder imports {encoder_pref:#x?}, exportable {exportable:#x?})"
+        );
+        if !exportable.contains(&modifier) {
+            return Err(gst::loggable_error!(
+                CAT,
+                "negotiated NV12 modifier {modifier:#x} is not Vulkan-exportable on \
+                 {render_path} (exportable: {exportable:#x?})"
+            ));
+        }
+        // Direct `! vah265enc`: exporting anything but the encoder's own modifier makes it
+        // re-import (and radeonsi-VA then fails). Behind interpipe (`nv12=true`) a
+        // LINEAR/encoder mismatch is expected -- the consumer's vapostproc imports it -- so
+        // only flag it on the direct path.
+        if !prefer_nv12 {
+            if let Some(pref) = encoder_pref {
+                if pref != modifier {
+                    tracing::warn!(
+                        "waylandsrc: exporting NV12 modifier {modifier:#x} but the VA encoder \
+                         on {render_path} imports {pref:#x}; a direct encode needs a vapostproc \
+                         bridge"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl BaseSrcImpl for WaylandDisplaySrc {
     #[cfg(feature = "cuda")]
     fn query(&self, query: &mut gst::QueryRef) -> bool {
@@ -640,31 +699,60 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             }
         }
 
-        // NV12 via the in-process Vulkan converter: the compositor renders RGBA and
-        // Vulkan converts to an NV12 dmabuf. Advertise every NV12 modifier this GPU's
-        // Vulkan can export, so negotiation intersects with the encoder's accepted
-        // modifiers (e.g. the AMD VA tiled modifier) and the converter then exports
-        // that exact modifier -- no LINEAR-vs-tiled mismatch, no guessing. (modifier 0
-        // == LINEAR, advertised as bare "NV12"; INVALID is skipped.)
+        // NV12 via the in-process Vulkan converter: the compositor renders RGBA and Vulkan
+        // converts to an NV12 dmabuf. The modifier we advertise is the one downstream can
+        // import without a re-import, and we pick it deterministically rather than offering
+        // a list and hoping negotiation lands right (it can't behind interpipe -- there's no
+        // encoder in the pipeline to intersect with).
         const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-        // Query the same GPU the converter will run on (the compositor's render node), so
-        // the advertised modifiers match what we can actually export in a multi-GPU host.
-        let nv12_minor = {
-            let path = self
-                .settings
-                .lock()
-                .unwrap()
-                .render_node
-                .clone()
-                .unwrap_or_else(|| "/dev/dri/renderD128".into());
-            waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&path)
+        const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+        let (render_path, prefer_nv12) = {
+            let s = self.settings.lock().unwrap();
+            (
+                s.render_node
+                    .clone()
+                    .unwrap_or_else(|| "/dev/dri/renderD128".into()),
+                s.nv12,
+            )
         };
-        let mut nv12_caps = gst::Caps::new_empty();
-        for &m in waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(nv12_minor) {
-            if m == DRM_FORMAT_MOD_INVALID {
-                continue;
+        // Match the GPU the converter runs on (the compositor's render node), so advertised
+        // modifiers are ones we can actually export on a multi-GPU host.
+        let nv12_minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&render_path);
+
+        // `nv12=true` is Wolf: `waylanddisplaysrc ! interpipesink`, the encoder sits behind
+        // interpipe so no caps negotiation reaches us. Pin LINEAR -- the one NV12 modifier
+        // every VA importer (the consumer's vapostproc) takes -- instead of a tiled/DCC
+        // modifier radeonsi-VA mis-imports into green frames. Direct (`! vah265enc`): order
+        // the encoder's own modifier (queried from the driver) first so negotiation lands on
+        // exactly what it wants, then LINEAR, then the rest the GPU can export.
+        let nv12_mods: Vec<u64> = if prefer_nv12 {
+            vec![DRM_FORMAT_MOD_LINEAR]
+        } else {
+            let exportable =
+                waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(nv12_minor);
+            let encoder_pref =
+                waylanddisplaycore::utils::va_query::import_nv12_modifier(&render_path);
+            let mut ordered: Vec<u64> = Vec::new();
+            if let Some(p) = encoder_pref {
+                if p != DRM_FORMAT_MOD_INVALID && exportable.contains(&p) {
+                    ordered.push(p);
+                }
             }
-            let drm = if m == 0 {
+            if exportable.contains(&DRM_FORMAT_MOD_LINEAR) {
+                ordered.push(DRM_FORMAT_MOD_LINEAR);
+            }
+            let rest: Vec<u64> = exportable
+                .iter()
+                .copied()
+                .filter(|m| *m != DRM_FORMAT_MOD_INVALID && !ordered.contains(m))
+                .collect();
+            ordered.extend(rest);
+            ordered
+        };
+
+        let mut nv12_caps = gst::Caps::new_empty();
+        for m in nv12_mods {
+            let drm = if m == DRM_FORMAT_MOD_LINEAR {
                 "NV12".to_string()
             } else {
                 format!("NV12:0x{m:016x}")
@@ -684,7 +772,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // (e.g. an unconstrained interpipesink, as in Wolf) fixates on NV12 instead of
         // RGBA; RGBA stays appended as a fallback. Default: RGBA first (current behaviour),
         // with NV12 still offered for encoders that request it directly.
-        let prefer_nv12 = self.settings.lock().unwrap().nv12;
         let mut caps = if prefer_nv12 {
             nv12_caps.merge(caps);
             nv12_caps
@@ -796,7 +883,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
         let video_info = match VideoInfoDmaDrm::from_caps(caps) {
-            Ok(dma_video_info) => GstVideoInfo::DMA(dma_video_info),
+            Ok(dma_video_info) => {
+                self.check_nv12_export(caps, &dma_video_info)?;
+                GstVideoInfo::DMA(dma_video_info)
+            }
             #[cfg(feature = "cuda")]
             Err(_) => {
                 let base_video_info =

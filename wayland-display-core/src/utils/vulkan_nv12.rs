@@ -329,30 +329,9 @@ impl VulkanNv12 {
             dev_props.vendor_id
         );
 
-        // PROTOTYPE (env-gated, off by default) -- VA-native-surface workaround for
-        // the RX 9070 / GFX12. There `vah265enc` negotiates *only* the AMD DCC NV12
-        // modifier for DMABuf, but radeonsi-VA cannot import radv's DCC metadata as an
-        // encode source, so the encoder fails to create its reconstruct picture. We
-        // can't change what the encoder negotiates, but we *can* change what we export:
-        // forcing the export image to LINEAR (which radeonsi-VA imports cleanly) lets
-        // `va_share` attach a real VA surface to the buffer, which the encoder then
-        // *reuses* (`gst_va_memory_peek_display`) instead of re-importing the dmabuf --
-        // so the negotiated DCC caps only label a buffer the encoder consumes via its VA
-        // surface. No-op where the encoder already negotiates LINEAR (7900 XTX / Intel),
-        // so it can't be validated there: run on a 9070 with
-        // `WAYLANDDISPLAY_VA_FORCE_LINEAR_EXPORT=1`.
-        let export_modifier = if implicit_sync
-            && export_modifier != DRM_FORMAT_MOD_LINEAR
-            && std::env::var_os("WAYLANDDISPLAY_VA_FORCE_LINEAR_EXPORT").is_some()
-        {
-            tracing::info!(
-                "VulkanNv12: VA_FORCE_LINEAR_EXPORT -- exporting LINEAR instead of \
-                 negotiated {export_modifier:#x} (9070 VA-surface workaround)"
-            );
-            DRM_FORMAT_MOD_LINEAR
-        } else {
-            export_modifier
-        };
+        // We export exactly the negotiated modifier (the caps layer already picked one the
+        // encoder imports -- LINEAR for the interpipe/vapostproc path, the encoder's own
+        // modifier for a direct `! vah265enc`). No env-gated override.
 
         let qfi = instance
             .get_physical_device_queue_family_properties(pd)
