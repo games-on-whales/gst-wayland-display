@@ -79,7 +79,7 @@ pub use self::rendering::*;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::GsCUDABuf;
 use crate::utils::allocator::{
-    GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, VideoInfoTypes,
+    GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
 };
 use crate::utils::device::gpu::GPUDevice;
@@ -343,6 +343,17 @@ pub(crate) fn apply_video_info(
                         GsDmaBuf::new(node, base_info).expect("Failed to create GsDmaBuf");
                     state.output_buffer = Some(GsBufferType::DMA(allocator));
                 }
+            }
+            GstVideoInfo::VULKAN(params) => {
+                let node = render_node.unwrap();
+                let allocator = GsVulkanBuf::new(
+                    &mut state.renderer,
+                    node,
+                    params.video_info,
+                    params.profile,
+                )
+                .expect("Failed to create GsVulkanBuf (no shared GstVulkanDevice?)");
+                state.output_buffer = Some(GsBufferType::VULKAN(allocator));
             }
             #[cfg(feature = "cuda")]
             GstVideoInfo::CUDA(base_info) => {

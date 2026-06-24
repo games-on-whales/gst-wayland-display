@@ -18,7 +18,7 @@ use gst::glib::translate::FromGlibPtrFull;
 use gst::prelude::*;
 use gst_video::ffi::{GstVideoFormat, GstVideoInfoDmaDrm, gst_video_info_set_format};
 use gst_video::{VideoFormat, VideoMeta};
-use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
+use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use libloading::Library;
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -198,7 +198,7 @@ pub fn build_shared_buffer(fd: RawFd, size: usize, l: &Nv12Layout) -> Option<Gst
     {
         let b = buffer.get_mut().unwrap();
         let gmem =
-            unsafe { allocator.alloc_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }.ok()?;
+            unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }.ok()?;
         b.append_memory(gmem);
         VideoMeta::add_full(
             b,

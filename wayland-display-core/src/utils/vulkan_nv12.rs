@@ -64,7 +64,7 @@
 use ash::vk;
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfoDmaDrm, VideoMeta};
-use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
+use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use smithay::backend::allocator::Buffer as _;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
@@ -79,6 +79,8 @@ const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const RING: usize = 8;
 /// PCI vendor id for Nvidia -- its CUDA consumer ignores implicit dma-buf fences.
 const VENDOR_NVIDIA: u32 = 0x10de;
+/// `VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR` -- the layout `vulkanh264enc` expects its input.
+const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
 
 type Err = Box<dyn std::error::Error>;
 /// An imported RGBA dmabuf (image/memory/view) kept alive until its frame's GPU work ends.
@@ -266,6 +268,14 @@ pub struct VulkanNv12 {
     implicit_sync: bool,
     /// LINEAR direct path (compute writes the export image; no scratch/copy).
     direct: bool,
+    /// Shared-device encode path: outputs are NV12 `GstVulkanImageMemory` from the encoder's
+    /// own pool (single multiplanar `VIDEO_ENCODE_SRC` images); compute writes a storage
+    /// scratch then copies into the pool image, which is left in `VIDEO_ENCODE_SRC` layout
+    /// for the encoder to view zero-copy. No dmabuf export, no implicit-sync fence.
+    encode_src: bool,
+    /// Keeps the shared `GstVulkanDevice` alive for the converter's lifetime (the encode-src
+    /// images are allocated on it).
+    _shared_device: Option<gstreamer_vulkan::VulkanDevice>,
     outputs: Vec<Nv12Out>,
     next: usize, // next ring slot to write
     cur: usize,  // last slot written (the one to_gst_buffer returns)
@@ -499,6 +509,146 @@ impl VulkanNv12 {
             sem_fd,
             implicit_sync,
             direct,
+            encode_src: false,
+            _shared_device: None,
+            outputs,
+            next: 0,
+            cur: 0,
+            width,
+            height,
+        })
+    }
+
+    /// Shared-device encode path: wrap the downstream encoder's `GstVulkanDevice` and build
+    /// an output ring of NV12 `GstVulkanImageMemory` buffers from its encode-src pool. The
+    /// compositor's RGBA dmabuf is imported + converted (compute -> storage scratch) and
+    /// `vkCmdCopyImage`'d into the pool's encode-src image, left in `VIDEO_ENCODE_SRC`
+    /// layout for `vulkanh264enc` to view zero-copy. Same device as the encoder, so ordering
+    /// is a plain fence wait (the encoder does its own input acquire).
+    pub fn new_on_shared(
+        device_gst: gstreamer_vulkan::VulkanDevice,
+        raw: crate::utils::vulkan_share::RawVk,
+        nv12_caps: &gst::Caps,
+        profile: &str,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        match unsafe { Self::new_on_shared_inner(device_gst, raw, nv12_caps, profile, width, height) }
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!("VulkanNv12::new_on_shared failed: {e}");
+                None
+            }
+        }
+    }
+
+    unsafe fn new_on_shared_inner(
+        device_gst: gstreamer_vulkan::VulkanDevice,
+        raw: crate::utils::vulkan_share::RawVk,
+        _nv12_caps: &gst::Caps,
+        profile: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, Err> {
+        // Drive ash on the encoder's existing instance/device (do NOT create our own).
+        let entry = ash::Entry::load()?;
+        let instance = ash::Instance::load(entry.static_fn(), raw.instance);
+        let device = ash::Device::load(instance.fp_v1_0(), raw.device);
+        let queue = device.get_device_queue(raw.gfx_queue_family, 0);
+        let memp = instance.get_physical_device_memory_properties(raw.physical);
+
+        // ---- compute pipeline (same as the dmabuf path, on the shared device) ----
+        let module = device.create_shader_module(
+            &vk::ShaderModuleCreateInfo {
+                code_size: RGBA_TO_NV12_SPV.len(),
+                p_code: RGBA_TO_NV12_SPV.as_ptr() as *const u32,
+                ..Default::default()
+            },
+            None,
+        )?;
+        let binds = [
+            dsl_bind(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            dsl_bind(1, vk::DescriptorType::STORAGE_IMAGE),
+            dsl_bind(2, vk::DescriptorType::STORAGE_IMAGE),
+        ];
+        let desc_layout = device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
+            None,
+        )?;
+        let dsls = [desc_layout];
+        let pcr = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(8)];
+        let pipeline_layout = device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&dsls)
+                .push_constant_ranges(&pcr),
+            None,
+        )?;
+        let entry_name = c"main";
+        let pipeline = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(module)
+                            .name(entry_name),
+                    )
+                    .layout(pipeline_layout)],
+                None,
+            )
+            .map_err(|(_, e)| e)?[0];
+        device.destroy_shader_module(module, None);
+        let psizes = [
+            pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, RING as u32),
+            pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * RING as u32),
+        ];
+        let desc_pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(RING as u32)
+                .pool_sizes(&psizes),
+            None,
+        )?;
+        let sampler = device.create_sampler(&vk::SamplerCreateInfo::default(), None)?;
+        let cmd_pool = device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default()
+                .queue_family_index(raw.gfx_queue_family)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+            None,
+        )?;
+
+        // ---- encode-src output ring: NV12 VIDEO_ENCODE_SRC GstVulkanImageMemory images
+        // allocated directly on the shared device (bypasses the pool's generic-format check).
+        let mut outputs = Vec::with_capacity(RING);
+        for _ in 0..RING {
+            outputs.push(create_encode_output(
+                &device, &memp, &device_gst, profile, desc_pool, desc_layout, cmd_pool, width,
+                height,
+            )?);
+        }
+
+        Ok(VulkanNv12 {
+            _entry: entry,
+            instance,
+            device,
+            queue,
+            cmd_pool,
+            pipeline,
+            pipeline_layout,
+            desc_layout,
+            desc_pool,
+            sampler,
+            memp,
+            sync_sem: vk::Semaphore::null(),
+            sem_fd: None,
+            implicit_sync: false,
+            direct: false,
+            encode_src: true,
+            _shared_device: Some(device_gst),
             outputs,
             next: 0,
             cur: 0,
@@ -529,6 +679,28 @@ impl VulkanNv12 {
                 .wait_for_fences(&[self.outputs[idx].fence], true, u64::MAX)?;
             self.device.reset_fences(&[self.outputs[idx].fence])?;
             self.outputs[idx].in_flight = false;
+        }
+
+        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
+        // downstream encoders at once (interpipe delivers it to every consumer). Our own
+        // graphics fence above only proves *our* last write to this slot finished -- it says
+        // nothing about the consumers' encode *reads*, which run on the encode queue with no
+        // shared sync to us. Overwriting the slot's image while an encode still reads it is a
+        // GPU data hazard that wedges the encoder. Block until every consumer has dropped its
+        // ref (the buffer is writable again, refcount back to 1) before reusing the slot.
+        if self.encode_src {
+            let mut waited = 0u32;
+            while self.outputs[idx].buffer.get_mut().is_none() {
+                // ~1s cap so a paused/stalled consumer can't deadlock the producer forever.
+                if waited >= 10_000 {
+                    tracing::warn!(
+                        "VulkanNv12: encode-src slot {idx} still referenced after 1s; reusing anyway"
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                waited += 1;
+            }
         }
 
         // Ensure this slot's cached RGBA import matches the current dmabuf. Built once per
@@ -731,6 +903,39 @@ impl VulkanNv12 {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
             );
+
+            if self.encode_src {
+                // Hand the encoder its input already in VIDEO_ENCODE_SRC_KHR. The encode
+                // queue read is ordered after this submit by the slot fence wait below
+                // (same device as the encoder).
+                let enc_layout =
+                    vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR);
+                let e_y = img_barrier(
+                    out_img,
+                    vk::ImageAspectFlags::PLANE_0,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    enc_layout,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::empty(),
+                );
+                let e_uv = img_barrier(
+                    out_img,
+                    vk::ImageAspectFlags::PLANE_1,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    enc_layout,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::empty(),
+                );
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[e_y, e_uv],
+                );
+            }
         }
 
         self.device.end_command_buffer(cmd)?;
@@ -908,10 +1113,14 @@ impl Drop for VulkanNv12 {
                     self.device.destroy_image(s_img, None);
                     self.device.free_memory(s_mem, None);
                 }
-                self.device.destroy_image(o.image, None);
-                self.device.free_memory(o.mem, None);
+                // On the encode-src path the output image + memory belong to the gst pool
+                // (freed when the buffer/pool drop) and there is no export fd to close.
+                if !self.encode_src {
+                    self.device.destroy_image(o.image, None);
+                    self.device.free_memory(o.mem, None);
+                    libc::close(o.export_fd);
+                }
                 self.device.destroy_fence(o.fence, None);
-                libc::close(o.export_fd);
             }
             if self.sync_sem != vk::Semaphore::null() {
                 self.device.destroy_semaphore(self.sync_sem, None);
@@ -924,8 +1133,14 @@ impl Drop for VulkanNv12 {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            // On the shared/encode-src path the VkDevice + VkInstance are owned by the
+            // downstream encoder's GstVulkanDevice (held alive via `_shared_device`); the
+            // encoder still frees its own DPB image views at teardown, so destroying them
+            // here would yank the device out from under it. Only tear down what we created.
+            if !self.encode_src {
+                self.device.destroy_device(None);
+                self.instance.destroy_instance(None);
+            }
         }
     }
 }
@@ -1128,7 +1343,7 @@ unsafe fn create_output(
             {
                 let b = buffer.get_mut().unwrap();
                 let gmem =
-                    allocator.alloc_with_flags(fd, mr.size as usize, FdMemoryFlags::DONT_CLOSE)?;
+                    allocator.alloc_dmabuf_with_flags(fd, mr.size as usize, FdMemoryFlags::DONT_CLOSE)?;
                 b.append_memory(gmem);
                 VideoMeta::add_full(
                     b,
@@ -1174,6 +1389,76 @@ unsafe fn create_output(
         buffer,
         export_fd,
         scratch,
+        y_view,
+        uv_view,
+        cmd,
+        fence,
+        desc_set,
+        import: None,
+        in_flight: false,
+    })
+}
+
+/// Build one encode-src ring slot: a buffer from the encoder's `GstVulkanImageBufferPool`
+/// (a single multiplanar NV12 `VIDEO_ENCODE_SRC` image), a LINEAR storage scratch the
+/// compute shader writes, and the per-slot cmd/fence/descriptor set. No dmabuf export --
+/// the pool owns the output image's memory.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_encode_output(
+    device: &ash::Device,
+    memp: &vk::PhysicalDeviceMemoryProperties,
+    gst_device: &gstreamer_vulkan::VulkanDevice,
+    profile: &str,
+    desc_pool: vk::DescriptorPool,
+    desc_layout: vk::DescriptorSetLayout,
+    cmd_pool: vk::CommandPool,
+    width: u32,
+    height: u32,
+) -> Result<Nv12Out, Err> {
+    let buffer =
+        crate::utils::vulkan_share::alloc_encode_src_buffer(gst_device, width, height, profile)
+            .ok_or("encode-src image allocation failed")?;
+    let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)
+        .ok_or("encode-src buffer is not a single GstVulkanImageMemory")?;
+
+    // LINEAR storage scratch (compute writes here; copied into the encode-src image).
+    let (s_img, s_mem, y_view, uv_view) = create_storage_nv12(
+        device,
+        memp,
+        width,
+        height,
+        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        false,
+    )?;
+
+    let cmd = device.allocate_command_buffers(
+        &vk::CommandBufferAllocateInfo::default()
+            .command_pool(cmd_pool)
+            .command_buffer_count(1),
+    )?[0];
+    let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+    let dsls = [desc_layout];
+    let desc_set = device.allocate_descriptor_sets(
+        &vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(desc_pool)
+            .set_layouts(&dsls),
+    )?[0];
+    let y_info = [image_info(y_view)];
+    let uv_info = [image_info(uv_view)];
+    device.update_descriptor_sets(
+        &[
+            write_img(desc_set, 1, vk::DescriptorType::STORAGE_IMAGE, &y_info),
+            write_img(desc_set, 2, vk::DescriptorType::STORAGE_IMAGE, &uv_info),
+        ],
+        &[],
+    );
+
+    Ok(Nv12Out {
+        image: out_img,
+        mem: vk::DeviceMemory::null(), // the pool owns the encode-src image memory
+        buffer,
+        export_fd: -1,
+        scratch: Some((s_img, s_mem)),
         y_view,
         uv_view,
         cmd,

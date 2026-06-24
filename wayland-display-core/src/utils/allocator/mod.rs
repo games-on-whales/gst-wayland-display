@@ -9,7 +9,7 @@ use crate::utils::device::gpu::GPUDevice;
 use crate::utils::vulkan_nv12::VulkanNv12;
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
-use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
+use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
@@ -202,6 +202,77 @@ impl GsNv12Buf {
     }
 }
 
+/// NV12 output as `memory:VulkanImage` on the downstream encoder's shared `GstVulkanDevice`
+/// (the Vulkan-encode/interpipe path). Renders the scene into an RGBA dmabuf like
+/// [`GsNv12Buf`], but the Vulkan converter writes into the encoder's own encode-src image
+/// pool, so `vulkanh264enc` consumes the result zero-copy.
+#[derive(Debug, Clone)]
+pub struct GsVulkanBuf {
+    pub rgba: Dmabuf,
+    vulkan: Arc<Mutex<VulkanNv12>>,
+    video_info: VideoInfo,
+}
+
+impl GsVulkanBuf {
+    /// `profile` is the negotiated H.264 profile (for the encode-src image's video profile).
+    /// Returns `None` if no shared `GstVulkanDevice` has been received yet (caller then
+    /// falls back to the dmabuf path).
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        render_node: DrmNode,
+        video_info: VideoInfo,
+        profile: String,
+    ) -> Option<Self> {
+        let (w, h) = (video_info.width(), video_info.height());
+
+        // RGBA render-target modifier (same policy as GsNv12Buf: LINEAR except on Nvidia).
+        let formats =
+            <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
+        let mut mods: Vec<Modifier> = formats
+            .iter()
+            .filter(|f| f.code == DrmFourcc::Abgr8888)
+            .map(|f| f.modifier)
+            .collect();
+        mods.sort_by_key(|m| *m == Modifier::Invalid);
+        let gbm = new_gbm_device(render_node)?;
+        let mut dma = DmabufAllocator(GbmAllocator::new(gbm, GbmBufferFlags::RENDERING));
+        let is_nvidia = matches!(
+            GPUDevice::try_from(render_node).map(|d| *d.pci_vendor() == PCIVendor::NVIDIA),
+            Ok(true)
+        );
+        let order: Vec<Modifier> = if is_nvidia {
+            mods.iter()
+                .copied()
+                .chain(std::iter::once(Modifier::Linear))
+                .collect()
+        } else {
+            std::iter::once(Modifier::Linear)
+                .chain(mods.iter().copied())
+                .collect()
+        };
+        let rgba = order
+            .iter()
+            .find_map(|m| dma.create_buffer(w, h, DrmFourcc::Abgr8888, &[*m]).ok())?;
+
+        // The shared device must already have been absorbed from a GstContext.
+        let dev = crate::utils::vulkan_share::shared_device()?;
+        let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
+        let nv12_caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:VulkanImage"])
+            .field("format", "NV12")
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("framerate", video_info.fps())
+            .build();
+        let vulkan = VulkanNv12::new_on_shared(dev, raw, &nv12_caps, &profile, w, h)?;
+        Some(GsVulkanBuf {
+            rgba,
+            vulkan: Arc::new(Mutex::new(vulkan)),
+            video_info,
+        })
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct GsCUDABuf {
@@ -278,6 +349,7 @@ pub enum GsBufferType {
     RAW(GsGlesbuffer),
     DMA(GsDmaBuf),
     NV12(GsNv12Buf),
+    VULKAN(GsVulkanBuf),
     #[cfg(feature = "cuda")]
     CUDA(GsCUDABuf),
 }
@@ -308,6 +380,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             // NV12 mode renders the scene into the RGBA dmabuf; Vulkan converts it
             // to NV12 in to_gs_buffer().
             GsBufferType::NV12(buffer) => renderer.bind(&mut buffer.rgba),
+            // Vulkan-encode path: render into the RGBA dmabuf; convert in to_gs_buffer().
+            GsBufferType::VULKAN(buffer) => renderer.bind(&mut buffer.rgba),
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => renderer.bind(&mut buffer.buffer),
         }
@@ -387,7 +461,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
-                                .alloc_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
+                                .alloc_dmabuf_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);
@@ -421,6 +495,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 Ok(gst_buffer)
             }
             GsBufferType::NV12(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba)?;
+                v.to_gst_buffer()
+            }
+            GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
                 v.convert(&buffer.rgba)?;
                 v.to_gst_buffer()
@@ -511,7 +590,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
-                                .alloc_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
+                                .alloc_dmabuf_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);
@@ -549,6 +628,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 v.convert(&buffer.rgba)?;
                 v.to_gst_buffer()
             }
+            GsBufferType::VULKAN(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba)?;
+                v.to_gst_buffer()
+            }
         }
     }
 
@@ -559,6 +643,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             GsBufferType::NV12(buffer) => {
                 VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())
             }
+            GsBufferType::VULKAN(buffer) => VideoInfoTypes::VideoInfo(buffer.video_info.clone()),
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
                 VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())

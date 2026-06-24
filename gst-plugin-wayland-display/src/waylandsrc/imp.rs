@@ -54,6 +54,9 @@ pub struct Settings {
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
     nv12: bool,
+    /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
+    /// `GstVulkanDevice` (zero-copy into `vulkanh264enc`). Default off.
+    vulkan: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -284,6 +287,17 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("vulkan")
+                    .nick("Prefer NV12 Vulkan output")
+                    .blurb(
+                        "Advertise NV12 memory:VulkanImage output on a downstream encoder's \
+                         shared GstVulkanDevice (zero-copy into vulkanh264enc), offered first \
+                         so a format-agnostic interpipesink negotiates it. Requires the encoder \
+                         to share its GstVulkanDevice via context; falls back to dmabuf/RGBA \
+                         otherwise. Default off.",
+                    )
+                    .default_value(false)
+                    .build(),
             ]
         });
 
@@ -347,6 +361,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 settings.disable_intel_workaround =
                     value.get::<bool>().expect("Type checked upstream");
             }
+            "vulkan" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.vulkan = value.get::<bool>().expect("Type checked upstream");
+            }
             "nv12" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.nv12 = value.get::<bool>().expect("Type checked upstream");
@@ -388,6 +406,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "nv12" => {
                 let settings = self.settings.lock().unwrap();
                 settings.nv12.to_value()
+            }
+            "vulkan" => {
+                let settings = self.settings.lock().unwrap();
+                settings.vulkan.to_value()
             }
             _ => unreachable!(),
         }
@@ -449,6 +471,17 @@ impl ElementImpl for WaylandDisplaySrc {
 
             dmabuf_caps.merge(caps);
 
+            // NV12 memory:VulkanImage (the shared-device encode path; offered when `vulkan`
+            // is set and a downstream encoder shares its GstVulkanDevice).
+            let vulkan_caps = gst_video::VideoCapsBuilder::new()
+                .features(["memory:VulkanImage"])
+                .format(VideoFormat::Nv12)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            dmabuf_caps.merge(vulkan_caps);
+
             #[cfg(feature = "cuda")]
             {
                 let cuda_caps = gst_video::VideoCapsBuilder::new()
@@ -494,6 +527,12 @@ impl ElementImpl for WaylandDisplaySrc {
     }
 
     fn set_context(&self, context: &Context) {
+        // Absorb a downstream encoder's shared GstVulkanDevice so the Vulkan-encode path can
+        // mint encode-src images on the same device (best-effort; no-op for other contexts).
+        if waylanddisplaycore::utils::vulkan_share::handle_set_context(context) {
+            tracing::info!("waylandsrc: absorbed shared GstVulkanDevice for Vulkan encode path");
+        }
+
         // Absorb a downstream VA encoder's GstVaDisplay context so our NV12 buffers can
         // attach VA surfaces on the same display (best-effort).
         let render_path = {
@@ -780,6 +819,24 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             caps
         };
 
+        // `vulkan=true`: advertise NV12 memory:VulkanImage FIRST, so a format-agnostic
+        // interpipesink (Wolf) fixates on it and we hand the encoder a shared-device
+        // encode-src image. Requires the encoder to share its GstVulkanDevice (set_context);
+        // the dmabuf/RGBA caps stay as fallback.
+        let vulkan_on = self.settings.lock().unwrap().vulkan;
+        if vulkan_on {
+            let vk_caps = gst_video::VideoCapsBuilder::new()
+                .features(["memory:VulkanImage"])
+                .format(VideoFormat::Nv12)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            let mut merged = vk_caps;
+            merged.merge(caps);
+            caps = merged;
+        }
+
         if let Some(filter) = filter {
             caps = caps.intersect(filter);
         }
@@ -882,6 +939,24 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
+        // NV12 memory:VulkanImage: hand the compositor a VULKAN video-info so it builds the
+        // shared-device encode-src converter. The H.264 profile isn't in our (raw) caps --
+        // it lives in the encoder's output caps downstream -- so default to "high"
+        // (vulkanh264enc's default); a mismatch would only force the encoder to copy.
+        let is_vulkan = caps
+            .features(0)
+            .is_some_and(|f| f.contains("memory:VulkanImage"));
+        if is_vulkan {
+            let base_video_info =
+                gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
+            let video_info = GstVideoInfo::VULKAN(waylanddisplaycore::utils::video_info::VulkanParams {
+                video_info: base_video_info,
+                profile: "high".to_string(),
+            });
+            let _ = self.command_tx.send(Command::VideoInfo(video_info));
+            return self.parent_set_caps(caps);
+        }
+
         let video_info = match VideoInfoDmaDrm::from_caps(caps) {
             Ok(dma_video_info) => {
                 self.check_nv12_export(caps, &dma_video_info)?;
