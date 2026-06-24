@@ -461,7 +461,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
-                                .alloc_dmabuf_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
+                                .alloc_dmabuf_with_flags(
+                                    fd,
+                                    allocation_size,
+                                    FdMemoryFlags::DONT_CLOSE,
+                                )
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);
@@ -590,7 +594,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
-                                .alloc_dmabuf_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
+                                .alloc_dmabuf_with_flags(
+                                    fd,
+                                    allocation_size,
+                                    FdMemoryFlags::DONT_CLOSE,
+                                )
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);

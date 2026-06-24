@@ -22,7 +22,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
-use gst::glib::translate::{from_glib_full, ToGlibPtr};
+use gst::glib::translate::{ToGlibPtr, from_glib_full};
 use gst::prelude::*;
 use gstreamer_vulkan::VulkanDevice;
 use gstreamer_vulkan_sys as gstvk;
@@ -230,14 +230,17 @@ pub fn alloc_encode_src_buffer(
     profile: &str,
 ) -> Option<gst::Buffer> {
     let std_profile_idc = match profile {
-        "high" | "constrained-high" | "progressive-high" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH,
+        "high" | "constrained-high" | "progressive-high" => {
+            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+        }
         "main" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
         _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
     };
     unsafe {
         // Profile chain (matches what vulkanh264enc's pool builds from caps): the H.264
         // codec struct chained off the VkVideoProfileInfoKHR; usage info omitted.
-        let mut h264 = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_profile_idc);
+        let mut h264 =
+            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_profile_idc);
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
@@ -245,13 +248,16 @@ pub fn alloc_encode_src_buffer(
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .push_next(&mut h264);
         let profiles = [profile_info];
-        let mut profile_list =
-            vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
-            .extent(vk::Extent3D { width, height, depth: 1 })
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)

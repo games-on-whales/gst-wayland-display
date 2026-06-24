@@ -949,10 +949,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         if is_vulkan {
             let base_video_info =
                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
-            let video_info = GstVideoInfo::VULKAN(waylanddisplaycore::utils::video_info::VulkanParams {
-                video_info: base_video_info,
-                profile: "high".to_string(),
-            });
+            let video_info =
+                GstVideoInfo::VULKAN(waylanddisplaycore::utils::video_info::VulkanParams {
+                    video_info: base_video_info,
+                    profile: "high".to_string(),
+                });
             let _ = self.command_tx.send(Command::VideoInfo(video_info));
             return self.parent_set_caps(caps);
         }

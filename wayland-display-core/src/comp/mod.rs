@@ -346,13 +346,9 @@ pub(crate) fn apply_video_info(
             }
             GstVideoInfo::VULKAN(params) => {
                 let node = render_node.unwrap();
-                let allocator = GsVulkanBuf::new(
-                    &mut state.renderer,
-                    node,
-                    params.video_info,
-                    params.profile,
-                )
-                .expect("Failed to create GsVulkanBuf (no shared GstVulkanDevice?)");
+                let allocator =
+                    GsVulkanBuf::new(&mut state.renderer, node, params.video_info, params.profile)
+                        .expect("Failed to create GsVulkanBuf (no shared GstVulkanDevice?)");
                 state.output_buffer = Some(GsBufferType::VULKAN(allocator));
             }
             #[cfg(feature = "cuda")]

@@ -198,7 +198,8 @@ pub fn build_shared_buffer(fd: RawFd, size: usize, l: &Nv12Layout) -> Option<Gst
     {
         let b = buffer.get_mut().unwrap();
         let gmem =
-            unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }.ok()?;
+            unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }
+                .ok()?;
         b.append_memory(gmem);
         VideoMeta::add_full(
             b,

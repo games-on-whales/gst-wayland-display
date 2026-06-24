@@ -533,8 +533,9 @@ impl VulkanNv12 {
         width: u32,
         height: u32,
     ) -> Option<Self> {
-        match unsafe { Self::new_on_shared_inner(device_gst, raw, nv12_caps, profile, width, height) }
-        {
+        match unsafe {
+            Self::new_on_shared_inner(device_gst, raw, nv12_caps, profile, width, height)
+        } {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::error!("VulkanNv12::new_on_shared failed: {e}");
@@ -626,7 +627,14 @@ impl VulkanNv12 {
         let mut outputs = Vec::with_capacity(RING);
         for _ in 0..RING {
             outputs.push(create_encode_output(
-                &device, &memp, &device_gst, profile, desc_pool, desc_layout, cmd_pool, width,
+                &device,
+                &memp,
+                &device_gst,
+                profile,
+                desc_pool,
+                desc_layout,
+                cmd_pool,
+                width,
                 height,
             )?);
         }
@@ -908,8 +916,7 @@ impl VulkanNv12 {
                 // Hand the encoder its input already in VIDEO_ENCODE_SRC_KHR. The encode
                 // queue read is ordered after this submit by the slot fence wait below
                 // (same device as the encoder).
-                let enc_layout =
-                    vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR);
+                let enc_layout = vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR);
                 let e_y = img_barrier(
                     out_img,
                     vk::ImageAspectFlags::PLANE_0,
@@ -1342,8 +1349,11 @@ unsafe fn create_output(
             let mut buffer = GstBuffer::new();
             {
                 let b = buffer.get_mut().unwrap();
-                let gmem =
-                    allocator.alloc_dmabuf_with_flags(fd, mr.size as usize, FdMemoryFlags::DONT_CLOSE)?;
+                let gmem = allocator.alloc_dmabuf_with_flags(
+                    fd,
+                    mr.size as usize,
+                    FdMemoryFlags::DONT_CLOSE,
+                )?;
                 b.append_memory(gmem);
                 VideoMeta::add_full(
                     b,
