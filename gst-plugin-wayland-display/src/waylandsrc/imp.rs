@@ -635,10 +635,36 @@ impl WaylandDisplaySrc {
     }
 }
 
+impl WaylandDisplaySrc {
+    /// When `vulkan=true`, answer a downstream `gst.vulkan.{instance,device}` context query
+    /// with the `GstVulkanDevice` we own — created with the external-memory extensions the
+    /// converter needs. The encoder then adopts our device (one shared device, no zero-copy
+    /// gap, no gstreamer fork). Mirrors how the CUDA path shares its context.
+    fn handle_vulkan_context_query(&self, query: &mut gst::QueryRef) -> bool {
+        let (vulkan_on, render_node) = {
+            let s = self.settings.lock().unwrap();
+            (s.vulkan, s.render_node.clone())
+        };
+        if !vulkan_on {
+            return false;
+        }
+        let node = render_node.unwrap_or_else(|| "/dev/dri/renderD128".into());
+        let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
+        waylanddisplaycore::utils::vulkan_share::provide_context(
+            self.obj().upcast_ref::<gst::Element>(),
+            query,
+            minor,
+        )
+    }
+}
+
 impl BaseSrcImpl for WaylandDisplaySrc {
     #[cfg(feature = "cuda")]
     fn query(&self, query: &mut gst::QueryRef) -> bool {
         if query.type_() == gst::QueryType::Context {
+            if self.handle_vulkan_context_query(query) {
+                return true;
+            }
             let settings = self.settings.lock().unwrap();
             match settings.cuda_context {
                 Some(ref cuda_context) => {
@@ -659,6 +685,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
     #[cfg(not(feature = "cuda"))]
     fn query(&self, query: &mut gst::QueryRef) -> bool {
+        if query.type_() == gst::QueryType::Context && self.handle_vulkan_context_query(query) {
+            return true;
+        }
         BaseSrcImplExt::parent_query(self, query)
     }
 
@@ -949,18 +978,19 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             .features(0)
             .is_some_and(|f| f.contains("memory:VulkanImage"));
         if is_vulkan {
-            // Proactively harvest the downstream encoder's GstVulkanDevice. vulkanh264enc
-            // answers a `gst.vulkan.device` context query but only ever *pushes* its
-            // instance context via set_context, so in a direct pipeline the device must be
-            // pulled here -- otherwise the compositor never gets a shared device to mint the
-            // encode-src VulkanImage on, and the Vulkan-encode path can't allocate.
-            if let Some(srcpad) = self.obj().static_pad("src") {
-                if waylanddisplaycore::utils::vulkan_share::query_downstream_device(&srcpad) {
-                    tracing::info!(
-                        "waylandsrc: harvested the downstream encoder's GstVulkanDevice via context query"
-                    );
-                }
-            }
+            // Ensure OUR shared GstVulkanDevice exists before the compositor allocates on it.
+            // We create it (with the external-memory extensions the converter needs) and hand
+            // it to the downstream encoder via our context-query answer (see query()), so both
+            // sides share one device -- no zero-copy gap and no gstreamer fork.
+            let node = self
+                .settings
+                .lock()
+                .unwrap()
+                .render_node
+                .clone()
+                .unwrap_or_else(|| "/dev/dri/renderD128".into());
+            let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
+            waylanddisplaycore::utils::vulkan_share::ensure_owned_device(minor);
             let base_video_info =
                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
             let video_info =

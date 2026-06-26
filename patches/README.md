@@ -16,19 +16,12 @@ Moves the call into `new_sequence`, after `gst_vulkan_encoder_start`.
 
 Tested on gst 1.28.4 and 1.29.1. Upstream fix pending.
 
-## vk-device-external-memory.patch
-
-`GstVulkanDevice` enables a curated set of optional extensions but **not** the
-external-memory ones. The Vulkan-encode path harvests the encoder's
-`GstVulkanDevice` (so the NV12 `memory:VulkanImage` is zero-copy to the encoder)
-and then imports the compositor's RGBA dmabuf onto that same device — which needs
-`VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`,
-`VK_EXT_image_drm_format_modifier` and `VK_KHR_external_semaphore_fd`. Without
-them `vkGetMemoryFdPropertiesKHR` is unloaded and the import aborts. Adds the four
-to `optional_extensions[]` in `gstvkdevice.c`.
-
-Tested on gst 1.28.4 (RTX 5080): `waylanddisplaysrc vulkan=true ! vulkanh264enc !
-fakesink` now encodes to EOS.
+(The Vulkan-encode path also needs the device to enable the external-memory
+extensions that `GstVulkanDevice` does not — `VK_KHR_external_memory_fd` etc. —
+to import the compositor's RGBA dmabuf. Rather than fork gstreamer for that, the
+plugin **creates its own `GstVulkanInstance`/`GstVulkanDevice`** with those
+extensions enabled and hands it to the encoder via a context-query answer, so no
+gstreamer patch is required. See `wayland-display-core/src/utils/vulkan_share.rs`.)
 
 ## Building the patched gstreamer
 

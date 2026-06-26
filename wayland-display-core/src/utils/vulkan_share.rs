@@ -24,7 +24,8 @@
 use ash::vk;
 use gst::glib::translate::{ToGlibPtr, from_glib_full};
 use gst::prelude::*;
-use gstreamer_vulkan::VulkanDevice;
+use gstreamer_vulkan::prelude::*;
+use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice};
 use gstreamer_vulkan_sys as gstvk;
 use std::os::raw::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -106,32 +107,115 @@ pub fn handle_set_context(context: &gst::Context) -> bool {
     true
 }
 
-/// The shared device, if a downstream encoder's context has been absorbed.
+/// The shared device, if one has been created (or absorbed).
 pub fn shared_device() -> Option<VulkanDevice> {
     device_slot().lock().unwrap().clone()
 }
 
-/// Proactively pull the downstream encoder's `GstVulkanDevice` via a context query.
-///
-/// `vulkanh264enc` only *pushes* its `gst.vulkan.instance` context via `set_context`; it
-/// never pushes its device. But, like every gst-vulkan element, it *answers* a
-/// `gst.vulkan.device` context query with the device it created. Passively waiting for
-/// `set_context` therefore never yields a device in a direct pipeline -- we have to query
-/// for it. Send the query down `pad`'s peer, absorb the answer, and return whether a device
-/// is now shared.
-pub fn query_downstream_device(pad: &gst::Pad) -> bool {
-    use gst::prelude::*;
-    let mut query = gst::query::Context::new("gst.vulkan.device");
-    if !pad.peer_query(&mut query) {
+/// Process-wide slot for the `GstVulkanInstance` we own (keeps it alive + lets us answer
+/// `gst.vulkan.instance` context queries).
+fn instance_slot() -> &'static Mutex<Option<VulkanInstance>> {
+    static SLOT: OnceLock<Mutex<Option<VulkanInstance>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Index of the physical device whose DRM render/primary minor matches `target_minor`, so on
+/// a multi-GPU host we share the GPU that owns the compositor's render node. Falls back to 0.
+unsafe fn physical_index_for_minor(
+    ash_inst: &ash::Instance,
+    target_minor: Option<u32>,
+) -> Option<u32> {
+    let devices = ash_inst.enumerate_physical_devices().ok()?;
+    if let Some(minor) = target_minor {
+        for (i, &d) in devices.iter().enumerate() {
+            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+            ash_inst.get_physical_device_properties2(d, &mut p2);
+            if (drm.has_render != 0 && drm.render_minor as i64 == minor as i64)
+                || (drm.has_primary != 0 && drm.primary_minor as i64 == minor as i64)
+            {
+                return Some(i as u32);
+            }
+        }
+        tracing::warn!("vulkan_share: no physical device matched render minor {minor}; using 0");
+    }
+    if devices.is_empty() { None } else { Some(0) }
+}
+
+/// Create (once) the `GstVulkanInstance` + `GstVulkanDevice` that *we* own, on the GPU
+/// backing `target_minor`, with the external-memory extensions the RGBA-dmabuf import needs
+/// (`VK_KHR_external_memory_fd` etc.) enabled — which gst-vulkan's own device does not. This
+/// is the device we hand the encoder (see [`provide_context`]) so producer and encoder share
+/// one device with no zero-copy gap *and* no gstreamer fork. Idempotent.
+pub fn ensure_owned_device(target_minor: Option<u32>) -> Option<VulkanDevice> {
+    let mut slot = device_slot().lock().unwrap();
+    if let Some(d) = slot.clone() {
+        return Some(d);
+    }
+    let instance = VulkanInstance::new();
+    if let Err(e) = instance.open() {
+        tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
+        return None;
+    }
+    let vk_instance = unsafe { (*(instance.as_ptr() as *const GstVulkanInstanceOverlay)).instance };
+    let index = unsafe {
+        let entry = match ash::Entry::load() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("vulkan_share: ash entry load failed: {e}");
+                return None;
+            }
+        };
+        let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
+        physical_index_for_minor(&ash_inst, target_minor)?
+    };
+    let physical = VulkanPhysicalDevice::new(&instance, index);
+    let device = VulkanDevice::new(&physical);
+    for ext in [
+        "VK_KHR_external_memory_fd",
+        "VK_EXT_external_memory_dma_buf",
+        "VK_EXT_image_drm_format_modifier",
+        "VK_KHR_external_semaphore_fd",
+    ] {
+        device.enable_extension(ext);
+    }
+    if let Err(e) = device.open() {
+        tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
+        return None;
+    }
+    *instance_slot().lock().unwrap() = Some(instance);
+    *slot = Some(device.clone());
+    tracing::info!(
+        "vulkan_share: created shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
+    );
+    Some(device)
+}
+
+/// Answer a `gst.vulkan.{instance,device}` context query on `element` with the device we own,
+/// creating it on `target_minor`'s GPU on first ask. The downstream encoder's
+/// `gst_vulkan_ensure_element_data` then adopts *our* device instead of minting its own.
+pub fn provide_context(
+    element: &gst::Element,
+    query: &mut gst::QueryRef,
+    target_minor: Option<u32>,
+) -> bool {
+    if ensure_owned_device(target_minor).is_none() {
         return false;
     }
-    match query.context_owned() {
-        Some(ctx) => handle_set_context(&ctx),
-        None => false,
+    let inst = instance_slot().lock().unwrap().clone();
+    let dev = device_slot().lock().unwrap().clone();
+    unsafe {
+        gstvk::gst_vulkan_handle_context_query(
+            element.as_ptr() as *mut _,
+            query.as_mut_ptr() as *mut _,
+            std::ptr::null_mut(),
+            inst.as_ref().map_or(std::ptr::null_mut(), |i| i.as_ptr()) as *mut _,
+            dev.as_ref().map_or(std::ptr::null_mut(), |d| d.as_ptr()) as *mut _,
+        ) != gst::glib::ffi::GFALSE
     }
 }
 
-/// Wait up to `timeout` for the downstream encoder's `GstVulkanDevice` to be absorbed.
+/// Wait up to `timeout` for our shared `GstVulkanDevice` to be available.
 ///
 /// The encoder shares its device via a `GstContext` delivered to `set_context` on the
 /// streaming thread, which races the compositor thread that allocates our Vulkan output
