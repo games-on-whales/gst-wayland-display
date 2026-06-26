@@ -111,6 +111,25 @@ pub fn shared_device() -> Option<VulkanDevice> {
     device_slot().lock().unwrap().clone()
 }
 
+/// Wait up to `timeout` for the downstream encoder's `GstVulkanDevice` to be absorbed.
+///
+/// The encoder shares its device via a `GstContext` delivered to `set_context` on the
+/// streaming thread, which races the compositor thread that allocates our Vulkan output
+/// buffer. Polling here lets the allocation wait for the device to arrive instead of
+/// failing when it merely hasn't been shared *yet*. Returns `None` if it never arrives.
+pub fn wait_for_shared_device(timeout: std::time::Duration) -> Option<VulkanDevice> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(dev) = shared_device() {
+            return Some(dev);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Extract the raw `VkInstance`/`VkPhysicalDevice`/`VkDevice` + a graphics-capable queue
 /// family from the (shared) `GstVulkanDevice`.
 pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {

@@ -168,3 +168,46 @@ fn supported_nv12_modifiers_nonempty() {
         "expected a non-empty NV12 export modifier set for {node} (minor {minor:?})"
     );
 }
+
+/// The Vulkan-encode happy path: the source hands `vulkanh264enc` a shared-device
+/// NV12 `memory:VulkanImage` and drives it to EOS. Needs an nvidia GPU (the only
+/// `vulkanh264enc`-capable driver in our fleet).
+#[test]
+#[ignore = "needs an nvidia GPU with vulkanh264enc; run via ci/harness.sh gpu"]
+fn nvidia_vulkan_encode_to_eos() {
+    init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no nvidia render node")
+    };
+    if !have("vulkanh264enc") {
+        skip!("no vulkanh264enc (needs Vulkan video-encode)");
+    }
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=20 ! vulkanh264enc ! fakesink"
+    ))
+    .expect("nvidia Vulkan encode");
+}
+
+/// Regression for the device-sharing race: forcing `memory:VulkanImage` with **no**
+/// encoder downstream means the source can never absorb a shared `GstVulkanDevice`.
+/// This used to abort the process with a Rust panic in the compositor thread
+/// (`GsVulkanBuf .expect("...no shared GstVulkanDevice?")`). It must now wait for the
+/// device and, when it never arrives, stop with a clean bus error instead of panicking.
+#[test]
+#[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
+fn vulkan_without_encoder_errors_not_panics() {
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    let res = run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=5 ! \
+         video/x-raw(memory:VulkanImage),format=NV12,width=320,height=240 ! fakesink"
+    ));
+    // A clean bus error (Err) is the pass condition; reaching EOS would be wrong, and a
+    // panic/abort would crash the test binary rather than return here at all.
+    assert!(
+        res.is_err(),
+        "expected a clean error with no encoder downstream, got EOS"
+    );
+}

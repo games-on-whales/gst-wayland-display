@@ -3,6 +3,7 @@ use gst_video::VideoInfo;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::input::AxisSource;
 use smithay::backend::input::TouchSlot;
+use smithay::backend::SwapBuffersError;
 use smithay::backend::renderer::ImportEgl;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::gbm::BufferObjectFlags;
@@ -386,10 +387,34 @@ pub(crate) fn apply_video_info(
             }
             GstVideoInfo::VULKAN(params) => {
                 let node = render_node.unwrap();
-                let allocator =
-                    GsVulkanBuf::new(&mut state.renderer, node, params.video_info, params.profile)
-                        .expect("Failed to create GsVulkanBuf (no shared GstVulkanDevice?)");
-                state.output_buffer = Some(GsBufferType::VULKAN(allocator));
+                // The downstream encoder shares its GstVulkanDevice via a GstContext
+                // absorbed in set_context on the *streaming* thread, which races this
+                // (compositor-thread) allocation. Wait for the device to arrive instead
+                // of panicking when it merely hasn't been shared yet. If it never comes,
+                // leave output_buffer unset -- the render loop turns that into a clean
+                // FlowError rather than aborting the process.
+                if crate::utils::vulkan_share::wait_for_shared_device(Duration::from_secs(5))
+                    .is_some()
+                {
+                    match GsVulkanBuf::new(
+                        &mut state.renderer,
+                        node,
+                        params.video_info,
+                        params.profile,
+                    ) {
+                        Some(allocator) => {
+                            state.output_buffer = Some(GsBufferType::VULKAN(allocator))
+                        }
+                        None => tracing::error!(
+                            "Failed to create Vulkan output buffer despite a shared GstVulkanDevice"
+                        ),
+                    }
+                } else {
+                    tracing::error!(
+                        "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder \
+                         never shared its device. Cannot produce memory:VulkanImage output."
+                    );
+                }
             }
             #[cfg(feature = "cuda")]
             GstVideoInfo::CUDA(base_info) => {
@@ -514,6 +539,19 @@ pub(crate) fn init(
                             Some(ref tracer) => Some(tracer.trace("render")),
                             None => None,
                         };
+                        // apply_video_info may have been unable to set up the output buffer
+                        // (e.g. a downstream Vulkan encoder that never shared its
+                        // GstVulkanDevice). Fail the frame cleanly instead of letting
+                        // create_frame() panic on the missing buffer.
+                        if state.output_buffer.is_none() {
+                            let _ = buffer_sender.send(Err(SwapBuffersError::TemporaryFailure(
+                                Box::<dyn std::error::Error + Send + Sync>::from(
+                                    "no output buffer: downstream did not share a GstVulkanDevice",
+                                ),
+                            )));
+                            state.should_quit = true;
+                            return;
+                        }
                         if let Err(_) = match state.create_frame() {
                             Ok((buf, render_result)) => {
                                 render_result
