@@ -876,16 +876,13 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
         let cuda_ctx = settings.cuda_context.as_ref().unwrap().lock().unwrap();
 
-        // Let's get the pool from the query, if it's not there, we'll create one
-        let pools = query.allocation_pools();
-        let (pool, update_pool, size, min, max) = if pools.is_empty() {
-            tracing::info!("No allocation pools, creating one");
-            let video_info = VideoInfo::from_caps(outcaps.unwrap())?;
-            let size = video_info.size() as u32;
-            (CUDABufferPool::new(&cuda_ctx), false, size, 0, 0)
-        } else {
+        // Let's get the pool from the query, if it's not there, we'll create one.
+        // `allocation_pools()` is an iterator as of gstreamer-rs 0.24; bind the
+        // first item to a local so the query borrow is dropped before we mutate
+        // the query further down.
+        let first_pool = query.allocation_pools().next();
+        let (pool, update_pool, size, min, max) = if let Some((pool, size, min, max)) = first_pool {
             tracing::info!("Found existing allocation pools");
-            let (pool, size, min, max) = pools.get(0).unwrap();
             let wrapped_pool = match pool {
                 Some(pool) => match CUDABufferPool::from(pool.as_ptr()) {
                     Ok(pool) => Ok(pool),
@@ -903,7 +900,12 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     CUDABufferPool::new(&cuda_ctx)
                 }
             };
-            (wrapped_pool, true, *size, *min, *max)
+            (wrapped_pool, true, size, min, max)
+        } else {
+            tracing::info!("No allocation pools, creating one");
+            let video_info = VideoInfo::from_caps(outcaps.unwrap())?;
+            let size = video_info.size() as u32;
+            (CUDABufferPool::new(&cuda_ctx), false, size, 0, 0)
         };
 
         match pool {
