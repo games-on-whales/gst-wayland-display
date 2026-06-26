@@ -18,10 +18,13 @@ Tested on gst 1.28.4 and 1.29.1. Upstream fix pending.
 
 ## Building the patched gstreamer
 
+The dev container (`.devcontainer/Dockerfile`) builds this automatically — see
+[`CONTRIBUTING.md`](../CONTRIBUTING.md). The manual recipe below documents what
+it does.
+
 Built against the `gstreamer` monorepo at tag **1.28.4** (also tested on
-1.29.1). Note the prebuilt `ghcr.io/games-on-whales/gstreamer:1.26.7` image
-used by the devcontainer does **not** ship `vulkanh264enc` — the Vulkan-encode
-path needs a hand-built gstreamer as below.
+1.29.1). `gstreamer-rs` 0.25 needs the GStreamer C library **>= 1.28**, which no
+distro (or games-on-whales) image ships yet — so it must be built from source.
 
 Build deps:
 
@@ -57,7 +60,9 @@ Two gotchas:
    *silently absent*. Point `PKG_CONFIG_PATH` at a newer `vulkan.pc` (a
    `VK_HEADER_VERSION` 341 / 1.4.341 set works) *first* so meson's `vulkan_dep`
    probe sets `GST_VULKAN_HAVE_VIDEO_EXTENSIONS=1`.
-2. With `auto_features=disabled`, `gst-plugins-bad/docs/meson.build` needs an
-   early `if not get_option('doc').allowed() subdir_done() endif` or the
-   `plugins_cache_generator` target goes missing. (gst-interpipe, if built in
-   the same tree, likewise needs `-Denable-gtk-doc=false`.)
+2. With `auto_features=disabled`, **every** subproject's `docs/meson.build`
+   (gst-plugins-base, -bad, -good, gst-rtsp-server, the core `gstreamer` tree…)
+   references an undefined `plugins_cache_generator` and aborts configure. Prepend
+   `if not get_option('doc').allowed() subdir_done() endif` to each
+   `subprojects/*/docs/meson.build` (and `docs/meson.build`). (gst-interpipe, if
+   built in the same tree, likewise needs `-Denable-gtk-doc=false`.)
