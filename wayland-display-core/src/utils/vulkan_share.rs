@@ -111,6 +111,26 @@ pub fn shared_device() -> Option<VulkanDevice> {
     device_slot().lock().unwrap().clone()
 }
 
+/// Proactively pull the downstream encoder's `GstVulkanDevice` via a context query.
+///
+/// `vulkanh264enc` only *pushes* its `gst.vulkan.instance` context via `set_context`; it
+/// never pushes its device. But, like every gst-vulkan element, it *answers* a
+/// `gst.vulkan.device` context query with the device it created. Passively waiting for
+/// `set_context` therefore never yields a device in a direct pipeline -- we have to query
+/// for it. Send the query down `pad`'s peer, absorb the answer, and return whether a device
+/// is now shared.
+pub fn query_downstream_device(pad: &gst::Pad) -> bool {
+    use gst::prelude::*;
+    let mut query = gst::query::Context::new("gst.vulkan.device");
+    if !pad.peer_query(&mut query) {
+        return false;
+    }
+    match query.context_owned() {
+        Some(ctx) => handle_set_context(&ctx),
+        None => false,
+    }
+}
+
 /// Wait up to `timeout` for the downstream encoder's `GstVulkanDevice` to be absorbed.
 ///
 /// The encoder shares its device via a `GstContext` delivered to `set_context` on the

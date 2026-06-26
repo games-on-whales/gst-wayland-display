@@ -949,6 +949,18 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             .features(0)
             .is_some_and(|f| f.contains("memory:VulkanImage"));
         if is_vulkan {
+            // Proactively harvest the downstream encoder's GstVulkanDevice. vulkanh264enc
+            // answers a `gst.vulkan.device` context query but only ever *pushes* its
+            // instance context via set_context, so in a direct pipeline the device must be
+            // pulled here -- otherwise the compositor never gets a shared device to mint the
+            // encode-src VulkanImage on, and the Vulkan-encode path can't allocate.
+            if let Some(srcpad) = self.obj().static_pad("src") {
+                if waylanddisplaycore::utils::vulkan_share::query_downstream_device(&srcpad) {
+                    tracing::info!(
+                        "waylandsrc: harvested the downstream encoder's GstVulkanDevice via context query"
+                    );
+                }
+            }
             let base_video_info =
                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
             let video_info =

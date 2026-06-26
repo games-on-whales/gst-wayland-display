@@ -1,9 +1,9 @@
 use super::{Command, DrmFormat, GstVideoInfo};
 use gst_video::VideoInfo;
+use smithay::backend::SwapBuffersError;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::input::AxisSource;
 use smithay::backend::input::TouchSlot;
-use smithay::backend::SwapBuffersError;
 use smithay::backend::renderer::ImportEgl;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::gbm::BufferObjectFlags;
@@ -544,11 +544,12 @@ pub(crate) fn init(
                         // GstVulkanDevice). Fail the frame cleanly instead of letting
                         // create_frame() panic on the missing buffer.
                         if state.output_buffer.is_none() {
-                            let _ = buffer_sender.send(Err(SwapBuffersError::TemporaryFailure(
-                                Box::<dyn std::error::Error + Send + Sync>::from(
+                            let _ =
+                                buffer_sender.send(Err(SwapBuffersError::TemporaryFailure(Box::<
+                                    dyn std::error::Error + Send + Sync,
+                                >::from(
                                     "no output buffer: downstream did not share a GstVulkanDevice",
-                                ),
-                            )));
+                                ))));
                             state.should_quit = true;
                             return;
                         }
