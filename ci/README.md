@@ -32,9 +32,12 @@ ci/harness.sh -v              # stream sub-command output
 | AMD    | `amdgpu`           | `vah265enc` (NV12 dmabuf, LINEAR) |
 | Intel  | `i915`/`xe`        | `vah265lpenc` (NV12 dmabuf, Y-tiled; low-power only) |
 | Nvidia | `nvidia`           | `dmabuftocuda ! nvh265enc` (needs the `cuda` feature) |
+| any    | any with `vulkanh264enc` | `vulkan=true ! vulkanh264enc` (shared-device NV12 `memory:VulkanImage`, zero-copy) |
 
 A vendor with no render node, or whose encoder element is missing, is skipped
-(reported, not failed).
+(reported, not failed). The Vulkan-encode row is vendor-agnostic — it runs
+wherever `vulkanh264enc` registers (an nvidia render node, or Intel with
+`ANV_VIDEO_ENCODE=1`); the `integration` phase prefers the nvidia node.
 
 ## Host prerequisites
 
