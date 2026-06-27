@@ -427,6 +427,25 @@ pub fn alloc_encode_src_buffer(
         let profiles = [profile_info];
         let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
+        // RX 9070 / GFX12 (RDNA4) workaround: radv mishandles a LINEAR->tiled (different
+        // swizzle mode) vkCmdCopyImage on GFX12 (cf. Mesa 26.0.2 "radv: fix copying images
+        // with different swizzle modes on SDMA7"), corrupting the encoder's tiled NV12 input
+        // (green band / shifted image). Allocating the encode-src LINEAR makes the
+        // scratch->encode-src copy LINEAR->LINEAR (no swizzle change), avoiding that path --
+        // *if* the GFX12 VCN encoder accepts a linear input image. Opt-in (the tiled default
+        // works on RDNA3 and on a fixed radv); falls back to tiled if the linear alloc fails.
+        let linear_encsrc = std::env::var("WOLF_VULKAN_LINEAR_ENCSRC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let tiling = if linear_encsrc {
+            tracing::info!(
+                "vulkan_share: encode-src tiling=LINEAR (WOLF_VULKAN_LINEAR_ENCSRC) -- copy is \
+                 LINEAR->LINEAR, avoids the GFX12 swizzle-mode copy"
+            );
+            vk::ImageTiling::LINEAR
+        } else {
+            vk::ImageTiling::OPTIMAL
+        };
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
@@ -438,7 +457,7 @@ pub fn alloc_encode_src_buffer(
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
+            .tiling(tiling)
             .usage(
                 vk::ImageUsageFlags::TRANSFER_DST
                     | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR),
