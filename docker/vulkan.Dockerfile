@@ -38,9 +38,16 @@ RUN dnf install -y dnf-plugins-core 'dnf-command(builddep)' && \
 # Fedora's stock mesa strips the patent codecs, so the RADV device exposes no
 # video-encode queue and vulkanh264enc fails at runtime. The freeworld build
 # restores it. (No-op for nvidia, which uses its own ICD.)
+#
+# MUST pin .x86_64 + pass --allowerasing: freeworld is a drop-in replacement that
+# CONFLICTS with the stock x86_64 mesa-vulkan-drivers. Without --allowerasing dnf
+# can't erase the stock x86_64 driver, so it silently installs only the non-
+# conflicting i686 freeworld package — leaving the 64-bit RADV ICD stock (no
+# encode queue) and vulkanh264enc absent. --skip-unavailable keeps nvidia builds
+# (where the package may be absent) a no-op.
 RUN dnf install -y \
       "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" && \
-    dnf install -y --skip-unavailable mesa-vulkan-drivers-freeworld && \
+    dnf install -y --allowerasing --skip-unavailable mesa-vulkan-drivers-freeworld.x86_64 && \
     dnf clean all
 
 # --- Patched GStreamer 1.28.4 -> /opt/gst -----------------------------------
