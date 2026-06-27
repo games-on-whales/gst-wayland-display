@@ -987,6 +987,15 @@ impl VulkanNv12 {
         if strides.is_empty() {
             return Err("no stride".into());
         }
+        // Diagnostic for cross-API import layout bugs (e.g. RX 9070 DCC "jumping"): the
+        // actual modifier + per-plane strides/offsets the import builds the VkImage from.
+        tracing::debug!(
+            "VulkanNv12 import: format={:?} modifier={modifier:#x} extent={}x{} strides={strides:?} offsets={offsets:?} planes={}",
+            rgba.format().code,
+            self.width,
+            self.height,
+            strides.len(),
+        );
         let src_fd = rgba
             .handles()
             .next()

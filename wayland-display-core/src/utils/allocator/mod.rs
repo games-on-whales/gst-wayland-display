@@ -144,6 +144,41 @@ pub struct GsNv12Buf {
     video_info: VideoInfoDmaDrm,
 }
 
+/// True if `m` is an AMD `AMD_FMT_MOD` modifier with DCC enabled: vendor byte `0x02`
+/// (`DRM_FORMAT_MOD_VENDOR_AMD`) and the DCC bit (`AMD_FMT_MOD_DCC`, shift 13) set, e.g.
+/// the RX 9070 (GFX12/RDNA4) preferred `NV12:0x0200000000082305`. A DCC-compressed RGBA
+/// render target is mis-sampled when `VulkanNv12` imports it cross-API on radv, so we keep
+/// such modifiers as a last resort (see [`rgba_modifier_order`]).
+fn is_amd_dcc_modifier(m: Modifier) -> bool {
+    let v: u64 = m.into();
+    ((v >> 56) & 0xff) == 0x02 && ((v >> 13) & 0x1) == 1
+}
+
+/// Order RGBA render-target modifier candidates so `VulkanNv12`'s cross-API import lands on
+/// a sampleable buffer.
+///   - Nvidia: keep the GPU's block-linear preferred modifier first (forcing LINEAR breaks
+///     its self-import); LINEAR last as a fallback.
+///   - Everyone else (AMD/Intel): LINEAR first, then plain tiled, then **DCC last**. On the
+///     RX 9070 / GFX12 the preferred modifier is DCC; without pushing DCC behind the other
+///     candidates, a failed LINEAR allocation falls straight back to the DCC modifier that
+///     the import mis-samples (image "jumps"/shifts, cursor dropped). DCC stays in the list
+///     as a last resort so we never end up with *no* buffer.
+fn rgba_modifier_order(mods: &[Modifier], is_nvidia: bool) -> Vec<Modifier> {
+    if is_nvidia {
+        return mods
+            .iter()
+            .copied()
+            .chain(std::iter::once(Modifier::Linear))
+            .collect();
+    }
+    let (dcc, non_dcc): (Vec<Modifier>, Vec<Modifier>) =
+        mods.iter().copied().partition(|m| is_amd_dcc_modifier(*m));
+    std::iter::once(Modifier::Linear)
+        .chain(non_dcc)
+        .chain(dcc)
+        .collect()
+}
+
 impl GsNv12Buf {
     pub fn new(
         renderer: &mut GlesRenderer,
@@ -176,16 +211,7 @@ impl GsNv12Buf {
             GPUDevice::try_from(render_node).map(|d| *d.pci_vendor() == PCIVendor::NVIDIA),
             Ok(true)
         );
-        let order: Vec<Modifier> = if is_nvidia {
-            mods.iter()
-                .copied()
-                .chain(std::iter::once(Modifier::Linear))
-                .collect()
-        } else {
-            std::iter::once(Modifier::Linear)
-                .chain(mods.iter().copied())
-                .collect()
-        };
+        let order = rgba_modifier_order(&mods, is_nvidia);
         let rgba = order
             .iter()
             .find_map(|m| dma.create_buffer(w, h, DrmFourcc::Abgr8888, &[*m]).ok())?;
@@ -240,19 +266,14 @@ impl GsVulkanBuf {
             GPUDevice::try_from(render_node).map(|d| *d.pci_vendor() == PCIVendor::NVIDIA),
             Ok(true)
         );
-        let order: Vec<Modifier> = if is_nvidia {
-            mods.iter()
-                .copied()
-                .chain(std::iter::once(Modifier::Linear))
-                .collect()
-        } else {
-            std::iter::once(Modifier::Linear)
-                .chain(mods.iter().copied())
-                .collect()
-        };
+        let order = rgba_modifier_order(&mods, is_nvidia);
         let rgba = order
             .iter()
             .find_map(|m| dma.create_buffer(w, h, DrmFourcc::Abgr8888, &[*m]).ok())?;
+        tracing::debug!(
+            "GsVulkanBuf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
+            rgba.format().modifier
+        );
 
         // The shared device must already have been absorbed from a GstContext.
         let dev = crate::utils::vulkan_share::shared_device()?;
