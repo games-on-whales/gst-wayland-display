@@ -1470,6 +1470,16 @@ unsafe fn create_encode_output(
         false,
     )?;
 
+    // Diagnostic for the RX 9070 green-bar/jump report: if the encoder's pool gives us an
+    // encode-src image padded beyond width*height*3/2 (e.g. RDNA4 row-alignment), our copy
+    // fills only `height` rows and the padding stays zeroed -> green at the bottom.
+    let tight_nv12 = width as u64 * height as u64 * 3 / 2;
+    tracing::debug!(
+        "encode-src slot: req={width}x{height} NV12; out_img mem={} scratch mem={} tight={tight_nv12}",
+        device.get_image_memory_requirements(out_img).size,
+        device.get_image_memory_requirements(s_img).size,
+    );
+
     let cmd = device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
             .command_pool(cmd_pool)
