@@ -77,6 +77,26 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
 const RING: usize = 8;
+
+/// Number of ring slots actually cycled (`<= RING`; the per-slot arrays stay sized at
+/// `RING`). Override with `WOLF_VULKAN_RING` for diagnosis -- e.g. `WOLF_VULKAN_RING=1` pins
+/// a single encode-src slot, isolating whether per-slot encode-src images (address-dependent
+/// tiling/swizzle) cause the RX 9070 / GFX12 "jumping" image. The compositor renders into one
+/// stable RGBA buffer, so every slot converts identical content -- if a single slot is stable
+/// but 8 jump, the encode-src pool images differ per slot. Read once.
+fn ring_used() -> usize {
+    use std::sync::OnceLock;
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        let n = std::env::var("WOLF_VULKAN_RING")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| (1..=RING).contains(&n))
+            .unwrap_or(RING);
+        tracing::debug!("VulkanNv12: ring_used={n} (RING={RING})");
+        n
+    })
+}
 /// PCI vendor id for Nvidia -- its CUDA consumer ignores implicit dma-buf fences.
 const VENDOR_NVIDIA: u32 = 0x10de;
 /// `VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR` -- the layout `vulkanh264enc` expects its input.
@@ -679,7 +699,7 @@ impl VulkanNv12 {
 
         // pick the next export ring slot and reclaim its previous (RING-frames-old) work
         let idx = self.next;
-        self.next = (self.next + 1) % self.outputs.len();
+        self.next = (self.next + 1) % ring_used().min(self.outputs.len());
         if self.outputs[idx].in_flight {
             // This fence was signalled RING frames ago, so this is a no-op wait in steady
             // state -- it just lets us safely recycle the slot's cmd buffer.
