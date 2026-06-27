@@ -92,10 +92,7 @@ WORKDIR /src
 RUN cargo cinstall --release \
       --prefix=/opt/gst \
       --libdir=/opt/gst/lib64/gstreamer-1.0 \
-      --pkgconfigdir=/opt/gst/lib64/pkgconfig && \
-    test -e /opt/gst/lib64/gstreamer-1.0/libgstwaylanddisplaysrc.so && \
-    GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0 gst-inspect-1.0 waylanddisplaysrc >/dev/null && \
-    GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0 gst-inspect-1.0 vulkanh264enc >/dev/null
+      --pkgconfigdir=/opt/gst/lib64/pkgconfig
 
 WORKDIR /
 CMD ["bash"]

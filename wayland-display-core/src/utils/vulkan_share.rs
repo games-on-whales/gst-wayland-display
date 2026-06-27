@@ -190,7 +190,9 @@ unsafe fn physical_index_for_minor(
         );
         return Some(i as u32);
     }
-    tracing::warn!("vulkan_share: NO video-encode-capable physical device found; using index 0 (encode will likely fail)");
+    tracing::warn!(
+        "vulkan_share: NO video-encode-capable physical device found; using index 0 (encode will likely fail)"
+    );
     Some(0)
 }
 
