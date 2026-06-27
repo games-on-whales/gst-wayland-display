@@ -76,10 +76,11 @@ const RGBA_TO_NV12_SPV: &[u8] = include_bytes!("shaders/rgba_to_nv12.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
-// Max ring depth (array sizing) and the default active depth. Override the *active*
-// depth at runtime with WOLF_VULKAN_RING (1..=RING) via ring_used(); 8 is the only
-// depth proven not to starve the downstream encoder's buffer references.
-const RING: usize = 8;
+// Ring depth: slots cycled to pipeline convert+encode (array sizing + default active depth).
+// 4 is enough fan-out for the downstream encoder's buffer references (1 starves; 4 and 8 are
+// indistinguishable in practice). Override the active depth at runtime with WOLF_VULKAN_RING
+// (1..=RING) via ring_used().
+const RING: usize = 4;
 
 /// Optional path for a one-shot debug dump of the converter's NV12 output (the LINEAR
 /// compute scratch, *before* the tiled encode-src copy) as raw NV12. Set
