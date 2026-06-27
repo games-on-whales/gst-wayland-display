@@ -119,27 +119,79 @@ fn instance_slot() -> &'static Mutex<Option<VulkanInstance>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// Index of the physical device whose DRM render/primary minor matches `target_minor`, so on
-/// a multi-GPU host we share the GPU that owns the compositor's render node. Falls back to 0.
+// VK_QUEUE_VIDEO_ENCODE_BIT_KHR — the encoder (gst_vulkan_encoder_create_from_queue) requires a
+// queue family with this bit, and gst_vulkan_device_choose_queues only opens an encode queue if the
+// chosen physical device has one. Software devices (llvmpipe) do NOT, so a device without this bit
+// is useless for the encode path and makes vulkanh264enc fail to link.
+const VK_QUEUE_VIDEO_ENCODE_BIT_KHR: vk::QueueFlags = vk::QueueFlags::from_raw(0x0000_0040);
+
+/// Whether `dev` exposes a video-encode queue family (i.e. it can host `vulkanh264enc`).
+unsafe fn has_video_encode_queue(ash_inst: &ash::Instance, dev: vk::PhysicalDevice) -> bool {
+    ash_inst
+        .get_physical_device_queue_family_properties(dev)
+        .iter()
+        .any(|q| q.queue_flags.contains(VK_QUEUE_VIDEO_ENCODE_BIT_KHR))
+}
+
+unsafe fn device_name(ash_inst: &ash::Instance, dev: vk::PhysicalDevice) -> String {
+    let mut p2 = vk::PhysicalDeviceProperties2::default();
+    ash_inst.get_physical_device_properties2(dev, &mut p2);
+    let bytes = &p2.properties.device_name;
+    let len = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+    let slice = std::slice::from_raw_parts(bytes.as_ptr() as *const u8, len);
+    String::from_utf8_lossy(slice).into_owned()
+}
+
+/// Pick the physical device to back our shared encode device. We must NEVER hand the encoder a
+/// device that can't video-encode (e.g. llvmpipe), so encode capability is a hard requirement:
+/// prefer the encode-capable GPU whose DRM render/primary minor matches the compositor's render
+/// node (`target_minor`); otherwise the first encode-capable GPU. Only if none can encode do we
+/// fall back to index 0. (The old code fell back to a bare index 0, which — since Vulkan
+/// enumeration order isn't guaranteed — could land on llvmpipe and make `vulkanh264enc` fail to
+/// link, intermittently across restarts.)
 unsafe fn physical_index_for_minor(
     ash_inst: &ash::Instance,
     target_minor: Option<u32>,
 ) -> Option<u32> {
     let devices = ash_inst.enumerate_physical_devices().ok()?;
+    if devices.is_empty() {
+        return None;
+    }
+    let encode_capable: Vec<usize> = (0..devices.len())
+        .filter(|&i| has_video_encode_queue(ash_inst, devices[i]))
+        .collect();
+
+    // Prefer an encode-capable device matching the compositor's render minor.
     if let Some(minor) = target_minor {
-        for (i, &d) in devices.iter().enumerate() {
+        for &i in &encode_capable {
+            let d = devices[i];
             let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
             ash_inst.get_physical_device_properties2(d, &mut p2);
             if (drm.has_render != 0 && drm.render_minor as i64 == minor as i64)
                 || (drm.has_primary != 0 && drm.primary_minor as i64 == minor as i64)
             {
+                tracing::info!(
+                    "vulkan_share: selected physical device {i} '{}' (matches render minor {minor}, video-encode capable)",
+                    device_name(ash_inst, d)
+                );
                 return Some(i as u32);
             }
         }
-        tracing::warn!("vulkan_share: no physical device matched render minor {minor}; using 0");
+        tracing::warn!(
+            "vulkan_share: no encode-capable physical device matched render minor {minor}; \
+             falling back to first encode-capable GPU"
+        );
     }
-    if devices.is_empty() { None } else { Some(0) }
+    if let Some(&i) = encode_capable.first() {
+        tracing::info!(
+            "vulkan_share: selected physical device {i} '{}' (first video-encode capable)",
+            device_name(ash_inst, devices[i])
+        );
+        return Some(i as u32);
+    }
+    tracing::warn!("vulkan_share: NO video-encode-capable physical device found; using index 0 (encode will likely fail)");
+    Some(0)
 }
 
 /// Create (once) the `GstVulkanInstance` + `GstVulkanDevice` that *we* own, on the GPU
