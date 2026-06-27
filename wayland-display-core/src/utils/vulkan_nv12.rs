@@ -76,7 +76,24 @@ const RGBA_TO_NV12_SPV: &[u8] = include_bytes!("shaders/rgba_to_nv12.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
-const RING: usize = 8;
+const RING: usize = 4;
+
+/// Optional path for a one-shot debug dump of the converter's NV12 output (the LINEAR
+/// compute scratch, *before* the tiled encode-src copy) as raw NV12. Set
+/// `WOLF_VULKAN_DUMP=<file>` to capture one frame -- if it's clean, the RX 9070 green-bar/
+/// jump corruption is introduced downstream (the tiled copy or the encoder), not our
+/// conversion. Read once; off (zero overhead) when unset.
+fn dump_path() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static P: OnceLock<Option<String>> = OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("WOLF_VULKAN_DUMP")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+static DUMP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Number of ring slots actually cycled (`<= RING`; the per-slot arrays stay sized at
 /// `RING`). Override with `WOLF_VULKAN_RING` for diagnosis -- e.g. `WOLF_VULKAN_RING=1` pins
@@ -988,7 +1005,121 @@ impl VulkanNv12 {
             self.device.reset_fences(&[fence])?;
         }
 
+        // Debug: one-shot readback of the converter's NV12 output to a file. `compute_target`
+        // (the LINEAR scratch on the encode-src path) holds exactly what the compute wrote,
+        // before the tiled encode-src copy -- so a clean dump localises the green-bar/jump to
+        // the tiled copy or the encoder. Off unless WOLF_VULKAN_DUMP is set; once, a few
+        // frames in (let the scene settle). Failures are logged, never fatal.
+        if let Some(path) = dump_path() {
+            if DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 20 {
+                self.device.device_wait_idle().ok();
+                match self.dump_nv12(compute_target, self.width, self.height, path) {
+                    Ok(()) => tracing::info!(
+                        "VulkanNv12: dumped converter NV12 {}x{} (raw NV12) to {path} -- view: \
+                         ffmpeg -f rawvideo -pix_fmt nv12 -s {}x{} -i {path} -frames 1 out.png",
+                        self.width,
+                        self.height,
+                        self.width,
+                        self.height
+                    ),
+                    Err(e) => tracing::warn!("VulkanNv12: NV12 dump failed: {e}"),
+                }
+            }
+        }
+
         self.cur = idx;
+        Ok(())
+    }
+
+    /// One-shot debug readback of a multiplanar NV12 image (must be in TRANSFER_SRC_OPTIMAL
+    /// and have TRANSFER_SRC usage -- true for the compute scratch) into a host buffer, then
+    /// write tight raw NV12 (`w*h` Y plane + `w*h/2` interleaved UV) to `path`.
+    unsafe fn dump_nv12(&self, img: vk::Image, w: u32, h: u32, path: &str) -> Result<(), Err> {
+        let y_size = (w * h) as u64;
+        let total = y_size + (w as u64 * h as u64 / 2);
+        let buf = self.device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(total)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST),
+            None,
+        )?;
+        let mr = self.device.get_buffer_memory_requirements(buf);
+        let mt = mem_type(
+            &self.memp,
+            mr.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let mem = self.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(mr.size)
+                .memory_type_index(mt),
+            None,
+        )?;
+        self.device.bind_buffer_memory(buf, mem, 0)?;
+
+        let cmd = self.device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.cmd_pool)
+                .command_buffer_count(1),
+        )?[0];
+        self.device
+            .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+        let regions = [
+            vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::PLANE_0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                }),
+            vk::BufferImageCopy::default()
+                .buffer_offset(y_size)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::PLANE_1)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: w / 2,
+                    height: h / 2,
+                    depth: 1,
+                }),
+        ];
+        self.device.cmd_copy_image_to_buffer(
+            cmd,
+            img,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buf,
+            &regions,
+        );
+        self.device.end_command_buffer(cmd)?;
+        let fence = self
+            .device
+            .create_fence(&vk::FenceCreateInfo::default(), None)?;
+        let cbs = [cmd];
+        self.device.queue_submit(
+            self.queue,
+            &[vk::SubmitInfo::default().command_buffers(&cbs)],
+            fence,
+        )?;
+        self.device.wait_for_fences(&[fence], true, u64::MAX)?;
+
+        let ptr = self
+            .device
+            .map_memory(mem, 0, total, vk::MemoryMapFlags::empty())? as *const u8;
+        let res = std::fs::write(path, std::slice::from_raw_parts(ptr, total as usize));
+        self.device.unmap_memory(mem);
+
+        self.device.destroy_fence(fence, None);
+        self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+        self.device.destroy_buffer(buf, None);
+        self.device.free_memory(mem, None);
+        res?;
         Ok(())
     }
 
