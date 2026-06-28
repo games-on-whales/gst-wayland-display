@@ -12,20 +12,19 @@ jobs:
     name: harness (lint · build · unit)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/games-on-whales/gstreamer:1.26.7
+      # The project's own image: patched GStreamer 1.28 at /opt/gst (gstreamer-rs
+      # 0.25 needs >= 1.28; the old gstreamer:1.26.7 base is too old) plus all the
+      # build deps. PKG_CONFIG_PATH/LD_LIBRARY_PATH are baked into the image ENV.
+      image: ghcr.io/games-on-whales/gst-wayland-display:vulkan
     steps:
       - uses: actions/checkout@v4
 
       - name: System dependencies
-        # The gstreamer:1.26.7 base image is Fedora, so install build/link deps
-        # with dnf. gstreamer1-plugins-base-devel provides gstreamer-allocators-1.0
-        # (the gstreamer-rs -sys binding); the GPU runtime drivers are only needed
-        # for the self-skipping GPU phases, not lint/build/unit.
+        # Image already carries the gst-1.28 + link deps; only ensure the extras
+        # the harness's non-GPU phases need are present (idempotent on Fedora).
         run: |
           dnf install -y \
-            gcc gcc-c++ make pkgconf-pkg-config curl ca-certificates git \
-            openssl-devel libicu \
-            gstreamer1-devel gstreamer1-plugins-base-devel \
+            git openssl-devel libicu \
             wayland-devel libinput-devel libxkbcommon-devel mesa-libgbm-devel \
             mesa-libEGL-devel mesa-libGLES-devel systemd-devel clang clang-devel
 
