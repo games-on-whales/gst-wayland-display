@@ -5,6 +5,7 @@ Apply against a gstreamer monorepo checkout before building:
 
 ```
 git apply patches/vkh264enc-dpb-pool-in-new-sequence.patch
+git apply patches/vulkanh265enc.patch
 ```
 
 ## vkh264enc-dpb-pool-in-new-sequence.patch
@@ -15,6 +16,25 @@ git apply patches/vkh264enc-dpb-pool-in-new-sequence.patch
 Moves the call into `new_sequence`, after `gst_vulkan_encoder_start`.
 
 Tested on gst 1.28.4 and 1.29.1. Upstream fix pending.
+
+## vulkanh265enc.patch
+
+Adds a Vulkan **H.265/HEVC** video-encode element (`vulkanh265enc`), ported from
+the upstream `vulkanh264enc` (`GstH264Encoder` → new `GstH265Encoder` base +
+`vkh265enc` element). HEVC specifics: VPS+SPS+PPS (std structs use pointer
+sub-structs: profile-tier-level, DecPicBufMgr, per-slice ShortTermRefPicSet,
+VUI), POC-based picture order, segment-based slice headers, `no_output_of_prior_
+pics_flag` on IDR, CABAC-implicit (no entropy-mode flag, WPP/tiles off), and a
+2-slot DPB for single-reference P frames. Includes the same DPB-pool-in-
+`new_sequence` interpipe fix as the H.264 patch above.
+
+New files (`subprojects/gst-plugins-bad/ext/vulkan/`): `base/gsth265encoder.{c,h}`,
+`vkh265enc.{c,h}`; plus `meson.build` + `gstvulkan.c` registration. Apply *after*
+the H.264 patch (independent files; no conflict).
+
+Status: compiles + links + loads clean on 1.28.4; HEVC bitstream design
+roundtable-approved. Pending hardware validation on AMD (RADV
+`RADV_PERFTEST=video_encode`) before any upstream MR.
 
 (The Vulkan-encode path also needs the device to enable the external-memory
 extensions that `GstVulkanDevice` does not — `VK_KHR_external_memory_fd` etc. —

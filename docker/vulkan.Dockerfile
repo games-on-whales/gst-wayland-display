@@ -1,7 +1,8 @@
 # gst-wayland-display:vulkan
 #
 # A Fedora image carrying patched GStreamer 1.28.4 (Vulkan video encode enabled +
-# the vulkanh264enc DPB-pool patch) with the gst-wayland-display plugin installed.
+# the vulkanh264enc DPB-pool patch + the vulkanh265enc element) with the
+# gst-wayland-display plugin installed.
 # It is the single source of the gst-1.28.4-Vulkan + plugin build and serves as the
 # base image for wolf:vulkan (which compiles Wolf on top and inherits the plugin).
 #
@@ -53,10 +54,12 @@ RUN dnf install -y \
 
 # --- Patched GStreamer 1.28.4 -> /opt/gst -----------------------------------
 COPY patches/vkh264enc-dpb-pool-in-new-sequence.patch /tmp/dpb.patch
+COPY patches/vulkanh265enc.patch /tmp/h265.patch
 RUN git clone --depth 1 --branch ${GST_VERSION} \
       https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
     cd /tmp/gstreamer && \
     git apply /tmp/dpb.patch && \
+    git apply /tmp/h265.patch && \
     # auto_features=disabled leaves several subprojects' docs/meson.build referring
     # to an undefined plugins_cache_generator; short-circuit each when doc is off.
     for d in subprojects/*/docs/meson.build docs/meson.build; do \
@@ -83,7 +86,7 @@ RUN git clone --depth 1 --branch ${GST_VERSION} \
       -Dnls=disabled -Dgst-examples=disabled -Drs=disabled && \
     meson compile -C build && \
     meson install -C build && \
-    rm -rf /tmp/gstreamer /tmp/dpb.patch
+    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch
 
 ENV PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig \
     LD_LIBRARY_PATH=/opt/gst/lib64 \
