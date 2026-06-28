@@ -1135,7 +1135,8 @@ impl VulkanNv12 {
         // the tiled copy or the encoder. Off unless WOLF_VULKAN_DUMP is set; once, a few
         // frames in (let the scene settle). Failures are logged, never fatal.
         if let Some(path) = dump_path() {
-            if DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == dump_frame_target() {
+            if DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == dump_frame_target()
+            {
                 self.device.device_wait_idle().ok();
                 let pix = match self.fmt {
                     PixFmt::Nv12 => "nv12",
@@ -1730,9 +1731,10 @@ unsafe fn create_encode_output(
     height: u32,
     fmt: PixFmt,
 ) -> Result<Nv12Out, Err> {
-    let buffer =
-        crate::utils::vulkan_share::alloc_encode_src_buffer(gst_device, width, height, profile, fmt)
-            .ok_or("encode-src image allocation failed")?;
+    let buffer = crate::utils::vulkan_share::alloc_encode_src_buffer(
+        gst_device, width, height, profile, fmt,
+    )
+    .ok_or("encode-src image allocation failed")?;
     let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)
         .ok_or("encode-src buffer is not a single GstVulkanImageMemory")?;
 
