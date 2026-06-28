@@ -33,7 +33,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal \
-                --default-toolchain "${RUST_VERSION:-1.89.0}" --component rustfmt
+                --default-toolchain "${RUST_VERSION:-1.94.0}" --component rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Harness
