@@ -57,6 +57,11 @@ pub struct Settings {
     /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
     /// `GstVulkanDevice` (zero-copy into `vulkanh264enc`). Default off.
     vulkan: bool,
+    /// Tag the P010 10-bit output as HDR (BT.2100 PQ): BT.2020 primaries + SMPTE 2084 (PQ)
+    /// transfer + BT.2020 matrix colorimetry, plus static mastering-display-info and
+    /// content-light-level caps fields, so a downstream `vulkanh265enc` emits the matching
+    /// VUI + mastering/CLL SEI. Only affects the P010 path; NV12/SDR is unchanged. Default off.
+    hdr: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -298,6 +303,17 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("hdr")
+                    .nick("Tag P010 output as HDR (BT.2100 PQ)")
+                    .blurb(
+                        "On the P010 10-bit path, tag the output caps as HDR: BT.2020 primaries, \
+                         SMPTE 2084 (PQ) transfer and BT.2020 matrix colorimetry, plus static \
+                         mastering-display-info and content-light-level fields, and convert with \
+                         the BT.2020 matrix. A downstream vulkanh265enc then emits the matching \
+                         VUI + mastering/CLL SEI. No effect on NV12/SDR output. Default off.",
+                    )
+                    .default_value(false)
+                    .build(),
             ]
         });
 
@@ -369,6 +385,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let mut settings = self.settings.lock().unwrap();
                 settings.nv12 = value.get::<bool>().expect("Type checked upstream");
             }
+            "hdr" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.hdr = value.get::<bool>().expect("Type checked upstream");
+            }
             _ => unreachable!(),
         }
     }
@@ -410,6 +430,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "vulkan" => {
                 let settings = self.settings.lock().unwrap();
                 settings.vulkan.to_value()
+            }
+            "hdr" => {
+                let settings = self.settings.lock().unwrap();
+                settings.hdr.to_value()
             }
             _ => unreachable!(),
         }
@@ -471,11 +495,12 @@ impl ElementImpl for WaylandDisplaySrc {
 
             dmabuf_caps.merge(caps);
 
-            // NV12 memory:VulkanImage (the shared-device encode path; offered when `vulkan`
-            // is set and a downstream encoder shares its GstVulkanDevice).
+            // NV12/P010 memory:VulkanImage (the shared-device encode path; offered when
+            // `vulkan` is set and a downstream encoder shares its GstVulkanDevice). NV12 ⇒
+            // vulkanh264enc 8-bit; P010 ⇒ vulkanh265enc Main-10.
             let vulkan_caps = gst_video::VideoCapsBuilder::new()
                 .features(["memory:VulkanImage"])
-                .format(VideoFormat::Nv12)
+                .format_list([VideoFormat::Nv12, VideoFormat::P01010le])
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -585,11 +610,12 @@ impl WaylandDisplaySrc {
         caps: &gst::Caps,
         info: &VideoInfoDmaDrm,
     ) -> Result<(), gst::LoggableError> {
-        let is_nv12 = caps
+        let drm_format = caps
             .structure(0)
-            .and_then(|s| s.get::<String>("drm-format").ok())
-            .is_some_and(|f| f.starts_with("NV12"));
-        if !is_nv12 {
+            .and_then(|s| s.get::<String>("drm-format").ok());
+        let is_nv12 = drm_format.as_deref().is_some_and(|f| f.starts_with("NV12"));
+        let is_p010 = drm_format.as_deref().is_some_and(|f| f.starts_with("P010"));
+        if !is_nv12 && !is_p010 {
             return Ok(());
         }
         let (render_path, prefer_nv12) = {
@@ -603,18 +629,32 @@ impl WaylandDisplaySrc {
         };
         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&render_path);
         let modifier = info.modifier();
-        let exportable = waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(minor);
+        let (label, exportable) = if is_p010 {
+            (
+                "P010",
+                waylanddisplaycore::utils::vulkan_nv12::supported_p010_modifiers(minor),
+            )
+        } else {
+            (
+                "NV12",
+                waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(minor),
+            )
+        };
         let encoder_pref = waylanddisplaycore::utils::va_query::import_nv12_modifier(&render_path);
         tracing::info!(
-            "waylandsrc: NV12 export modifier {modifier:#x} on {render_path} \
+            "waylandsrc: {label} export modifier {modifier:#x} on {render_path} \
              (encoder imports {encoder_pref:#x?}, exportable {exportable:#x?})"
         );
         if !exportable.contains(&modifier) {
             return Err(gst::loggable_error!(
                 CAT,
-                "negotiated NV12 modifier {modifier:#x} is not Vulkan-exportable on \
+                "negotiated {label} modifier {modifier:#x} is not Vulkan-exportable on \
                  {render_path} (exportable: {exportable:#x?})"
             ));
+        }
+        // The encoder-modifier-match warning below is NV12/VA-specific; skip it for P010.
+        if is_p010 {
+            return Ok(());
         }
         // Direct `! vah265enc`: exporting anything but the encoder's own modifier makes it
         // re-import (and radeonsi-VA then fails). Behind interpipe (`nv12=true`) a
@@ -848,20 +888,92 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             caps
         };
 
+        // HDR (BT.2100 PQ) signalling for the P010 path. When `hdr` is set we stamp these
+        // onto the P010 output caps (dmabuf and memory:VulkanImage) so a downstream
+        // vulkanh265enc reads the colorimetry + static metadata from its input caps and emits
+        // the matching VUI + mastering-display / content-light-level SEI. The compositor
+        // content is 8-bit SDR; this is container/signalling (+ a BT.2020 conversion matrix),
+        // not real PQ tone-mapping. NV12/SDR caps are never touched.
+        //   colorimetry: bt2100-pq == primaries=bt2020, transfer=smpte2084, matrix=bt2020,
+        //                range=tv (the gst shorthand for BT.2100 PQ).
+        //   mastering-display-info: R:G:B:W chromaticity (x,y * 50000) + max:min luminance
+        //                (* 10000 cd/m^2) -> BT.2020 primaries, 1000 nit / 0.0001 nit.
+        //   content-light-level: MaxCLL:MaxFALL -> 1000 : 400.
+        let hdr = self.settings.lock().unwrap().hdr;
+        const HDR_COLORIMETRY: &str = "bt2100-pq";
+        const HDR_MASTERING: &str = "35400:14600:8500:39850:6550:2300:15635:16450:10000000:1";
+        const HDR_CLL: &str = "1000:400";
+
+        // P010 (10-bit 4:2:0) via the same Vulkan converter, for a downstream that asks for
+        // it (e.g. a Main-10 dmabuf encoder). Offered as a fallback after NV12/RGBA -- NV12
+        // stays the default; P010 is selected only when downstream constrains the format.
+        let p010_exportable =
+            waylanddisplaycore::utils::vulkan_nv12::supported_p010_modifiers(nv12_minor);
+        let mut p010_mods: Vec<u64> = Vec::new();
+        if p010_exportable.contains(&DRM_FORMAT_MOD_LINEAR) {
+            p010_mods.push(DRM_FORMAT_MOD_LINEAR);
+        }
+        p010_mods.extend(
+            p010_exportable
+                .iter()
+                .copied()
+                .filter(|m| *m != DRM_FORMAT_MOD_INVALID && *m != DRM_FORMAT_MOD_LINEAR),
+        );
+        for m in p010_mods {
+            let drm = if m == DRM_FORMAT_MOD_LINEAR {
+                "P010".to_string()
+            } else {
+                format!("P010:0x{m:016x}")
+            };
+            let mut b = gst_video::VideoCapsBuilder::new()
+                .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+                .format(VideoFormat::DmaDrm)
+                .field("drm-format", drm)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1));
+            if hdr {
+                b = b
+                    .field("colorimetry", HDR_COLORIMETRY)
+                    .field("mastering-display-info", HDR_MASTERING)
+                    .field("content-light-level", HDR_CLL);
+            }
+            caps.merge(b.build());
+        }
+
         // `vulkan=true`: advertise NV12 memory:VulkanImage FIRST, so a format-agnostic
         // interpipesink (Wolf) fixates on it and we hand the encoder a shared-device
         // encode-src image. Requires the encoder to share its GstVulkanDevice (set_context);
         // the dmabuf/RGBA caps stay as fallback.
+        // NV12 is listed first so a format-agnostic interpipesink (Wolf) fixates on it by
+        // default; a downstream Main-10 encoder (vulkanh265enc) constrains the format to
+        // P010_10LE, so negotiation intersects to the P010 path on demand.
         let vulkan_on = self.settings.lock().unwrap().vulkan;
         if vulkan_on {
-            let vk_caps = gst_video::VideoCapsBuilder::new()
+            // NV12 (8-bit SDR) first so a format-agnostic interpipesink fixates on it; P010 is
+            // a separate structure so the HDR fields apply ONLY to it (an `hdr` NV12 stream
+            // would be wrong). A downstream vulkanh265enc constrains to P010_10LE on demand.
+            let nv12_vk = gst_video::VideoCapsBuilder::new()
                 .features(["memory:VulkanImage"])
                 .format(VideoFormat::Nv12)
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
                 .build();
-            let mut merged = vk_caps;
+            let mut p010_vk_b = gst_video::VideoCapsBuilder::new()
+                .features(["memory:VulkanImage"])
+                .format(VideoFormat::P01010le)
+                .height_range(..i32::MAX)
+                .width_range(..i32::MAX)
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1));
+            if hdr {
+                p010_vk_b = p010_vk_b
+                    .field("colorimetry", HDR_COLORIMETRY)
+                    .field("mastering-display-info", HDR_MASTERING)
+                    .field("content-light-level", HDR_CLL);
+            }
+            let mut merged = nv12_vk;
+            merged.merge(p010_vk_b.build());
             merged.merge(caps);
             caps = merged;
         }
@@ -993,10 +1105,18 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             waylanddisplaycore::utils::vulkan_share::ensure_owned_device(minor);
             let base_video_info =
                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
+            // P010 ⇒ the Vulkan HEVC encoder (vulkanh265enc) Main-10; NV12 ⇒ vulkanh264enc.
+            // The producer's raw caps don't carry the codec, so the negotiated format selects
+            // it (the encode-src image's video profile is built from this downstream).
+            let profile = if base_video_info.format() == VideoFormat::P01010le {
+                "main-10".to_string()
+            } else {
+                "high".to_string()
+            };
             let video_info =
                 GstVideoInfo::VULKAN(waylanddisplaycore::utils::video_info::VulkanParams {
                     video_info: base_video_info,
-                    profile: "high".to_string(),
+                    profile,
                 });
             let _ = self.command_tx.send(Command::VideoInfo(video_info));
             return self.parent_set_caps(caps);

@@ -6,7 +6,7 @@ use crate::DrmModifier;
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
 use crate::utils::device::PCIVendor;
 use crate::utils::device::gpu::GPUDevice;
-use crate::utils::vulkan_nv12::VulkanNv12;
+use crate::utils::vulkan_nv12::{PixFmt, VulkanNv12};
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
@@ -179,11 +179,19 @@ fn rgba_modifier_order(mods: &[Modifier], is_nvidia: bool) -> Vec<Modifier> {
         .collect()
 }
 
+/// True when the negotiated colorimetry uses the BT.2020 matrix (i.e. HDR / BT.2100-PQ
+/// output): the RGBA->P010 converter must then use the BT.2020 luma/chroma matrix so the
+/// samples match the `matrix=bt2020` caps the encoder signals. SDR (BT.601/709) -> false.
+fn is_bt2020_matrix(colorimetry: &gst_video::VideoColorimetry) -> bool {
+    colorimetry.matrix() == gst_video::VideoColorMatrix::Bt2020
+}
+
 impl GsNv12Buf {
     pub fn new(
         renderer: &mut GlesRenderer,
         render_node: DrmNode,
         video_info: VideoInfoDmaDrm,
+        fmt: PixFmt,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
         // RGBA render-target modifier candidates the GLES renderer supports (INVALID last).
@@ -219,7 +227,12 @@ impl GsNv12Buf {
             "GsNv12Buf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
             rgba.format().modifier
         );
-        let vulkan = VulkanNv12::new(render_node, video_info.clone())?;
+        // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
+        let bt2020 = video_info
+            .to_video_info()
+            .ok()
+            .is_some_and(|vi| is_bt2020_matrix(&vi.colorimetry()));
+        let vulkan = VulkanNv12::new(render_node, video_info.clone(), fmt, bt2020)?;
         Some(GsNv12Buf {
             rgba,
             vulkan: Arc::new(Mutex::new(vulkan)),
@@ -278,14 +291,23 @@ impl GsVulkanBuf {
         // The shared device must already have been absorbed from a GstContext.
         let dev = crate::utils::vulkan_share::shared_device()?;
         let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
-        let nv12_caps = gst::Caps::builder("video/x-raw")
+        // NV12 (8-bit, vulkanh264enc) or P010 (10-bit, vulkanh265enc Main-10) per the
+        // negotiated memory:VulkanImage format.
+        let fmt = PixFmt::from_gst(video_info.format());
+        let format_str = match fmt {
+            PixFmt::Nv12 => "NV12",
+            PixFmt::P010 => "P010_10LE",
+        };
+        let out_caps = gst::Caps::builder("video/x-raw")
             .features(["memory:VulkanImage"])
-            .field("format", "NV12")
+            .field("format", format_str)
             .field("width", w as i32)
             .field("height", h as i32)
             .field("framerate", video_info.fps())
             .build();
-        let vulkan = VulkanNv12::new_on_shared(dev, raw, &nv12_caps, &profile, w, h)?;
+        // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
+        let bt2020 = is_bt2020_matrix(&video_info.colorimetry());
+        let vulkan = VulkanNv12::new_on_shared(dev, raw, &out_caps, &profile, w, h, fmt, bt2020)?;
         Some(GsVulkanBuf {
             rgba,
             vulkan: Arc::new(Mutex::new(vulkan)),

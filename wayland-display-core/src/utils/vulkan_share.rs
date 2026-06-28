@@ -21,6 +21,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::utils::vulkan_nv12::PixFmt;
 use ash::vk;
 use gst::glib::translate::{ToGlibPtr, from_glib_full};
 use gst::prelude::*;
@@ -405,8 +406,9 @@ pub fn alloc_encode_src_buffer(
     width: u32,
     height: u32,
     profile: &str,
+    fmt: PixFmt,
 ) -> Option<gst::Buffer> {
-    let std_profile_idc = match profile {
+    let std_h264_idc = match profile {
         "high" | "constrained-high" | "progressive-high" => {
             vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
         }
@@ -414,16 +416,28 @@ pub fn alloc_encode_src_buffer(
         _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
     };
     unsafe {
-        // Profile chain (matches what vulkanh264enc's pool builds from caps): the H.264
-        // codec struct chained off the VkVideoProfileInfoKHR; usage info omitted.
-        let mut h264 =
-            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_profile_idc);
+        // Profile chain (matches what the encoder's pool builds from caps): the codec struct
+        // chained off the VkVideoProfileInfoKHR; usage info omitted. P010 -> H.265 Main-10
+        // 10-bit (for vulkanh265enc); NV12 -> H.264 8-bit (the default Vulkan-encode path).
+        let mut h264 = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
+        let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default()
+            .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10);
+        let bit_depth = match fmt {
+            PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+            PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+        };
         let mut profile_info = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push_next(&mut h264);
+            .luma_bit_depth(bit_depth)
+            .chroma_bit_depth(bit_depth);
+        profile_info = match fmt {
+            PixFmt::P010 => profile_info
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                .push_next(&mut h265),
+            PixFmt::Nv12 => profile_info
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                .push_next(&mut h264),
+        };
         let profiles = [profile_info];
         let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
@@ -446,9 +460,13 @@ pub fn alloc_encode_src_buffer(
         } else {
             vk::ImageTiling::OPTIMAL
         };
+        let image_format = match fmt {
+            PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+        };
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .format(image_format)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -520,7 +538,10 @@ pub fn alloc_encode_src_buffer(
             let _ = gst_video::VideoMeta::add(
                 b,
                 gst_video::VideoFrameFlags::empty(),
-                gst_video::VideoFormat::Nv12,
+                match fmt {
+                    PixFmt::Nv12 => gst_video::VideoFormat::Nv12,
+                    PixFmt::P010 => gst_video::VideoFormat::P01010le,
+                },
                 width,
                 height,
             );

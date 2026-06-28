@@ -370,13 +370,21 @@ pub(crate) fn apply_video_info(
             }
             GstVideoInfo::DMA(base_info) => {
                 let node = render_node.unwrap();
-                // NV12 output goes through the Vulkan converter (render RGBA -> Vulkan
-                // RGBA->NV12 -> exported NV12 dmabuf); any other DMA format is the
-                // existing direct path.
-                if gst_video_format_to_drm_fourcc(&base_info)
-                    == Some(smithay::reexports::drm::buffer::DrmFourcc::Nv12)
-                {
-                    let allocator = GsNv12Buf::new(&mut state.renderer, node, base_info)
+                // NV12/P010 output goes through the Vulkan converter (render RGBA -> Vulkan
+                // RGBA->NV12/P010 -> exported dmabuf); any other DMA format is the existing
+                // direct path.
+                let fourcc = gst_video_format_to_drm_fourcc(&base_info);
+                let conv_fmt = match fourcc {
+                    Some(smithay::reexports::drm::buffer::DrmFourcc::Nv12) => {
+                        Some(crate::utils::vulkan_nv12::PixFmt::Nv12)
+                    }
+                    Some(smithay::reexports::drm::buffer::DrmFourcc::P010) => {
+                        Some(crate::utils::vulkan_nv12::PixFmt::P010)
+                    }
+                    _ => None,
+                };
+                if let Some(conv_fmt) = conv_fmt {
+                    let allocator = GsNv12Buf::new(&mut state.renderer, node, base_info, conv_fmt)
                         .expect("Failed to create GsNv12Buf");
                     state.output_buffer = Some(GsBufferType::NV12(allocator));
                 } else {

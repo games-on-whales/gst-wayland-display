@@ -73,6 +73,11 @@ use std::os::fd::{AsFd, AsRawFd, IntoRawFd, RawFd};
 use std::sync::{Mutex, OnceLock};
 
 const RGBA_TO_NV12_SPV: &[u8] = include_bytes!("shaders/rgba_to_nv12.spv");
+const RGBA_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010.spv");
+/// BT.2020 (BT.2100-PQ HDR) variant of the P010 converter: identical topology to
+/// [`RGBA_TO_P010_SPV`] but with the BT.2020 luma/chroma matrix, selected when the producer
+/// signals HDR output so the matrix matches the `matrix=bt2020` caps tagging.
+const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt2020.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
@@ -98,6 +103,20 @@ fn dump_path() -> Option<&'static str> {
     .as_deref()
 }
 static DUMP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which converted frame to capture when `WOLF_VULKAN_DUMP` is set (default 20, a few frames
+/// in so the scene has settled). Override with `WOLF_VULKAN_DUMP_FRAME` to wait longer -- e.g.
+/// for a client to connect and paint a known colour before the dump fires. Read once.
+fn dump_frame_target() -> u64 {
+    use std::sync::OnceLock;
+    static F: OnceLock<u64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("WOLF_VULKAN_DUMP_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20)
+    })
+}
 
 /// Number of ring slots actually cycled (`<= RING`; the per-slot arrays stay sized at
 /// `RING`). Override with `WOLF_VULKAN_RING` for diagnosis -- e.g. `WOLF_VULKAN_RING=1` pins
@@ -126,6 +145,81 @@ const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
 type Err = Box<dyn std::error::Error>;
 /// An imported RGBA dmabuf (image/memory/view) kept alive until its frame's GPU work ends.
 type Import = (vk::Image, vk::DeviceMemory, vk::ImageView);
+
+/// Output pixel format the converter targets. NV12 is the 8-bit 4:2:0 default; P010 is the
+/// 10-bit 4:2:0 path (for `vulkanh265enc` Main-10). Identical compute math and pipeline
+/// topology -- P010 just swaps the multiplanar image format and per-plane storage views for
+/// their 16-bit equivalents and selects the 16-bit shader. The compositor content is 8-bit
+/// RGBA, so P010 is a valid 10-bit container of 8-bit-precision content (true HDR later).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PixFmt {
+    Nv12,
+    P010,
+}
+
+impl PixFmt {
+    /// The multiplanar Vulkan format of the output/scratch image.
+    fn image_format(self) -> vk::Format {
+        match self {
+            PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+        }
+    }
+    /// Per-plane storage-view format the compute shader imageStores into (Y plane). For P010
+    /// the plane is `R10X6_UNORM_PACK16`; we view it as `R16_UNORM` -- both are in Vulkan's
+    /// 16-bit format-compatibility class, so the view is size/class-compatible -- and a
+    /// normalized store lands across all 16 bits (the P010 reader takes the top 10).
+    fn y_view_format(self) -> vk::Format {
+        match self {
+            PixFmt::Nv12 => vk::Format::R8_UNORM,
+            PixFmt::P010 => vk::Format::R16_UNORM,
+        }
+    }
+    /// Per-plane storage-view format for the interleaved Cb/Cr plane (`R10X6G10X6` <-> R16G16,
+    /// 32-bit class, compatible).
+    fn uv_view_format(self) -> vk::Format {
+        match self {
+            PixFmt::Nv12 => vk::Format::R8G8_UNORM,
+            PixFmt::P010 => vk::Format::R16G16_UNORM,
+        }
+    }
+    fn gst_format(self) -> VideoFormat {
+        match self {
+            PixFmt::Nv12 => VideoFormat::Nv12,
+            PixFmt::P010 => VideoFormat::P01010le,
+        }
+    }
+    /// dmabuf fourcc (little-endian 4cc) for the export VideoMeta / VA layout.
+    fn fourcc(self) -> u32 {
+        match self {
+            PixFmt::Nv12 => u32::from_le_bytes(*b"NV12"),
+            PixFmt::P010 => u32::from_le_bytes(*b"P010"),
+        }
+    }
+    /// Bytes per luma sample (NV12 = 1, P010 = 2) -- sizes the host-readback debug dump.
+    fn y_bytes(self) -> u64 {
+        match self {
+            PixFmt::Nv12 => 1,
+            PixFmt::P010 => 2,
+        }
+    }
+    /// Pick the matching compute shader SPIR-V. `bt2020` selects the BT.2020 (HDR / BT.2100-PQ)
+    /// matrix variant on the P010 path; it has no effect on NV12 (8-bit SDR stays BT.601).
+    fn shader(self, bt2020: bool) -> &'static [u8] {
+        match (self, bt2020) {
+            (PixFmt::Nv12, _) => RGBA_TO_NV12_SPV,
+            (PixFmt::P010, false) => RGBA_TO_P010_SPV,
+            (PixFmt::P010, true) => RGBA_TO_P010_BT2020_SPV,
+        }
+    }
+    /// Derive from a negotiated gst video format (anything but P010 -> NV12).
+    pub fn from_gst(format: VideoFormat) -> Self {
+        match format {
+            VideoFormat::P01010le => PixFmt::P010,
+            _ => PixFmt::Nv12,
+        }
+    }
+}
 
 // --- dma-buf implicit-sync ioctl (attach a Vulkan signal as the dmabuf's write fence) ---
 
@@ -186,18 +280,32 @@ unsafe fn pick_physical_device(
 /// also accepts -- the converter then exports that exact modifier (LINEAR directly, tiled
 /// via a transfer copy), so no LINEAR-vs-tiled mismatch and no guessing.
 pub fn supported_nv12_modifiers(target_minor: Option<u32>) -> &'static [u64] {
-    static CACHE: OnceLock<Mutex<Vec<(Option<u32>, &'static [u64])>>> = OnceLock::new();
+    supported_modifiers(target_minor, PixFmt::Nv12)
+}
+
+/// DRM modifiers `target_minor`'s GPU can export P010 with -- the 10-bit sibling of
+/// [`supported_nv12_modifiers`], advertised so a P010 negotiation lands on a Vulkan-exportable
+/// modifier.
+pub fn supported_p010_modifiers(target_minor: Option<u32>) -> &'static [u64] {
+    supported_modifiers(target_minor, PixFmt::P010)
+}
+
+fn supported_modifiers(target_minor: Option<u32>, fmt: PixFmt) -> &'static [u64] {
+    static CACHE: OnceLock<Mutex<Vec<(Option<u32>, PixFmt, &'static [u64])>>> = OnceLock::new();
     let mut guard = CACHE.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
-    if let Some((_, mods)) = guard.iter().find(|(m, _)| *m == target_minor) {
+    if let Some((_, _, mods)) = guard
+        .iter()
+        .find(|(m, f, _)| *m == target_minor && *f == fmt)
+    {
         return mods;
     }
-    let mods = unsafe { query_nv12_modifiers(target_minor) }.unwrap_or_default();
+    let mods = unsafe { query_modifiers(target_minor, fmt.image_format()) }.unwrap_or_default();
     let leaked: &'static [u64] = Box::leak(mods.into_boxed_slice());
-    guard.push((target_minor, leaked));
+    guard.push((target_minor, fmt, leaked));
     leaked
 }
 
-unsafe fn query_nv12_modifiers(target_minor: Option<u32>) -> Option<Vec<u64>> {
+unsafe fn query_modifiers(target_minor: Option<u32>, format: vk::Format) -> Option<Vec<u64>> {
     let entry = ash::Entry::load().ok()?;
     let instance = entry
         .create_instance(
@@ -209,11 +317,7 @@ unsafe fn query_nv12_modifiers(target_minor: Option<u32>) -> Option<Vec<u64>> {
     let pd = pick_physical_device(&instance, target_minor)?;
     let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
     let mut p2 = vk::FormatProperties2::default().push_next(&mut list);
-    instance.get_physical_device_format_properties2(
-        pd,
-        vk::Format::G8_B8R8_2PLANE_420_UNORM,
-        &mut p2,
-    );
+    instance.get_physical_device_format_properties2(pd, format, &mut p2);
     let mut props = vec![
         vk::DrmFormatModifierPropertiesEXT::default();
         list.drm_format_modifier_count as usize
@@ -221,11 +325,7 @@ unsafe fn query_nv12_modifiers(target_minor: Option<u32>) -> Option<Vec<u64>> {
     let mut list2 = vk::DrmFormatModifierPropertiesListEXT::default()
         .drm_format_modifier_properties(&mut props);
     let mut p2b = vk::FormatProperties2::default().push_next(&mut list2);
-    instance.get_physical_device_format_properties2(
-        pd,
-        vk::Format::G8_B8R8_2PLANE_420_UNORM,
-        &mut p2b,
-    );
+    instance.get_physical_device_format_properties2(pd, format, &mut p2b);
     // Keep only modifiers that support TRANSFER_DST (the copy target) -- every export
     // modifier the encoder might want is filled via vkCmdCopyImage. We advertise the full
     // set (incl. AMD DCC): gst negotiation picks the encoder's preferred modifier, and on
@@ -322,6 +422,9 @@ pub struct VulkanNv12 {
     cur: usize,  // last slot written (the one to_gst_buffer returns)
     width: u32,
     height: u32,
+    /// Target output format (NV12 8-bit or P010 10-bit); selects the compute shader, image
+    /// format, and storage-view formats.
+    fmt: PixFmt,
 }
 
 impl std::fmt::Debug for VulkanNv12 {
@@ -333,7 +436,12 @@ impl std::fmt::Debug for VulkanNv12 {
 impl VulkanNv12 {
     /// Bring up Vulkan, build the compute pipeline, and allocate the NV12 export ring for
     /// `video_info`'s resolution, exporting with the negotiated modifier.
-    pub fn new(render_node: DrmNode, video_info: VideoInfoDmaDrm) -> Option<Self> {
+    pub fn new(
+        render_node: DrmNode,
+        video_info: VideoInfoDmaDrm,
+        fmt: PixFmt,
+        bt2020: bool,
+    ) -> Option<Self> {
         let width = video_info.width();
         let height = video_info.height();
         // Pick the Vulkan device whose DRM render/primary minor matches the render node,
@@ -345,7 +453,7 @@ impl VulkanNv12 {
             DRM_FORMAT_MOD_INVALID => DRM_FORMAT_MOD_LINEAR,
             m => m,
         };
-        match unsafe { Self::new_inner(width, height, modifier, target_minor) } {
+        match unsafe { Self::new_inner(width, height, modifier, target_minor, fmt, bt2020) } {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::error!("VulkanNv12::new_inner failed: {e}");
@@ -359,6 +467,8 @@ impl VulkanNv12 {
         height: u32,
         export_modifier: u64,
         target_minor: u32,
+        fmt: PixFmt,
+        bt2020: bool,
     ) -> Result<Self, Err> {
         let entry = ash::Entry::load()?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
@@ -415,11 +525,11 @@ impl VulkanNv12 {
         let queue = device.get_device_queue(qfi, 0);
         let memp = instance.get_physical_device_memory_properties(pd);
 
-        // ---- compute pipeline ----
+        // ---- compute pipeline (shader selected by output format) ----
         let module = device.create_shader_module(
             &vk::ShaderModuleCreateInfo {
-                code_size: RGBA_TO_NV12_SPV.len(),
-                p_code: RGBA_TO_NV12_SPV.as_ptr() as *const u32,
+                code_size: fmt.shader(bt2020).len(),
+                p_code: fmt.shader(bt2020).as_ptr() as *const u32,
                 ..Default::default()
             },
             None,
@@ -505,6 +615,7 @@ impl VulkanNv12 {
                     height,
                     export_modifier,
                     direct,
+                    fmt,
                 )?);
             }
             Ok(outputs)
@@ -557,6 +668,7 @@ impl VulkanNv12 {
             cur: 0,
             width,
             height,
+            fmt,
         })
     }
 
@@ -573,9 +685,13 @@ impl VulkanNv12 {
         profile: &str,
         width: u32,
         height: u32,
+        fmt: PixFmt,
+        bt2020: bool,
     ) -> Option<Self> {
         match unsafe {
-            Self::new_on_shared_inner(device_gst, raw, nv12_caps, profile, width, height)
+            Self::new_on_shared_inner(
+                device_gst, raw, nv12_caps, profile, width, height, fmt, bt2020,
+            )
         } {
             Ok(v) => Some(v),
             Err(e) => {
@@ -592,6 +708,8 @@ impl VulkanNv12 {
         profile: &str,
         width: u32,
         height: u32,
+        fmt: PixFmt,
+        bt2020: bool,
     ) -> Result<Self, Err> {
         // Drive ash on the encoder's existing instance/device (do NOT create our own).
         let entry = ash::Entry::load()?;
@@ -603,8 +721,8 @@ impl VulkanNv12 {
         // ---- compute pipeline (same as the dmabuf path, on the shared device) ----
         let module = device.create_shader_module(
             &vk::ShaderModuleCreateInfo {
-                code_size: RGBA_TO_NV12_SPV.len(),
-                p_code: RGBA_TO_NV12_SPV.as_ptr() as *const u32,
+                code_size: fmt.shader(bt2020).len(),
+                p_code: fmt.shader(bt2020).as_ptr() as *const u32,
                 ..Default::default()
             },
             None,
@@ -677,6 +795,7 @@ impl VulkanNv12 {
                 cmd_pool,
                 width,
                 height,
+                fmt,
             )?);
         }
 
@@ -703,6 +822,7 @@ impl VulkanNv12 {
             cur: 0,
             width,
             height,
+            fmt,
         })
     }
 
@@ -1015,18 +1135,23 @@ impl VulkanNv12 {
         // the tiled copy or the encoder. Off unless WOLF_VULKAN_DUMP is set; once, a few
         // frames in (let the scene settle). Failures are logged, never fatal.
         if let Some(path) = dump_path() {
-            if DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 20 {
+            if DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == dump_frame_target() {
                 self.device.device_wait_idle().ok();
-                match self.dump_nv12(compute_target, self.width, self.height, path) {
+                let pix = match self.fmt {
+                    PixFmt::Nv12 => "nv12",
+                    PixFmt::P010 => "p010le",
+                };
+                match self.dump_planar(compute_target, self.width, self.height, path) {
                     Ok(()) => tracing::info!(
-                        "VulkanNv12: dumped converter NV12 {}x{} (raw NV12) to {path} -- view: \
-                         ffmpeg -f rawvideo -pix_fmt nv12 -s {}x{} -i {path} -frames 1 out.png",
+                        "VulkanNv12: dumped converter {:?} {}x{} (raw planar) to {path} -- view: \
+                         ffmpeg -f rawvideo -pix_fmt {pix} -s {}x{} -i {path} -frames 1 out.png",
+                        self.fmt,
                         self.width,
                         self.height,
                         self.width,
                         self.height
                     ),
-                    Err(e) => tracing::warn!("VulkanNv12: NV12 dump failed: {e}"),
+                    Err(e) => tracing::warn!("VulkanNv12: {:?} dump failed: {e}", self.fmt),
                 }
             }
         }
@@ -1035,12 +1160,14 @@ impl VulkanNv12 {
         Ok(())
     }
 
-    /// One-shot debug readback of a multiplanar NV12 image (must be in TRANSFER_SRC_OPTIMAL
-    /// and have TRANSFER_SRC usage -- true for the compute scratch) into a host buffer, then
-    /// write tight raw NV12 (`w*h` Y plane + `w*h/2` interleaved UV) to `path`.
-    unsafe fn dump_nv12(&self, img: vk::Image, w: u32, h: u32, path: &str) -> Result<(), Err> {
-        let y_size = (w * h) as u64;
-        let total = y_size + (w as u64 * h as u64 / 2);
+    /// One-shot debug readback of a multiplanar NV12/P010 image (must be in
+    /// TRANSFER_SRC_OPTIMAL and have TRANSFER_SRC usage -- true for the compute scratch) into
+    /// a host buffer, then write tight raw planar (`w*h*bpp` Y plane + `w*h/2*bpp` interleaved
+    /// UV) to `path`. `bpp` is 1 for NV12, 2 for P010 (16-bit samples, value in the MSBs).
+    unsafe fn dump_planar(&self, img: vk::Image, w: u32, h: u32, path: &str) -> Result<(), Err> {
+        let bpp = self.fmt.y_bytes();
+        let y_size = w as u64 * h as u64 * bpp;
+        let total = y_size + (w as u64 * h as u64 / 2 * bpp);
         let buf = self.device.create_buffer(
             &vk::BufferCreateInfo::default()
                 .size(total)
@@ -1318,24 +1445,27 @@ impl Drop for VulkanNv12 {
 
 // --- helpers ---
 
-/// LINEAR NV12 image with per-plane R8/R8G8 storage views (storage works on LINEAR; it
-/// does not on DCC modifiers). Used as the tiled path's compute scratch and, on the
-/// direct path, as the export image itself (with `usage` extended for export).
-unsafe fn create_storage_nv12(
+/// LINEAR NV12/P010 image with per-plane storage views (R8/R8G8 for NV12, R16/R16G16 for
+/// P010). Storage works on LINEAR; it does not on DCC modifiers. Used as the tiled path's
+/// compute scratch and, on the direct path, as the export image itself (with `usage`
+/// extended for export). The image is `MUTABLE_FORMAT` with a view-format list so the planes
+/// can be stored through the size/class-compatible single-component views.
+unsafe fn create_storage(
     device: &ash::Device,
     memp: &vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
     usage: vk::ImageUsageFlags,
     export: bool,
+    fmt: PixFmt,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::ImageView), Err> {
     let mods = [DRM_FORMAT_MOD_LINEAR];
     let mut modlist =
         vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&mods);
     let view_formats = [
-        vk::Format::G8_B8R8_2PLANE_420_UNORM,
-        vk::Format::R8_UNORM,
-        vk::Format::R8G8_UNORM,
+        fmt.image_format(),
+        fmt.y_view_format(),
+        fmt.uv_view_format(),
     ];
     let mut flist = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
     let mut extmem = vk::ExternalMemoryImageCreateInfo::default()
@@ -1343,7 +1473,7 @@ unsafe fn create_storage_nv12(
     let mut info = vk::ImageCreateInfo::default()
         .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+        .format(fmt.image_format())
         .extent(vk::Extent3D {
             width,
             height,
@@ -1379,13 +1509,13 @@ unsafe fn create_storage_nv12(
     let y_view = plane_view(
         device,
         image,
-        vk::Format::R8_UNORM,
+        fmt.y_view_format(),
         vk::ImageAspectFlags::PLANE_0,
     )?;
     let uv_view = plane_view(
         device,
         image,
-        vk::Format::R8G8_UNORM,
+        fmt.uv_view_format(),
         vk::ImageAspectFlags::PLANE_1,
     )?;
     Ok((image, mem, y_view, uv_view))
@@ -1406,17 +1536,19 @@ unsafe fn create_output(
     height: u32,
     modifier: u64,
     direct: bool,
+    fmt: PixFmt,
 ) -> Result<Nv12Out, Err> {
     // The export image: direct (LINEAR, compute-writable) carries STORAGE; tiled is a
     // pure TRANSFER_DST target filled by vkCmdCopyImage.
     let (image, mem, y_view, uv_view, scratch) = if direct {
-        let (image, mem, y_view, uv_view) = create_storage_nv12(
+        let (image, mem, y_view, uv_view) = create_storage(
             device,
             memp,
             width,
             height,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST,
             true,
+            fmt,
         )?;
         (image, mem, y_view, uv_view, None)
     } else {
@@ -1428,7 +1560,7 @@ unsafe fn create_output(
         let image = device.create_image(
             &vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+                .format(fmt.image_format())
                 .extent(vk::Extent3D {
                     width,
                     height,
@@ -1460,13 +1592,14 @@ unsafe fn create_output(
         )?;
         device.bind_image_memory(image, mem, 0)?;
         // Per-slot LINEAR scratch the compute shader writes; copied into `image`.
-        let (s_img, s_mem, s_y, s_uv) = create_storage_nv12(
+        let (s_img, s_mem, s_y, s_uv) = create_storage(
             device,
             memp,
             width,
             height,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
             false,
+            fmt,
         )?;
         (image, mem, s_y, s_uv, Some((s_img, s_mem)))
     };
@@ -1500,14 +1633,21 @@ unsafe fn create_output(
     let layout = crate::utils::va_share::Nv12Layout {
         width,
         height,
-        fourcc: u32::from_le_bytes(*b"NV12"),
+        fourcc: fmt.fourcc(),
         modifier,
         y_offset: l0.offset as usize,
         y_stride: l0.row_pitch as i32,
         uv_offset: l1.offset as usize,
         uv_stride: l1.row_pitch as i32,
     };
-    let buffer = match crate::utils::va_share::build_shared_buffer(fd, mr.size as usize, &layout) {
+    // VA surface sharing is the AMD/Intel NV12 dmabuf-encode optimisation; the P010 path
+    // targets the Vulkan encoder, so only attempt the VA-allocator buffer for NV12.
+    let shared = if fmt == PixFmt::Nv12 {
+        crate::utils::va_share::build_shared_buffer(fd, mr.size as usize, &layout)
+    } else {
+        None
+    };
+    let buffer = match shared {
         Some(b) => b,
         None => {
             let mut buffer = GstBuffer::new();
@@ -1522,7 +1662,7 @@ unsafe fn create_output(
                 VideoMeta::add_full(
                     b,
                     gst_video::VideoFrameFlags::empty(),
-                    VideoFormat::Nv12,
+                    fmt.gst_format(),
                     width,
                     height,
                     &[l0.offset as usize, l1.offset as usize],
@@ -1588,21 +1728,23 @@ unsafe fn create_encode_output(
     cmd_pool: vk::CommandPool,
     width: u32,
     height: u32,
+    fmt: PixFmt,
 ) -> Result<Nv12Out, Err> {
     let buffer =
-        crate::utils::vulkan_share::alloc_encode_src_buffer(gst_device, width, height, profile)
+        crate::utils::vulkan_share::alloc_encode_src_buffer(gst_device, width, height, profile, fmt)
             .ok_or("encode-src image allocation failed")?;
     let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)
         .ok_or("encode-src buffer is not a single GstVulkanImageMemory")?;
 
     // LINEAR storage scratch (compute writes here; copied into the encode-src image).
-    let (s_img, s_mem, y_view, uv_view) = create_storage_nv12(
+    let (s_img, s_mem, y_view, uv_view) = create_storage(
         device,
         memp,
         width,
         height,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
         false,
+        fmt,
     )?;
 
     // Diagnostic for the RX 9070 green-bar/jump report: if the encoder's pool gives us an
