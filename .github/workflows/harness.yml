@@ -17,15 +17,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: System dependencies
+        # The gstreamer:1.26.7 base image is Fedora, so install build/link deps
+        # with dnf. gstreamer1-plugins-base-devel provides gstreamer-allocators-1.0
+        # (the gstreamer-rs -sys binding); the GPU runtime drivers are only needed
+        # for the self-skipping GPU phases, not lint/build/unit.
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl ca-certificates git libssl-dev libicu76 \
-            libwayland-dev libinput-dev libxkbcommon-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev libudev-dev libclang-dev clang \
-            libgl1-mesa-dri libegl-mesa0 mesa-vulkan-drivers hwdata \
-            librust-gstreamer-allocators-dev
+          dnf install -y \
+            gcc gcc-c++ make pkgconf-pkg-config curl ca-certificates git \
+            openssl-devel libicu \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            wayland-devel libinput-devel libxkbcommon-devel mesa-libgbm-devel \
+            mesa-libEGL-devel mesa-libGLES-devel systemd-devel clang clang-devel
 
       - name: Rust toolchain
         run: |
