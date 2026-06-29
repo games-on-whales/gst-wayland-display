@@ -83,32 +83,94 @@ pub struct ImageDescription {
     pub max_fall: Option<u32>,
 }
 
-/// The per-`wl_surface` colour state set through `set_image_description`. This is the
-/// detection payload downstream code reads via [`surface_is_hdr`].
-#[derive(Debug, Clone, Default)]
-pub struct SurfaceColorState {
-    pub transfer: Option<TransferFunction>,
-    pub primaries: Option<Primaries>,
-    pub mastering: Option<MasteringDisplay>,
-    pub max_cll: Option<u32>,
-    pub max_fall: Option<u32>,
+/// Mastering-display (SMPTE ST 2086) metadata, stored already converted into the units
+/// GStreamer's `mastering-display-info` caps field expects, so the consumer is
+/// protocol-agnostic: chromaticities in 1/50000 (×50000, so 50000 == 1.0) and luminances
+/// in 0.0001 cd/m² (×10000 from cd/m²). The two source protocols have different native
+/// units (frog: 0.00002 chromaticity / 1 cd/m² max-lum / 0.0001 cd/m² min-lum;
+/// `wp_color_management_v1`: 1,000,000 chromaticity / 1 cd/m² max-lum / 0.0001 cd/m²
+/// min-lum) and convert into this shared representation at write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasteringDisplayInfo {
+    /// r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y — each ×50000 (50000 == 1.0).
+    pub primaries: [u32; 8],
+    /// Max display mastering luminance, in 0.0001 cd/m² units.
+    pub max_luminance: u32,
+    /// Min display mastering luminance, in 0.0001 cd/m² units.
+    pub min_luminance: u32,
 }
 
-impl SurfaceColorState {
-    /// A surface is treated as HDR when its image description is BT.2100 PQ:
-    /// SMPTE ST 2084 (PQ) transfer + BT.2020 primaries.
-    pub fn is_hdr(&self) -> bool {
-        self.transfer == Some(TransferFunction::St2084Pq)
-            && self.primaries == Some(Primaries::Bt2020)
+impl MasteringDisplayInfo {
+    /// Format as the gst `mastering-display-info` caps string:
+    /// "Rx:Ry:Gx:Gy:Bx:By:Wx:Wy:maxLum:minLum" (same shape as the producer's
+    /// hardcoded `HDR_MASTERING`).
+    pub fn to_caps_string(&self) -> String {
+        let p = self.primaries;
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], self.max_luminance, self.min_luminance
+        )
     }
 }
 
-impl From<&ImageDescription> for SurfaceColorState {
-    fn from(desc: &ImageDescription) -> Self {
-        SurfaceColorState {
-            transfer: desc.transfer,
-            primaries: desc.primaries,
-            mastering: desc.mastering,
+/// Protocol-neutral per-`wl_surface` HDR colour state. Written by BOTH the standard
+/// `wp_color_management_v1` handler (used by sway) via [`set_surface_hdr_color`] and the
+/// `frog_color_management_v1` handler (used by gamescope, in
+/// `wayland::protocols::frog_color_management`), and read back by the protocol-agnostic
+/// accessors [`surface_is_hdr`] / [`surface_mastering_caps`]. The consumer never cares
+/// which protocol set it. Gated by `WOLF_HDR_CM` at the global-creation sites.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SurfaceHdrColor {
+    /// Transfer function is SMPTE ST 2084 (PQ).
+    pub is_pq: bool,
+    /// Container primaries are BT.2020 / Rec.2020.
+    pub is_bt2020: bool,
+    /// Mastering-display metadata (already in gst-caps units), if the client provided it.
+    pub mastering: Option<MasteringDisplayInfo>,
+    /// MaxCLL in cd/m² (nits), if provided.
+    pub max_cll: Option<u32>,
+    /// MaxFALL in cd/m² (nits), if provided.
+    pub max_fall: Option<u32>,
+}
+
+impl SurfaceHdrColor {
+    /// A surface is HDR when its declared transfer function is PQ (ST 2084) — the defining
+    /// HDR signal both protocols set (gamescope/sway always pair it with BT.2020).
+    pub fn is_hdr(&self) -> bool {
+        self.is_pq
+    }
+
+    /// The `(mastering-display-info, content-light-level)` gst caps strings, iff the client
+    /// supplied mastering metadata. `None` => the producer keeps its hardcoded HDR defaults.
+    pub fn mastering_caps(&self) -> Option<(String, String)> {
+        let mdi = self.mastering.as_ref()?.to_caps_string();
+        let cll = format!(
+            "{}:{}",
+            self.max_cll.unwrap_or(0),
+            self.max_fall.unwrap_or(0)
+        );
+        Some((mdi, cll))
+    }
+
+    /// Build from a resolved `wp_color_management_v1` image description, converting its
+    /// native units (chromaticity ×1,000,000, max-lum cd/m², min-lum 0.0001 cd/m²) into the
+    /// gst-caps units stored here (chromaticity ×50,000 => /20; max-lum ×10000; min-lum 1:1).
+    fn from_wp(desc: &ImageDescription) -> Self {
+        let mastering = desc.mastering.as_ref().map(|m| {
+            let mut primaries = [0u32; 8];
+            for (i, v) in m.primaries.iter().enumerate() {
+                primaries[i] = ((*v).max(0) as u32) / 20;
+            }
+            MasteringDisplayInfo {
+                primaries,
+                max_luminance: m.max_lum.saturating_mul(10000),
+                min_luminance: m.min_lum,
+            }
+        });
+        SurfaceHdrColor {
+            is_pq: desc.transfer == Some(TransferFunction::St2084Pq),
+            is_bt2020: desc.primaries == Some(Primaries::Bt2020),
+            mastering,
             max_cll: desc.max_cll,
             max_fall: desc.max_fall,
         }
@@ -188,34 +250,47 @@ struct ColorSurfaceAttached(Cell<bool>);
 
 /// Read the HDR flag a client set on `surface` (false if none / not color-managed).
 ///
-/// This is the detection entry point downstream code uses: `true` means the client
-/// declared the surface as BT.2100 PQ (PQ transfer + BT.2020 primaries).
+/// Protocol-agnostic detection entry point: `true` means EITHER protocol declared the
+/// surface PQ (`wp_color_management_v1`'s image description OR frog's transfer function).
 pub fn surface_is_hdr(surface: &WlSurface) -> bool {
     with_states(surface, |states| {
         states
             .data_map
-            .get::<RefCell<Option<SurfaceColorState>>>()
+            .get::<RefCell<Option<SurfaceHdrColor>>>()
             .map(|cell| cell.borrow().as_ref().is_some_and(|s| s.is_hdr()))
             .unwrap_or(false)
     })
 }
 
-/// Apply (`Some`) or clear (`None`) the colour state stored in a surface's `data_map`,
-/// logging the HDR transition so it can be observed on the target device.
-fn set_surface_color_state(surface: &WlSurface, new: Option<SurfaceColorState>) {
+/// Read the `(mastering-display-info, content-light-level)` gst caps strings a client set
+/// on `surface`, from whichever protocol provided them. `None` when the surface carries no
+/// (or no mastering) colour state — the producer then keeps its hardcoded HDR defaults.
+pub fn surface_mastering_caps(surface: &WlSurface) -> Option<(String, String)> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<RefCell<Option<SurfaceHdrColor>>>()
+            .and_then(|cell| cell.borrow().as_ref().and_then(|s| s.mastering_caps()))
+    })
+}
+
+/// Apply (`Some`) or clear (`None`) the shared [`SurfaceHdrColor`] stored in a surface's
+/// `data_map`, logging the HDR transition so it can be observed on the target device. Public
+/// so the frog handler writes the same shared state the `wp_color_management_v1` path does.
+pub fn set_surface_hdr_color(surface: &WlSurface, new: Option<SurfaceHdrColor>) {
     with_states(surface, |states| {
         let cell = states
             .data_map
-            .get_or_insert::<RefCell<Option<SurfaceColorState>>, _>(|| RefCell::new(None));
+            .get_or_insert::<RefCell<Option<SurfaceHdrColor>>, _>(|| RefCell::new(None));
         let was_hdr = cell.borrow().as_ref().is_some_and(|s| s.is_hdr());
         let now_hdr = new.as_ref().is_some_and(|s| s.is_hdr());
         *cell.borrow_mut() = new;
         if now_hdr && !was_hdr {
-            tracing::info!(surface = ?surface.id(), "color_mgmt: surface -> HDR (PQ/BT2020)");
+            tracing::info!(surface = ?surface.id(), "color_mgmt: surface -> HDR (PQ)");
         } else if was_hdr && !now_hdr {
             tracing::info!(
                 surface = ?surface.id(),
-                "color_mgmt: surface -> SDR (HDR image description cleared)"
+                "color_mgmt: surface -> SDR (HDR colour state cleared)"
             );
         }
     });
@@ -435,7 +510,7 @@ impl Dispatch<WpColorManagementSurfaceV1, ColorSurfaceData> for State {
                     );
                     return;
                 };
-                set_surface_color_state(&surface, Some(SurfaceColorState::from(&desc.desc)));
+                set_surface_hdr_color(&surface, Some(SurfaceHdrColor::from_wp(&desc.desc)));
             }
             Request::UnsetImageDescription => {
                 let Some(surface) = data.surface() else {
@@ -445,13 +520,13 @@ impl Dispatch<WpColorManagementSurfaceV1, ColorSurfaceData> for State {
                     );
                     return;
                 };
-                set_surface_color_state(&surface, None);
+                set_surface_hdr_color(&surface, None);
             }
             Request::Destroy => {
                 // Destroying behaves like unset_image_description, and frees the slot so
                 // a fresh wp_color_management_surface_v1 may be created for the surface.
                 if let Some(surface) = data.surface() {
-                    set_surface_color_state(&surface, None);
+                    set_surface_hdr_color(&surface, None);
                     with_states(&surface, |states| {
                         if let Some(marker) = states.data_map.get::<ColorSurfaceAttached>() {
                             marker.0.set(false);

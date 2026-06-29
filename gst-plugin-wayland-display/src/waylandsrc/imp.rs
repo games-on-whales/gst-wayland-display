@@ -41,6 +41,12 @@ pub struct WaylandDisplaySrc {
     /// Read in `caps()`, driven per-frame in `create()`. Default `false`. When
     /// WOLF_HDR_CM is unset this is never consulted (the static `hdr` property governs).
     hdr_active: AtomicBool,
+    /// Live HDR static metadata (WOLF_HDR_CM only): the active surface's REAL
+    /// `(mastering-display-info, content-light-level)` gst caps strings, as reported by the
+    /// compositor (frog for gamescope, `wp_color_management_v1` for sway). `(None, None)` =>
+    /// `caps()` falls back to the hardcoded `HDR_MASTERING` / `HDR_CLL` defaults. Driven in
+    /// `create()`, read in `caps()`. Never consulted when WOLF_HDR_CM is unset.
+    hdr_meta: Mutex<(Option<String>, Option<String>)>,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -52,6 +58,7 @@ impl Default for WaylandDisplaySrc {
             command_tx,
             command_rx: Mutex::new(Some(command_rx)),
             hdr_active: AtomicBool::new(false),
+            hdr_meta: Mutex::new((None, None)),
         }
     }
 }
@@ -921,6 +928,20 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         const HDR_COLORIMETRY: &str = "bt2100-pq";
         const HDR_MASTERING: &str = "35400:14600:8500:39850:6550:2300:15635:16450:10000000:1";
         const HDR_CLL: &str = "1000:400";
+        // Effective HDR static metadata. Under WOLF_HDR_CM use the live values the compositor
+        // reported from the game's own color-management signal (frog/gamescope or
+        // wp_color_management/sway) -- so the "HDR Luminance" slider actually flows through to
+        // the encoder's mastering/CLL SEI -- falling back to the hardcoded defaults when the
+        // game provided none. The static `hdr` property path keeps using the defaults verbatim.
+        let (hdr_mastering, hdr_cll): (String, String) = if hdr_cm {
+            let meta = self.hdr_meta.lock().unwrap();
+            (
+                meta.0.clone().unwrap_or_else(|| HDR_MASTERING.to_string()),
+                meta.1.clone().unwrap_or_else(|| HDR_CLL.to_string()),
+            )
+        } else {
+            (HDR_MASTERING.to_string(), HDR_CLL.to_string())
+        };
         // SDR colorimetry for the P010 path under WOLF_HDR_CM when the content is not PQ:
         // BT.709 (primaries=bt709, transfer=bt709, matrix=bt709, range=limited) and NO
         // mastering-display-info / content-light-level, so the encoder flips its VUI back to
@@ -958,8 +979,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             if hdr {
                 b = b
                     .field("colorimetry", HDR_COLORIMETRY)
-                    .field("mastering-display-info", HDR_MASTERING)
-                    .field("content-light-level", HDR_CLL);
+                    .field("mastering-display-info", hdr_mastering.as_str())
+                    .field("content-light-level", hdr_cll.as_str());
             } else if hdr_cm {
                 // WOLF_HDR_CM + SDR content: tag BT.709, no HDR static metadata.
                 b = b.field("colorimetry", SDR_COLORIMETRY);
@@ -995,8 +1016,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             if hdr {
                 p010_vk_b = p010_vk_b
                     .field("colorimetry", HDR_COLORIMETRY)
-                    .field("mastering-display-info", HDR_MASTERING)
-                    .field("content-light-level", HDR_CLL);
+                    .field("mastering-display-info", hdr_mastering.as_str())
+                    .field("content-light-level", hdr_cll.as_str());
             } else if hdr_cm {
                 // WOLF_HDR_CM + SDR content: tag BT.709, no HDR static metadata.
                 p010_vk_b = p010_vk_b.field("colorimetry", SDR_COLORIMETRY);
@@ -1337,7 +1358,10 @@ impl PushSrcImpl for WaylandDisplaySrc {
         // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
         // change, so this posts at most one message per transition.
         if std::env::var("WOLF_HDR_CM").is_ok() {
-            if let Some(hdr) = state.display.poll_hdr_state() {
+            if let Some((hdr, mastering, cll)) = state.display.poll_hdr_state() {
+                // Store the active surface's real mastering / CLL metadata so the next
+                // `caps()` stamps it onto the P010 HDR caps (else the hardcoded defaults).
+                *self.hdr_meta.lock().unwrap() = (mastering, cll);
                 let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
                 let structure = Structure::builder("wolf-hdr-state")
                     .field("hdr", hdr)

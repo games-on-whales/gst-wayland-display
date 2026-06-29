@@ -89,7 +89,12 @@ use crate::utils::allocator::{
 };
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
-use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
+use crate::{
+    utils::RenderTarget,
+    wayland::protocols::{
+        frog_color_management::create_frog_color_management_global, wl_drm::create_drm_global,
+    },
+};
 
 #[derive(Debug, Default)]
 pub struct ClientState {
@@ -156,6 +161,10 @@ pub struct State {
     /// that advertising color-management (which changes HDR clients' behaviour) stays
     /// opt-in until the buffer-import side is ready.
     color_mgmt_global: Option<GlobalId>,
+    /// `frog_color_management_v1` factory global id, present only when `WOLF_HDR_CM` is set.
+    /// gamescope's HDR path uses frog instead of `wp_color_management_v1`; both feed the same
+    /// shared per-surface `SurfaceHdrColor`.
+    frog_color_mgmt_global: Option<GlobalId>,
     /// Reverse channel (compositor -> element) used to signal OUTPUT HDR-state changes.
     /// `Some` only when `WOLF_HDR_CM` is set; `None` keeps the per-frame check a no-op so
     /// behaviour is exactly as before. See [`State::update_hdr_state`].
@@ -268,6 +277,18 @@ impl State {
                 "WOLF_HDR_CM set: advertising wp_color_manager_v1 (HDR-capable PQ/BT2020 output)"
             );
             Some(dh.create_global::<State, WpColorManagerV1, _>(1, ()))
+        } else {
+            None
+        };
+
+        // frog_color_management_v1 (gamescope's HDR path). Same WOLF_HDR_CM gate; gamescope
+        // does NOT speak wp_color_management_v1, so without this its real PQ signal + mastering
+        // metadata never reach us. Writes the same shared SurfaceHdrColor as wp above.
+        let frog_color_mgmt_global = if std::env::var("WOLF_HDR_CM").is_ok() {
+            tracing::info!(
+                "WOLF_HDR_CM set: advertising frog_color_management_v1 (gamescope HDR path)"
+            );
+            Some(create_frog_color_management_global::<State>(&dh))
         } else {
             None
         };
@@ -413,6 +434,7 @@ impl State {
             viewporter_state,
             single_pixel_buffer_state,
             color_mgmt_global,
+            frog_color_mgmt_global,
             hdr_state_tx: None,
             last_hdr_state: false,
             hdr_candidate_since: None,
@@ -441,6 +463,20 @@ impl State {
             .unwrap_or(false)
     }
 
+    /// The active fullscreen surface's HDR mastering / content-light-level gst caps strings,
+    /// from whichever color-management protocol provided them (frog for gamescope,
+    /// `wp_color_management_v1` for sway). `None` when there is no surface or it carries no
+    /// mastering metadata -- the producer then keeps its hardcoded HDR defaults.
+    fn active_surface_mastering_caps(&self) -> Option<(String, String)> {
+        self.space
+            .elements()
+            .next()
+            .and_then(|window| window.wl_surface())
+            .and_then(|surface| {
+                crate::wayland::handlers::color_management::surface_mastering_caps(&surface)
+            })
+    }
+
     /// Recompute the OUTPUT HDR state and, on an actual change, log it and signal the
     /// element over the reverse channel (so it can post a `wolf-hdr-state` application
     /// message on the GStreamer bus). The stored-bool compare debounces repeats. No-op
@@ -467,9 +503,28 @@ impl State {
             Some(since) if since.elapsed() >= HDR_DEBOUNCE => {
                 self.last_hdr_state = hdr;
                 self.hdr_candidate_since = None;
-                tracing::info!("output HDR state -> {} (debounced)", if hdr { "HDR" } else { "SDR" });
+                tracing::info!(
+                    "output HDR state -> {} (debounced)",
+                    if hdr { "HDR" } else { "SDR" }
+                );
+                // When going HDR, carry the active surface's REAL mastering / CLL metadata
+                // (from whichever color-management protocol the nested compositor speaks) so
+                // the encoder's SEI reflects the game's actual luminance; `None` => the
+                // producer keeps its hardcoded HDR defaults. SDR carries no metadata.
+                let (mastering, cll) = if hdr {
+                    match self.active_surface_mastering_caps() {
+                        Some((m, c)) => (Some(m), Some(c)),
+                        None => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
                 if let Some(tx) = &self.hdr_state_tx {
-                    let _ = tx.send(Command::HdrState(hdr));
+                    let _ = tx.send(Command::HdrState {
+                        hdr,
+                        mastering,
+                        cll,
+                    });
                 }
             }
             Some(_) => {} // candidate still maturing
@@ -1020,7 +1075,7 @@ pub(crate) fn init(
                 }
                 // Reverse-direction signal: only ever sent compositor -> element over the
                 // dedicated `hdr_state_tx` channel, never received on this command channel.
-                Event::Msg(Command::HdrState(_)) => {}
+                Event::Msg(Command::HdrState { .. }) => {}
             };
         })
         .unwrap();

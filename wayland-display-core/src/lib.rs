@@ -52,7 +52,16 @@ pub enum Command {
     /// dedicated reverse channel (never the element -> compositor command channel), and
     /// drained by the element via [`WaylandDisplay::poll_hdr_state`] so it can surface
     /// the change as a `wolf-hdr-state` application message on the GStreamer bus.
-    HdrState(bool),
+    ///
+    /// `mastering` / `cll` carry the active surface's REAL HDR static metadata (the gst
+    /// `mastering-display-info` / `content-light-level` caps strings) when `hdr` is true and
+    /// either color-management protocol provided it; `None` means the producer keeps its
+    /// hardcoded HDR defaults. Both are `None` when going SDR.
+    HdrState {
+        hdr: bool,
+        mastering: Option<String>,
+        cll: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -313,14 +322,21 @@ impl WaylandDisplay {
     }
 
     /// Drain any pending compositor -> element HDR-state notifications, returning the most
-    /// recent state if it changed (`Some(true)` = HDR, `Some(false)` = SDR), or `None` if
-    /// nothing was signalled. The compositor only sends on this channel when `WOLF_HDR_CM`
-    /// is set, so unset = always `None`.
-    pub fn poll_hdr_state(&self) -> Option<bool> {
+    /// recent state if it changed, or `None` if nothing was signalled. The tuple is
+    /// `(hdr, mastering, cll)`: `hdr` is the new output HDR state, and `mastering` / `cll`
+    /// are the active surface's real HDR static metadata caps strings (or `None` to fall back
+    /// to the producer's hardcoded defaults). The compositor only sends on this channel when
+    /// `WOLF_HDR_CM` is set, so unset = always `None`.
+    pub fn poll_hdr_state(&self) -> Option<(bool, Option<String>, Option<String>)> {
         let mut latest = None;
         while let Ok(cmd) = self.hdr_state_rx.try_recv() {
-            if let Command::HdrState(hdr) = cmd {
-                latest = Some(hdr);
+            if let Command::HdrState {
+                hdr,
+                mastering,
+                cll,
+            } = cmd
+            {
+                latest = Some((hdr, mastering, cll));
             }
         }
         latest
