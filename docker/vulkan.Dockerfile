@@ -114,6 +114,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal && \
     cargo install cargo-c
 
+# Cache-bust the plugin source COPY + compile. The registry build cache (cache-from/
+# cache-to mode=max) can serve a STALE `cargo cinstall` layer even when src/ changed,
+# leaving an outdated plugin .so in the image. Bump this to force a clean recompile.
+ARG PLUGIN_CACHEBUST=2026-06-29-dynamic-hdr
+RUN echo "plugin rebuild: ${PLUGIN_CACHEBUST}"
+
 COPY . /src
 WORKDIR /src
 # Install the plugin .so into /opt/gst's plugin dir (so anything FROM this image,
