@@ -42,19 +42,17 @@ fn hdr_cm_enabled() -> bool {
 fn log_client_buffer_fourcc(surface: &WlSurface) {
     use std::cell::Cell;
     with_states(surface, |states| {
-        let buffer = states
-            .cached_state
-            .get::<SurfaceAttributes>()
-            .current()
-            .buffer
-            .clone();
-        let Some(BufferAssignment::NewBuffer(buffer)) = buffer else {
-            return;
+        // BufferAssignment isn't Clone, so match the committed buffer by reference and pull
+        // out just the (Copy) fourcc + modifier; the cached_state guard stays alive for the
+        // borrow.
+        let attrs = states.cached_state.get::<SurfaceAttributes>();
+        let (fourcc, modifier) = match &attrs.current().buffer {
+            Some(BufferAssignment::NewBuffer(buffer)) => match get_dmabuf(buffer) {
+                Ok(dmabuf) => (dmabuf.format().code, dmabuf.format().modifier),
+                Err(_) => return, // not a dmabuf (e.g. SHM); nothing to report
+            },
+            _ => return,
         };
-        let Ok(dmabuf) = get_dmabuf(&buffer) else {
-            return; // not a dmabuf (e.g. SHM); nothing to report
-        };
-        let fourcc = dmabuf.format().code;
         let last = states
             .data_map
             .get_or_insert::<Cell<Option<Fourcc>>, _>(|| Cell::new(None));
@@ -62,8 +60,7 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
             last.set(Some(fourcc));
             tracing::info!(
                 surface = ?surface.id(),
-                "client_buffer fourcc={fourcc:?} modifier={:?}",
-                dmabuf.format().modifier
+                "client_buffer fourcc={fourcc:?} modifier={modifier:?}"
             );
         }
     });
