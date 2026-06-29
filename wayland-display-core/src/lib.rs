@@ -47,6 +47,12 @@ pub enum Command {
     TouchCancel,
     TouchFrame,
     Quit,
+    /// Compositor -> element signal (reverse direction): the OUTPUT HDR state of the
+    /// active fullscreen surface changed. Sent only when `WOLF_HDR_CM` is set, over a
+    /// dedicated reverse channel (never the element -> compositor command channel), and
+    /// drained by the element via [`WaylandDisplay::poll_hdr_state`] so it can surface
+    /// the change as a `wolf-hdr-state` application message on the GStreamer bus.
+    HdrState(bool),
 }
 
 #[derive(Clone)]
@@ -90,6 +96,10 @@ impl Drop for Trace {
 pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
+    /// Reverse channel (compositor -> element) carrying `Command::HdrState` whenever the
+    /// OUTPUT HDR state changes. Empty unless `WOLF_HDR_CM` is set; drained by
+    /// [`WaylandDisplay::poll_hdr_state`].
+    hdr_state_rx: Receiver<Command>,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -119,6 +129,8 @@ impl WaylandDisplay {
         let (channel_tx, channel_rx) = std::sync::mpsc::sync_channel(0);
         let (devices_tx, devices_rx) = std::sync::mpsc::channel();
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
+        // Reverse channel (compositor -> element) for HDR-state notifications.
+        let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -128,7 +140,13 @@ impl WaylandDisplay {
                 // calloops channel is not "UnwindSafe", but the std channel is... *sigh* lets workaround it creatively
                 let (command_tx, command_src) = smithay::reexports::calloop::channel::channel();
                 channel_tx.send(command_tx).unwrap();
-                comp::init(command_src, render_target, devices_tx, envs_tx);
+                comp::init(
+                    command_src,
+                    render_target,
+                    devices_tx,
+                    envs_tx,
+                    hdr_state_tx,
+                );
             }) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
             }
@@ -138,6 +156,7 @@ impl WaylandDisplay {
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            hdr_state_rx,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -151,17 +170,26 @@ impl WaylandDisplay {
     ) -> Result<WaylandDisplay, CreateDrmNodeError> {
         let (devices_tx, devices_rx) = std::sync::mpsc::channel();
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
+        // Reverse channel (compositor -> element) for HDR-state notifications.
+        let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
 
         let thread_handle = std::thread::spawn(move || {
-            comp::init(commands_rx, render_target, devices_tx, envs_tx);
+            comp::init(
+                commands_rx,
+                render_target,
+                devices_tx,
+                envs_tx,
+                hdr_state_tx,
+            );
         });
 
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            hdr_state_rx,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -282,6 +310,20 @@ impl WaylandDisplay {
         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
         let _ = self.command_tx.send(Command::GetRenderDevice(buffer_tx));
         buffer_rx.recv().unwrap()
+    }
+
+    /// Drain any pending compositor -> element HDR-state notifications, returning the most
+    /// recent state if it changed (`Some(true)` = HDR, `Some(false)` = SDR), or `None` if
+    /// nothing was signalled. The compositor only sends on this channel when `WOLF_HDR_CM`
+    /// is set, so unset = always `None`.
+    pub fn poll_hdr_state(&self) -> Option<bool> {
+        let mut latest = None;
+        while let Ok(cmd) = self.hdr_state_rx.try_recv() {
+            if let Command::HdrState(hdr) = cmd {
+                latest = Some(hdr);
+            }
+        }
+        latest
     }
 }
 

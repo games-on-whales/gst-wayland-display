@@ -1304,6 +1304,23 @@ impl PushSrcImpl for WaylandDisplaySrc {
             return Err(gst::FlowError::Eos);
         };
 
+        // WOLF_HDR_CM: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
+        // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
+        // change, so this posts at most one message per transition.
+        if std::env::var("WOLF_HDR_CM").is_ok() {
+            if let Some(hdr) = state.display.poll_hdr_state() {
+                let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+                let structure = Structure::builder("wolf-hdr-state")
+                    .field("hdr", hdr)
+                    .build();
+                if let Err(err) =
+                    elem.post_message(Application::builder(structure).src(&elem).build())
+                {
+                    gst::warning!(CAT, "Failed to post wolf-hdr-state message: {}", err);
+                }
+            }
+        }
+
         let subscriber = Registry::default().with(GstLayer);
         tracing::subscriber::with_default(subscriber, || {
             state.display.frame().map(CreateSuccess::NewBuffer)

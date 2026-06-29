@@ -9,6 +9,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::gbm::BufferObjectFlags;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::wayland::presentation::Refresh;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::{
     backend::{
@@ -149,6 +150,13 @@ pub struct State {
     /// that advertising color-management (which changes HDR clients' behaviour) stays
     /// opt-in until the buffer-import side is ready.
     color_mgmt_global: Option<GlobalId>,
+    /// Reverse channel (compositor -> element) used to signal OUTPUT HDR-state changes.
+    /// `Some` only when `WOLF_HDR_CM` is set; `None` keeps the per-frame check a no-op so
+    /// behaviour is exactly as before. See [`State::update_hdr_state`].
+    hdr_state_tx: Option<Sender<Command>>,
+    /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
+    /// log + signal on an actual change. Defaults to `false` (SDR).
+    last_hdr_state: bool,
 }
 
 /// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
@@ -388,6 +396,41 @@ impl State {
             viewporter_state,
             single_pixel_buffer_state,
             color_mgmt_global,
+            hdr_state_tx: None,
+            last_hdr_state: false,
+        }
+    }
+
+    /// Whether the active fullscreen surface is HDR (BT.2100 PQ / BT.2020, per
+    /// `wp_color_management_v1`). The compositor forces one fullscreen toplevel at a time,
+    /// so the first mapped window in the space is the active one. `false` when no window is
+    /// mapped or it carries no (or a non-HDR) image description.
+    pub fn output_hdr_state(&self) -> bool {
+        self.space
+            .elements()
+            .next()
+            .and_then(|window| window.wl_surface())
+            .map(|surface| crate::wayland::handlers::color_management::surface_is_hdr(&surface))
+            .unwrap_or(false)
+    }
+
+    /// Recompute the OUTPUT HDR state and, on an actual change, log it and signal the
+    /// element over the reverse channel (so it can post a `wolf-hdr-state` application
+    /// message on the GStreamer bus). The stored-bool compare debounces repeats. No-op
+    /// unless `WOLF_HDR_CM` wired `hdr_state_tx`, so unset = behaviour as before. Does NOT
+    /// touch the producer caps/shader -- this only derives + signals the trigger.
+    pub(crate) fn update_hdr_state(&mut self) {
+        if self.hdr_state_tx.is_none() {
+            return;
+        }
+        let hdr = self.output_hdr_state();
+        if hdr == self.last_hdr_state {
+            return;
+        }
+        self.last_hdr_state = hdr;
+        tracing::info!("output HDR state -> {}", if hdr { "HDR" } else { "SDR" });
+        if let Some(tx) = &self.hdr_state_tx {
+            let _ = tx.send(Command::HdrState(hdr));
         }
     }
 }
@@ -578,6 +621,7 @@ pub(crate) fn init(
     render: impl Into<RenderTarget>,
     devices_tx: Sender<Vec<CString>>,
     envs_tx: Sender<Vec<CString>>,
+    hdr_state_tx: Sender<Command>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -594,6 +638,12 @@ pub(crate) fn init(
     let libinput_backend = LibinputInputBackend::new(libinput_context);
 
     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
+
+    // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
+    // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
+    if std::env::var("WOLF_HDR_CM").is_ok() {
+        state.hdr_state_tx = Some(hdr_state_tx);
+    }
 
     // init event loop
     state
@@ -636,6 +686,10 @@ pub(crate) fn init(
                             Some(ref tracer) => Some(tracer.trace("render")),
                             None => None,
                         };
+                        // Derive + signal the OUTPUT HDR state every frame (no-op unless
+                        // WOLF_HDR_CM is set). Runs before the buffer check so transitions
+                        // are observed even on frames that fail to produce a buffer.
+                        state.update_hdr_state();
                         // apply_video_info may have been unable to set up the output buffer
                         // (e.g. a downstream Vulkan encoder that never shared its
                         // GstVulkanDevice). Fail the frame cleanly instead of letting
@@ -889,6 +943,9 @@ pub(crate) fn init(
                 Event::Msg(Command::TouchFrame) => {
                     state.touch_frame();
                 }
+                // Reverse-direction signal: only ever sent compositor -> element over the
+                // dedicated `hdr_state_tx` channel, never received on this command channel.
+                Event::Msg(Command::HdrState(_)) => {}
             };
         })
         .unwrap();
