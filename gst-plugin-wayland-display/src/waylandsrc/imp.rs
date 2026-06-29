@@ -1359,7 +1359,10 @@ impl PushSrcImpl for WaylandDisplaySrc {
                         "WOLF_HDR_CM: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
                         hdr
                     );
-                    self.obj().src_pad().mark_reconfigure();
+                    self.obj()
+                        .upcast_ref::<gst_base::BaseSrc>()
+                        .src_pad()
+                        .mark_reconfigure();
                 }
             }
         }
