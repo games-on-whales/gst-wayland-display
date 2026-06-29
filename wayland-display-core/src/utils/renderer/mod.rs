@@ -58,7 +58,19 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             debug: false,
             vsync: false,
         };
-        match EGLContext::new_with_config(&egl, attributes, PixelFormatRequirements::_8_bit()) {
+        // All-permissive reqs ("don't care") so config selection matches whatever the
+        // headless EGL offers (the explicit _8_bit() reqs failed to find a config). We only
+        // need GLES 3.0 (so fp16/10-bit dmabufs are textureable), not a specific framebuffer.
+        let reqs = PixelFormatRequirements {
+            hardware_accelerated: None,
+            color_bits: None,
+            float_color_buffer: false,
+            alpha_bits: None,
+            depth_bits: None,
+            stencil_bits: None,
+            multisampling: None,
+        };
+        match EGLContext::new_with_config(&egl, attributes, reqs) {
             Ok(ctx) => {
                 tracing::info!("WOLF_HDR_CM: created a GLES 3.0 EGL context (fp16/10-bit import)");
                 ctx

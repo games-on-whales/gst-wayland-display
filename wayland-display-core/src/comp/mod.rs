@@ -181,28 +181,36 @@ fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFo
         codes.len(),
         codes
     );
-    let mut added = Vec::new();
-    for f in importable
+    // All importable HDR formats (regardless of whether they're already in `formats` from the
+    // render set). Warn only if NONE are importable; otherwise ensure each is advertised.
+    let hdr_importable: Vec<DrmFormat> = importable
         .iter()
         .filter(|f| HDR_IMPORT_FOURCCS.contains(&f.code))
-    {
-        if !formats.contains(f) {
-            formats.push(*f);
-            added.push((f.code, f.modifier));
-        }
-    }
-    if added.is_empty() {
+        .copied()
+        .collect();
+    if hdr_importable.is_empty() {
         tracing::warn!(
             "WOLF_HDR_CM: GLES renderer imports no fp16/10-bit dmabuf formats; HDR clients \
              will fall back to 8-bit"
         );
-    } else {
-        tracing::info!(
-            "WOLF_HDR_CM: advertising {} HDR-capable dmabuf import format(s): {:?}",
-            added.len(),
-            added
-        );
+        return;
     }
+    let mut newly = 0usize;
+    for f in &hdr_importable {
+        if !formats.contains(f) {
+            formats.push(*f);
+            newly += 1;
+        }
+    }
+    let mut hdr_codes: Vec<_> = hdr_importable.iter().map(|f| f.code).collect();
+    hdr_codes.sort_by_key(|c| *c as u32);
+    hdr_codes.dedup();
+    tracing::info!(
+        "WOLF_HDR_CM: {} HDR-capable dmabuf format(s) importable ({} newly advertised): {:?}",
+        hdr_importable.len(),
+        newly,
+        hdr_codes
+    );
 }
 
 impl State {
