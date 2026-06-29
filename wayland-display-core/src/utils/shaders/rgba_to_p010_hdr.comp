@@ -1,0 +1,97 @@
+#version 450
+// HDR render-path spike: LINEAR fp16 RGBA -> P010 (10-bit 4:2:0, BT.2020 NON-CONSTANT-
+// LUMINANCE, limited "TV" range, SMPTE ST 2084 / PQ transfer).
+//
+// This is the WOLF_HDR_SPIKE sibling of rgba_to_p010_bt2020.comp. The ONLY difference is the
+// input encoding:
+//   - rgba_to_p010_bt2020.comp samples an 8-bit *sRGB-gamma* render target, so it must apply
+//     the sRGB EOTF to linearise before the gamut/PQ math.
+//   - This shader samples the WOLF_HDR_SPIKE *fp16* render target (R16G16B16A16_SFLOAT), whose
+//     values are already LINEAR scRGB-like BT.709 light with 1.0 == SDR reference white and
+//     highlights ALLOWED TO EXCEED 1.0. So we MUST NOT apply the sRGB EOTF -- the input is
+//     already linear -- we feed it straight into the gamut + reference-white + PQ pipeline.
+//
+// The point of the spike: a bar rendered at e.g. 4.0 (4x SDR white) survives the fp16 render
+// target, is read here without clamping, scaled to 4*REF_WHITE_NITS nits, PQ-encoded, and lands
+// in P010 as a real brighter-than-white highlight (clamped only at the 10000-nit PQ ceiling).
+//
+// Per-pixel pipeline (cf. the bt2020 shader, minus step 1's sRGB EOTF):
+//   1. (input is already linear BT.709 light, may be > 1.0 -- no EOTF)
+//   2. gamut          : linear BT.709 -> linear BT.2020       (709 fits inside 2020)
+//   3. reference white: linear (1.0 = SDR white) -> nits, 1.0 -> REF_WHITE_NITS, 4.0 ->
+//                       4*REF_WHITE_NITS, then normalise /10000 for PQ (clamp to [0,1])
+//   4. PQ OETF        : normalised linear nits -> PQ code value [0,1]
+//   5. BT.2020 NCL Y'CbCr matrix (limited range) on the PQ-encoded R'G'B'  (identical consts)
+//
+// Bindings (IDENTICAL to rgba_to_p010_bt2020.comp):
+//   0: src     - RGBA input (sampled; here LINEAR fp16, NOT sRGB-gamma)
+//   1: yPlane  - r16  storage image, full resolution (P010 plane 0, 10 bits in the MSBs)
+//   2: uvPlane - rg16 storage image, half resolution (P010 plane 1, Cb in r, Cr in g)
+// Push constant: full-resolution size in pixels.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r16)  uniform writeonly image2D yPlane;
+layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
+
+layout(push_constant) uniform Push { ivec2 size; } pc;
+
+// SDR diffuse white on the HDR display (BT.2408 graphics white = 203). Specialization
+// constant: set at pipeline-build time from the producer's sdr-reference-white (Wolf's
+// [gstreamer.video] sdr_reference_white config), so it's tunable without recompiling.
+layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
+
+// linear BT.709 -> linear BT.2020 primaries (D65, same white point). GLSL is column-major,
+// so each argument below is a COLUMN of the standard row-major 709->2020 matrix.
+const mat3 BT709_TO_BT2020 = mat3(
+    0.627404, 0.069097, 0.016391,
+    0.329283, 0.919541, 0.088013,
+    0.043313, 0.011362, 0.895595);
+
+// SMPTE ST 2084 inverse-EOTF ("OETF"): normalised linear light [0,1] (1.0 = 10000 nits)
+// -> PQ code value [0,1].
+float pq_oetf(float L) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float Lm = pow(L, m1);
+    return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
+}
+
+// LINEAR BT.709 light (1.0 = SDR white, may exceed 1.0) -> PQ-encoded BT.2020 R'G'B'.
+// No sRGB EOTF: the fp16 render target is already linear.
+vec3 linear_to_pq(vec3 lin709) {
+    vec3 lin2020 = BT709_TO_BT2020 * max(lin709, vec3(0.0));
+    vec3 norm = clamp(lin2020 * (REF_WHITE_NITS / 10000.0), 0.0, 1.0);
+    return vec3(pq_oetf(norm.r), pq_oetf(norm.g), pq_oetf(norm.b));
+}
+
+// BT.2020 NCL, limited "TV" range, on PQ-encoded R'G'B' (Kr=0.2627, Kg=0.6780, Kb=0.0593):
+//   Y  = 16/255  + (219/255) * (Kr*R + Kg*G + Kb*B)
+//   Cb = 128/255 + (224/255) * (B - Y') / (2*(1-Kb))
+//   Cr = 128/255 + (224/255) * (R - Y') / (2*(1-Kr))
+float luma(vec3 c) { return 0.2256 * c.r + 0.5823 * c.g + 0.0509 * c.b + 0.0627; }
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
+    ivec2 p  = ch * 2;                            // top-left luma coord
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    vec3 c00 = linear_to_pq(texelFetch(src, p + ivec2(0, 0), 0).rgb);
+    vec3 c10 = linear_to_pq(texelFetch(src, p + ivec2(1, 0), 0).rgb);
+    vec3 c01 = linear_to_pq(texelFetch(src, p + ivec2(0, 1), 0).rgb);
+    vec3 c11 = linear_to_pq(texelFetch(src, p + ivec2(1, 1), 0).rgb);
+
+    imageStore(yPlane, p + ivec2(0, 0), vec4(luma(c00)));
+    imageStore(yPlane, p + ivec2(1, 0), vec4(luma(c10)));
+    imageStore(yPlane, p + ivec2(0, 1), vec4(luma(c01)));
+    imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
+
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average (PQ-encoded R'G'B')
+    float cb = -0.1227 * a.r - 0.3166 * a.g + 0.4392 * a.b + 0.5;
+    float cr =  0.4392 * a.r - 0.4039 * a.g - 0.0353 * a.b + 0.5;
+    imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
+}

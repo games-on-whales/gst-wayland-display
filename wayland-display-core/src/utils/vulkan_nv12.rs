@@ -78,6 +78,14 @@ const RGBA_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010.spv");
 /// [`RGBA_TO_P010_SPV`] but with the BT.2020 luma/chroma matrix, selected when the producer
 /// signals HDR output so the matrix matches the `matrix=bt2020` caps tagging.
 const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt2020.spv");
+/// HDR render-path spike (`WOLF_HDR_SPIKE`) variant of the BT.2020/PQ P010 converter. Same
+/// topology/bindings as [`RGBA_TO_P010_BT2020_SPV`], but its input is the **linear fp16** RGBA
+/// render target (1.0 == SDR reference white, may exceed 1.0) instead of 8-bit sRGB, so it skips
+/// the sRGB EOTF and tone-maps the already-linear value straight to PQ -- proving a >1.0 value
+/// can travel render-target -> converter -> P010 PQ as a brighter-than-white highlight. Selected
+/// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is an
+/// empty placeholder; compile `shaders/rgba_to_p010_hdr.comp` with glslc before using the spike.
+const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
@@ -209,7 +217,16 @@ impl PixFmt {
         match (self, bt2020) {
             (PixFmt::Nv12, _) => RGBA_TO_NV12_SPV,
             (PixFmt::P010, false) => RGBA_TO_P010_SPV,
-            (PixFmt::P010, true) => RGBA_TO_P010_BT2020_SPV,
+            // HDR render-path spike: when WOLF_HDR_SPIKE is set, the RGBA render target is fp16
+            // linear (1.0 == SDR ref white, may exceed 1.0), so use the linear-input PQ shader
+            // instead of the sRGB-input BT.2020/PQ tone-map. Unset = the normal BT.2020 shader.
+            (PixFmt::P010, true) => {
+                if std::env::var("WOLF_HDR_SPIKE").is_ok() {
+                    RGBA_TO_P010_HDR_SPV
+                } else {
+                    RGBA_TO_P010_BT2020_SPV
+                }
+            }
         }
     }
     /// Derive from a negotiated gst video format (anything but P010 -> NV12).
@@ -349,6 +366,10 @@ fn rgba_vk_format(fourcc: DrmFourcc) -> Option<vk::Format> {
     Some(match fourcc {
         DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => vk::Format::R8G8B8A8_UNORM,
         DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => vk::Format::B8G8R8A8_UNORM,
+        // HDR render-path spike (WOLF_HDR_SPIKE): the compositor renders into an fp16 RGBA
+        // dmabuf so highlights can exceed 1.0. The sampler then reads linear fp16 (no clamp),
+        // which the rgba_to_p010_hdr shader expects (1.0 == SDR reference white).
+        DrmFourcc::Abgr16161616f => vk::Format::R16G16B16A16_SFLOAT,
         _ => return None,
     })
 }

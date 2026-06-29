@@ -26,6 +26,19 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+/// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
+/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When the `WOLF_HDR_SPIKE`
+/// env is set this becomes the 64bpp fp16 `Abgr16161616f` so the render target can carry
+/// linear values > 1.0 (HDR highlights) into the Vulkan P010/PQ converter instead of clamping
+/// them at 8-bit white. Unset = byte-for-byte the current 8-bit path.
+fn rgba_render_fourcc() -> DrmFourcc {
+    if std::env::var("WOLF_HDR_SPIKE").is_ok() {
+        DrmFourcc::Abgr16161616f
+    } else {
+        DrmFourcc::Abgr8888
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GsGlesbuffer {
     buffer: GlesRenderbuffer,
@@ -35,7 +48,8 @@ pub struct GsGlesbuffer {
 
 impl GsGlesbuffer {
     pub fn new(renderer: &mut GlesRenderer, video_info: VideoInfo) -> Option<Self> {
-        let format = Fourcc::try_from(video_info.format().to_fourcc()).unwrap_or(Fourcc::Abgr8888);
+        let format = Fourcc::try_from(video_info.format().to_fourcc())
+            .unwrap_or_else(|_| rgba_render_fourcc());
 
         let result = renderer.create_buffer(
             format,
@@ -194,12 +208,18 @@ impl GsNv12Buf {
         fmt: PixFmt,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
+        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
+        let rgba_fourcc = rgba_render_fourcc();
+        tracing::info!(
+            "GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
+            rgba_fourcc == DrmFourcc::Abgr16161616f
+        );
         // RGBA render-target modifier candidates the GLES renderer supports (INVALID last).
         let formats =
             <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
         let mut mods: Vec<Modifier> = formats
             .iter()
-            .filter(|f| f.code == DrmFourcc::Abgr8888)
+            .filter(|f| f.code == rgba_fourcc)
             .map(|f| f.modifier)
             .collect();
         mods.sort_by_key(|m| *m == Modifier::Invalid);
@@ -222,7 +242,7 @@ impl GsNv12Buf {
         let order = rgba_modifier_order(&mods, is_nvidia);
         let rgba = order
             .iter()
-            .find_map(|m| dma.create_buffer(w, h, DrmFourcc::Abgr8888, &[*m]).ok())?;
+            .find_map(|m| dma.create_buffer(w, h, rgba_fourcc, &[*m]).ok())?;
         tracing::debug!(
             "GsNv12Buf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
             rgba.format().modifier
@@ -264,12 +284,18 @@ impl GsVulkanBuf {
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
 
+        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
+        let rgba_fourcc = rgba_render_fourcc();
+        tracing::info!(
+            "GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
+            rgba_fourcc == DrmFourcc::Abgr16161616f
+        );
         // RGBA render-target modifier (same policy as GsNv12Buf: LINEAR except on Nvidia).
         let formats =
             <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
         let mut mods: Vec<Modifier> = formats
             .iter()
-            .filter(|f| f.code == DrmFourcc::Abgr8888)
+            .filter(|f| f.code == rgba_fourcc)
             .map(|f| f.modifier)
             .collect();
         mods.sort_by_key(|m| *m == Modifier::Invalid);
@@ -282,7 +308,7 @@ impl GsVulkanBuf {
         let order = rgba_modifier_order(&mods, is_nvidia);
         let rgba = order
             .iter()
-            .find_map(|m| dma.create_buffer(w, h, DrmFourcc::Abgr8888, &[*m]).ok())?;
+            .find_map(|m| dma.create_buffer(w, h, rgba_fourcc, &[*m]).ok())?;
         tracing::debug!(
             "GsVulkanBuf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
             rgba.format().modifier
