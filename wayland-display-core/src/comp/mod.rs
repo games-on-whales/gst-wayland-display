@@ -413,6 +413,15 @@ impl State {
     /// so the first mapped window in the space is the active one. `false` when no window is
     /// mapped or it carries no (or a non-HDR) image description.
     pub fn output_hdr_state(&self) -> bool {
+        // HDR when EITHER the active surface declares HDR via wp_color_management
+        // (surface_is_hdr) OR the current composited content is a 10-bit already-PQ buffer
+        // (current_input_is_pq). gamescope -- the real Steam/HDR path -- does NOT use the
+        // color-management protocol; it just submits 10-bit PQ buffers, so the fourcc-based
+        // current_input_is_pq is the signal that actually flips for it. Without this the
+        // producer colorimetry never flips to bt2100-pq for a gamescope HDR game.
+        if self.current_input_is_pq {
+            return true;
+        }
         self.space
             .elements()
             .next()
