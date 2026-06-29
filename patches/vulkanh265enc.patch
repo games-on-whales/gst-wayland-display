@@ -3441,10 +3441,10 @@ index ee93c9c..c01eb11 100644
    'vkvp9dec.c',
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
 new file mode 100644
-index 0000000..2bf6676
+index 0000000..566b622
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
-@@ -0,0 +1,2623 @@
+@@ -0,0 +1,2632 @@
 +/* GStreamer
 + * Copyright (C) 2025 Igalia, S.L.
 + *     Author: Stéphane Cerveau <scerveau@igalia.com>
@@ -4325,6 +4325,16 @@ index 0000000..2bf6676
 +    /* *INDENT-ON* */
 +  }
 +
++  /* Refresh in_state up-front, BEFORE the same-profile early-return below, so a
++   * colorimetry-only mid-stream change (dynamic SDR<->HDR: bt709 <-> bt2100-pq, plus
++   * the mastering/CLL caps fields) updates the source the VUI + HDR SEI are built from
++   * (_set_vui_colour_description / _write_hdr_sei read self->in_state). Previously this
++   * lived after the early-return, so same-profile colorimetry flips kept stale in_state
++   * and the emitted VUI never changed. */
++  if (self->in_state)
++    gst_video_codec_state_unref (self->in_state);
++  self->in_state = gst_video_codec_state_ref (in_state);
++
 +  if (gst_vulkan_encoder_is_started (self->encoder)) {
 +    if (self->profile.profile.chromaSubsampling == chroma_subsampling
 +        && self->profile.profile.chromaBitDepth == bit_depth_chroma
@@ -4458,9 +4468,8 @@ index 0000000..2bf6676
 +    gst_h265_encoder_set_preferred_output_delay (encoder, 4);
 +  }
 +
-+  if (self->in_state)
-+    gst_video_codec_state_unref (self->in_state);
-+  self->in_state = gst_video_codec_state_ref (in_state);
++  /* (in_state refresh hoisted to the top of this function so colorimetry-only
++   * mid-stream changes update the VUI/SEI even on the same-profile early-return.) */
 +
 +  {
 +    /* The coded picture tiles whole CTBs and the encode-source image must
