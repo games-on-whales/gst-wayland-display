@@ -14,6 +14,12 @@ on:
     paths-ignore:
       - "docs/**"
 
+# Cancel an in-flight run when a newer commit lands on the same ref, so two
+# builds never race to publish :vulkan / write the shared buildcache.
+concurrency:
+  group: vulkan-image-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
@@ -25,13 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Push only when we can authenticate to GHCR: push events and same-repo PRs.
-      # Fork PRs have no package-write token, so they build (validate) without pushing.
+      # Publish ONLY on push events. A branch with an open PR fires BOTH a push
+      # and a pull_request run for the same commit; when both pushed :vulkan (and
+      # both wrote the shared buildcache) they raced — separate buildx caches,
+      # last-to-finish wins — non-deterministically publishing a STALE plugin .so.
+      # pull_request runs now build-validate only (no push, no cache write).
       - name: Decide push
         id: prep
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ] || \
-             [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
             echo "push=true" >> "$GITHUB_OUTPUT"
           else
             echo "push=false" >> "$GITHUB_OUTPUT"
