@@ -34,7 +34,10 @@ layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
 
 layout(push_constant) uniform Push { ivec2 size; } pc;
 
-const float REF_WHITE_NITS = 203.0; // SDR diffuse white on the HDR display (BT.2408)
+// SDR diffuse white on the HDR display (BT.2408 graphics white = 203). Specialization
+// constant: set at pipeline-build time from the producer's sdr-reference-white (Wolf's
+// [gstreamer.video] sdr_reference_white config), so it's tunable without recompiling.
+layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
 
 // linear BT.709 -> linear BT.2020 primaries (D65, same white point). GLSL is column-major,
 // so each argument below is a COLUMN of the standard row-major 709->2020 matrix.

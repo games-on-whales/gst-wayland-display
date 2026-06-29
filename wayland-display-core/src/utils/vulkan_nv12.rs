@@ -555,6 +555,22 @@ impl VulkanNv12 {
             None,
         )?;
         let entry_name = c"main";
+        // SDR reference white (nits) -> specialization constant 0 of the BT.2020/PQ shader,
+        // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
+        // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
+        // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
+        let sdr_ref_white: f32 = std::env::var("WOLF_SDR_REFERENCE_WHITE")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(203.0);
+        let spec_data = sdr_ref_white.to_ne_bytes();
+        let spec_entries = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(std::mem::size_of::<f32>())];
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(&spec_data);
         let pipeline = device
             .create_compute_pipelines(
                 vk::PipelineCache::null(),
@@ -563,7 +579,8 @@ impl VulkanNv12 {
                         vk::PipelineShaderStageCreateInfo::default()
                             .stage(vk::ShaderStageFlags::COMPUTE)
                             .module(module)
-                            .name(entry_name),
+                            .name(entry_name)
+                            .specialization_info(&spec_info),
                     )
                     .layout(pipeline_layout)],
                 None,
@@ -748,6 +765,22 @@ impl VulkanNv12 {
             None,
         )?;
         let entry_name = c"main";
+        // SDR reference white (nits) -> specialization constant 0 of the BT.2020/PQ shader,
+        // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
+        // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
+        // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
+        let sdr_ref_white: f32 = std::env::var("WOLF_SDR_REFERENCE_WHITE")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(203.0);
+        let spec_data = sdr_ref_white.to_ne_bytes();
+        let spec_entries = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(std::mem::size_of::<f32>())];
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(&spec_data);
         let pipeline = device
             .create_compute_pipelines(
                 vk::PipelineCache::null(),
@@ -756,7 +789,8 @@ impl VulkanNv12 {
                         vk::PipelineShaderStageCreateInfo::default()
                             .stage(vk::ShaderStageFlags::COMPUTE)
                             .module(module)
-                            .name(entry_name),
+                            .name(entry_name)
+                            .specialization_info(&spec_info),
                     )
                     .layout(pipeline_layout)],
                 None,
