@@ -46,7 +46,33 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             display
         }
     };
-    let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
+    // EGLContext::new() defaults to a GLES 2 context; GLES2 can't texture RGBA16F / RGB10_A2,
+    // so EGL excludes fp16/10-bit from the renderer's importable dmabuf formats and HDR clients
+    // can't hand us HDR buffers. Under WOLF_HDR_CM request a GLES 3.0 context so those formats
+    // become importable. Gated so the default (SDR) path is byte-for-byte unchanged.
+    let context = if std::env::var("WOLF_HDR_CM").is_ok() {
+        use smithay::backend::egl::context::{GlAttributes, PixelFormatRequirements};
+        let attributes = GlAttributes {
+            version: (3, 0),
+            profile: None,
+            debug: false,
+            vsync: false,
+        };
+        match EGLContext::new_with_config(&egl, attributes, PixelFormatRequirements::_8_bit()) {
+            Ok(ctx) => {
+                tracing::info!("WOLF_HDR_CM: created a GLES 3.0 EGL context (fp16/10-bit import)");
+                ctx
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "WOLF_HDR_CM: GLES 3.0 context failed ({e}); falling back to default"
+                );
+                EGLContext::new(&egl).expect("Failed to initialize EGL context")
+            }
+        }
+    } else {
+        EGLContext::new(&egl).expect("Failed to initialize EGL context")
+    };
     let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
     renderer
 }

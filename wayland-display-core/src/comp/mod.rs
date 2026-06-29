@@ -154,10 +154,13 @@ pub struct State {
 /// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
 /// renderer can import them): fp16 scRGB-linear (`Abgr16161616f`) and 10-bit (`Abgr2101010`
 /// / `Argb2101010`). These let HDR clients submit real HDR buffers instead of 8-bit sRGB.
-const HDR_IMPORT_FOURCCS: [Fourcc; 3] = [
+const HDR_IMPORT_FOURCCS: [Fourcc; 6] = [
     Fourcc::Abgr16161616f,
+    Fourcc::Xbgr16161616f,
     Fourcc::Abgr2101010,
+    Fourcc::Xbgr2101010,
     Fourcc::Argb2101010,
+    Fourcc::Xrgb2101010,
 ];
 
 /// Add the HDR-capable dmabuf formats (fp16 / 10-bit) the GLES renderer can actually
@@ -168,6 +171,16 @@ const HDR_IMPORT_FOURCCS: [Fourcc; 3] = [
 fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFormat>) {
     use smithay::backend::renderer::ImportDma;
     let importable = renderer.dmabuf_formats();
+    // Diagnostic: dump the distinct importable fourccs so we can see what the EGL actually
+    // reports (and whether HDR formats appear under an unexpected fourcc).
+    let mut codes: Vec<_> = importable.iter().map(|f| f.code).collect();
+    codes.sort_by_key(|c| *c as u32);
+    codes.dedup();
+    tracing::info!(
+        "WOLF_HDR_CM: renderer importable dmabuf fourccs ({}): {:?}",
+        codes.len(),
+        codes
+    );
     let mut added = Vec::new();
     for f in importable
         .iter()
