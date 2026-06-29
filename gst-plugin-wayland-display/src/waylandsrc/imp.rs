@@ -933,7 +933,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // wp_color_management/sway) -- so the "HDR Luminance" slider actually flows through to
         // the encoder's mastering/CLL SEI -- falling back to the hardcoded defaults when the
         // game provided none. The static `hdr` property path keeps using the defaults verbatim.
-        let (hdr_mastering, hdr_cll): (String, String) = if hdr_cm {
+        let (mut hdr_mastering, mut hdr_cll): (String, String) = if hdr_cm {
             let meta = self.hdr_meta.lock().unwrap();
             (
                 meta.0.clone().unwrap_or_else(|| HDR_MASTERING.to_string()),
@@ -942,6 +942,21 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         } else {
             (HDR_MASTERING.to_string(), HDR_CLL.to_string())
         };
+        // Diagnostic / manual override of the static HDR metadata via environment, so the
+        // mastering-display peak and content-light-level can be swept at runtime (container
+        // restart, no rebuild). `WOLF_HDR_MASTERING` is a full gst mastering-display-info
+        // string (R:G:B:W chroma *50000, then max:min luminance in 0.0001 cd/m^2);
+        // `WOLF_HDR_CLL` is "maxCLL:maxFALL" in cd/m^2. Empty/unset => leave as computed.
+        if let Ok(v) = std::env::var("WOLF_HDR_MASTERING") {
+            if !v.trim().is_empty() {
+                hdr_mastering = v;
+            }
+        }
+        if let Ok(v) = std::env::var("WOLF_HDR_CLL") {
+            if !v.trim().is_empty() {
+                hdr_cll = v;
+            }
+        }
         // SDR colorimetry for the P010 path under WOLF_HDR_CM when the content is not PQ:
         // BT.709 (primaries=bt709, transfer=bt709, matrix=bt709, range=limited) and NO
         // mastering-display-info / content-light-level, so the encoder flips its VUI back to
