@@ -12,7 +12,7 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
@@ -34,6 +34,12 @@ pub struct WaylandDisplaySrc {
     settings: Mutex<Settings>,
     command_tx: Sender<Command>,
     command_rx: Mutex<Option<Channel<Command>>>,
+    /// Live HDR-colorimetry state (WOLF_HDR_CM only). Mirrors the latest
+    /// `poll_hdr_state()` value: `true` => the P010 output caps carry BT.2100 PQ
+    /// colorimetry + mastering/CLL, `false` => BT.709 SDR (no static metadata).
+    /// Read in `caps()`, driven per-frame in `create()`. Default `false`. When
+    /// WOLF_HDR_CM is unset this is never consulted (the static `hdr` property governs).
+    hdr_active: AtomicBool,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -44,6 +50,7 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx,
             command_rx: Mutex::new(Some(command_rx)),
+            hdr_active: AtomicBool::new(false),
         }
     }
 }
@@ -899,10 +906,25 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         //   mastering-display-info: R:G:B:W chromaticity (x,y * 50000) + max:min luminance
         //                (* 10000 cd/m^2) -> BT.2020 primaries, 1000 nit / 0.0001 nit.
         //   content-light-level: MaxCLL:MaxFALL -> 1000 : 400.
-        let hdr = self.settings.lock().unwrap().hdr;
+        // WOLF_HDR_CM: TRUE dynamic HDR. The stream stays P010/Main-10 always, but its
+        // colorimetry flips mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR
+        // content) following the live compositor HDR state (`hdr_active`, driven per-frame
+        // by `poll_hdr_state()` in `create()`). When the flag is unset this is byte-identical
+        // to the previous behaviour: the static `hdr` property alone governs the P010 caps.
+        let hdr_cm = std::env::var("WOLF_HDR_CM").is_ok();
+        let hdr = if hdr_cm {
+            self.hdr_active.load(Ordering::Relaxed)
+        } else {
+            self.settings.lock().unwrap().hdr
+        };
         const HDR_COLORIMETRY: &str = "bt2100-pq";
         const HDR_MASTERING: &str = "35400:14600:8500:39850:6550:2300:15635:16450:10000000:1";
         const HDR_CLL: &str = "1000:400";
+        // SDR colorimetry for the P010 path under WOLF_HDR_CM when the content is not PQ:
+        // BT.709 (primaries=bt709, transfer=bt709, matrix=bt709, range=limited) and NO
+        // mastering-display-info / content-light-level, so the encoder flips its VUI back to
+        // SDR. Format stays P010_10LE (Main-10) either way.
+        const SDR_COLORIMETRY: &str = "bt709";
 
         // P010 (10-bit 4:2:0) via the same Vulkan converter, for a downstream that asks for
         // it (e.g. a Main-10 dmabuf encoder). Offered as a fallback after NV12/RGBA -- NV12
@@ -937,6 +959,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     .field("colorimetry", HDR_COLORIMETRY)
                     .field("mastering-display-info", HDR_MASTERING)
                     .field("content-light-level", HDR_CLL);
+            } else if hdr_cm {
+                // WOLF_HDR_CM + SDR content: tag BT.709, no HDR static metadata.
+                b = b.field("colorimetry", SDR_COLORIMETRY);
             }
             caps.merge(b.build());
         }
@@ -971,6 +996,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     .field("colorimetry", HDR_COLORIMETRY)
                     .field("mastering-display-info", HDR_MASTERING)
                     .field("content-light-level", HDR_CLL);
+            } else if hdr_cm {
+                // WOLF_HDR_CM + SDR content: tag BT.709, no HDR static metadata.
+                p010_vk_b = p010_vk_b.field("colorimetry", SDR_COLORIMETRY);
             }
             let mut merged = nv12_vk;
             merged.merge(p010_vk_b.build());
@@ -1317,6 +1345,21 @@ impl PushSrcImpl for WaylandDisplaySrc {
                     elem.post_message(Application::builder(structure).src(&elem).build())
                 {
                     gst::warning!(CAT, "Failed to post wolf-hdr-state message: {}", err);
+                }
+
+                // Drive the live HDR-colorimetry state. On an actual change, mark the src pad
+                // for reconfiguration: BaseSrc's streaming loop calls
+                // `gst_pad_check_reconfigure()` before the next buffer, which re-runs
+                // negotiate -> `caps()`/`fixate()`/`set_caps`, producing the new colorimetry
+                // (BT.2100 PQ <-> BT.709) and pushing a fresh CAPS event downstream. The
+                // downstream encoder re-emits its VUI + HDR SEI at the next IDR.
+                if self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr {
+                    gst::info!(
+                        CAT,
+                        "WOLF_HDR_CM: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
+                        hdr
+                    );
+                    self.obj().src_pad().mark_reconfigure();
                 }
             }
         }
