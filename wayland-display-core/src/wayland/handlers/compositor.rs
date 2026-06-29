@@ -185,18 +185,17 @@ impl CompositorHandler for State {
         // Only the toplevel window's content drives this (cursors / popups are ignored); the
         // surface's buffer fourcc flips between 8-bit (Steam UI -> false) and 10-bit (the HDR
         // game -> true) within one gamescope surface. Off (no-op) unless WOLF_HDR_CM is set.
+        // gamescope presents ONE composited output surface to us, and its buffer fourcc flips
+        // 8-bit (Steam UI -> false) <-> 10-bit (HDR game -> true). Tying this to the
+        // space-window match was too strict (gamescope's content surface isn't always the
+        // mapped toplevel), so drive it directly off any dmabuf commit. Cursors here are
+        // MemoryRenderBuffers, not client dmabufs, so they don't perturb this.
         if hdr_cm_enabled() {
-            let is_window = self
-                .space
-                .elements()
-                .any(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false));
-            if is_window {
-                let pq = committed_dmabuf_fourcc(surface)
-                    .map(is_pq_fourcc)
-                    .unwrap_or(false);
+            if let Some(fourcc) = committed_dmabuf_fourcc(surface) {
+                let pq = is_pq_fourcc(fourcc);
                 if self.current_input_is_pq != pq {
                     self.current_input_is_pq = pq;
-                    tracing::info!("pq_passthrough -> {pq}");
+                    tracing::info!("pq_passthrough -> {pq} (fourcc={fourcc:?})");
                 }
             }
         }
