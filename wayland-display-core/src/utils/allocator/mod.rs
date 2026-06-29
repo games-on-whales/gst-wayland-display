@@ -423,6 +423,21 @@ pub enum GsBufferType {
     CUDA(GsCUDABuf),
 }
 
+impl GsBufferType {
+    /// The fourcc of the RGBA dmabuf the scene is rendered into for the Vulkan-converter buffer
+    /// types (NV12/VULKAN) -- i.e. the GLES render target that is also the converter's input.
+    /// `None` for buffer types without a separate RGBA render target. The HDR spike uses this to
+    /// confirm the render target is fp16 (`Abgr16161616f`) before reading it back off the GLES
+    /// framebuffer.
+    pub fn render_rgba_fourcc(&self) -> Option<DrmFourcc> {
+        match self {
+            GsBufferType::NV12(b) => Some(b.rgba.format().code),
+            GsBufferType::VULKAN(b) => Some(b.rgba.format().code),
+            _ => None,
+        }
+    }
+}
+
 pub enum VideoInfoTypes {
     VideoInfo(VideoInfo),
     VideoInfoDmaDrm(VideoInfoDmaDrm),
