@@ -165,10 +165,24 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        // WOLF_HDR_CM: report what pixel format the client committed (so we can confirm an
-        // HDR game submits fp16 / 10-bit buffers). Off (no-op) unless WOLF_HDR_CM is set.
+        // WOLF_HDR_CM: read the just-committed dmabuf fourcc ONCE, here, BEFORE the
+        // window/popup commits below advance the surface's double-buffered state (which would
+        // consume current().buffer and make a later read return None -- that was the bug). One
+        // read drives both the diagnostic log and the per-frame PQ-passthrough decision.
+        // gamescope presents ONE composited output surface whose buffer fourcc flips 8-bit
+        // (Steam UI -> SDR) <-> 10-bit (HDR game -> already-PQ); the converter uses
+        // current_input_is_pq to pick the matrix-only passthrough vs the SDR->PQ tone-map.
+        // Off (no-op) unless WOLF_HDR_CM is set. Cursors here are MemoryRenderBuffers, not
+        // client dmabufs, so they don't perturb this.
         if hdr_cm_enabled() {
             log_client_buffer_fourcc(surface);
+            if let Some(fourcc) = committed_dmabuf_fourcc(surface) {
+                let pq = is_pq_fourcc(fourcc);
+                if self.current_input_is_pq != pq {
+                    self.current_input_is_pq = pq;
+                    tracing::info!("pq_passthrough -> {pq} (fourcc={fourcc:?})");
+                }
+            }
         }
 
         if let Some(window) = self
@@ -179,26 +193,6 @@ impl CompositorHandler for State {
             window.on_commit();
         }
         self.popups.commit(surface);
-
-        // WOLF_HDR_CM: track whether the active fullscreen surface's latest buffer is 10-bit
-        // already-PQ content, so the Vulkan converter picks the per-frame passthrough shader.
-        // Only the toplevel window's content drives this (cursors / popups are ignored); the
-        // surface's buffer fourcc flips between 8-bit (Steam UI -> false) and 10-bit (the HDR
-        // game -> true) within one gamescope surface. Off (no-op) unless WOLF_HDR_CM is set.
-        // gamescope presents ONE composited output surface to us, and its buffer fourcc flips
-        // 8-bit (Steam UI -> false) <-> 10-bit (HDR game -> true). Tying this to the
-        // space-window match was too strict (gamescope's content surface isn't always the
-        // mapped toplevel), so drive it directly off any dmabuf commit. Cursors here are
-        // MemoryRenderBuffers, not client dmabufs, so they don't perturb this.
-        if hdr_cm_enabled() {
-            if let Some(fourcc) = committed_dmabuf_fourcc(surface) {
-                let pq = is_pq_fourcc(fourcc);
-                if self.current_input_is_pq != pq {
-                    self.current_input_is_pq = pq;
-                    tracing::info!("pq_passthrough -> {pq} (fourcc={fourcc:?})");
-                }
-            }
-        }
 
         // send the initial configure if relevant
         if let Some(idx) = self

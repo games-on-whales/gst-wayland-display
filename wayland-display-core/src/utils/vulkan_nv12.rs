@@ -85,6 +85,9 @@ const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt20
 /// can travel render-target -> converter -> P010 PQ as a brighter-than-white highlight. Selected
 /// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is an
 /// empty placeholder; compile `shaders/rgba_to_p010_hdr.comp` with glslc before using the spike.
+// Retained for the WOLF_HDR_SPIKE linear-bars proof; the real SDR path uses the sRGB
+// tone-map and HDR content uses the passthrough pipeline, so this is otherwise unused.
+#[allow(dead_code)]
 const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv");
 /// PQ-passthrough variant of the P010 converter (`WOLF_HDR_CM`). Same topology/bindings as
 /// [`RGBA_TO_P010_BT2020_SPV`], but it applies ONLY the BT.2020 limited-range Y'CbCr matrix --
@@ -232,11 +235,15 @@ impl PixFmt {
             (PixFmt::Nv12, _) => RGBA_TO_NV12_SPV,
             (PixFmt::P010, false) => RGBA_TO_P010_SPV,
             (PixFmt::P010, true) => {
-                if fp16_input {
-                    RGBA_TO_P010_HDR_SPV
-                } else {
-                    RGBA_TO_P010_BT2020_SPV
-                }
+                // The "normal" (non-passthrough) pipeline. SDR client content -- whether on an
+                // 8-bit target or stored sRGB-gamma in the fp16 target (Smithay does NOT
+                // linearise when sampling SDR clients) -- needs the sRGB-EOTF + tone-map shader.
+                // The linear-input shader (RGBA_TO_P010_HDR_SPV) only suited the synthetic
+                // WOLF_HDR_SPIKE bars (genuinely linear); real gamescope/Steam SDR is sRGB-gamma,
+                // so feeding it to the linear shader PQ-encoded gamma-as-linear -> washed out.
+                // Already-PQ 10-bit content takes the separate passthrough pipeline instead.
+                let _ = fp16_input;
+                RGBA_TO_P010_BT2020_SPV
             }
         }
     }
