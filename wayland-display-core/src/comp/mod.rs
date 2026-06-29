@@ -39,6 +39,7 @@ use smithay::{
             timer::{TimeoutAction, Timer},
         },
         input::Libinput,
+        wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::WpColorManagerV1,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
         wayland_server::{
@@ -144,6 +145,10 @@ pub struct State {
     viewporter_state: ViewporterState,
     cursor_event_count: i32,
     pub single_pixel_buffer_state: SinglePixelBufferState,
+    /// `wp_color_manager_v1` global id, present only when `WOLF_HDR_CM` is set. Gated so
+    /// that advertising color-management (which changes HDR clients' behaviour) stays
+    /// opt-in until the buffer-import side is ready.
+    color_mgmt_global: Option<GlobalId>,
 }
 
 impl State {
@@ -167,6 +172,19 @@ impl State {
         let shell_state = XdgShellState::new::<State>(&dh);
         let viewporter_state = ViewporterState::new::<State>(&dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+
+        // Color management (staging wp_color_manager_v1). Gated behind WOLF_HDR_CM:
+        // advertising it makes HDR clients enable their HDR path and tags HDR surfaces,
+        // but the buffer-import side isn't ready yet, so it must be opt-in. When unset the
+        // global is never created and behaviour is exactly as before.
+        let color_mgmt_global = if std::env::var("WOLF_HDR_CM").is_ok() {
+            tracing::info!(
+                "WOLF_HDR_CM set: advertising wp_color_manager_v1 (HDR-capable PQ/BT2020 output)"
+            );
+            Some(dh.create_global::<State, WpColorManagerV1, _>(1, ()))
+        } else {
+            None
+        };
 
         let render_node: Option<DrmNode> = render_target.clone().into();
 
@@ -299,6 +317,7 @@ impl State {
             shm_state,
             viewporter_state,
             single_pixel_buffer_state,
+            color_mgmt_global,
         }
     }
 }

@@ -1,3 +1,4 @@
+pub mod color_management;
 pub mod compositor;
 pub mod data_device;
 pub mod dmabuf;
