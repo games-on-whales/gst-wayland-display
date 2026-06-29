@@ -212,16 +212,19 @@ impl PixFmt {
         }
     }
     /// Pick the matching compute shader SPIR-V. `bt2020` selects the BT.2020 (HDR / BT.2100-PQ)
-    /// matrix variant on the P010 path; it has no effect on NV12 (8-bit SDR stays BT.601).
-    fn shader(self, bt2020: bool) -> &'static [u8] {
+    /// matrix variant on the P010 path; `fp16_input` is true when the RGBA render target the
+    /// converter samples is the linear fp16 (`Abgr16161616f` -> `R16G16B16A16_SFLOAT`) HDR
+    /// target instead of an 8-bit sRGB target. On the P010+bt2020 path the input format -- not
+    /// any env var -- chooses the shader: a linear fp16 input (real HDR client content, or the
+    /// `WOLF_HDR_SPIKE` bars) feeds the linear-input PQ shader (no sRGB EOTF, values may exceed
+    /// 1.0); an 8-bit sRGB input feeds the sRGB-input BT.2020/PQ tone-map. Neither flag affects
+    /// NV12 (8-bit SDR stays BT.601).
+    fn shader(self, bt2020: bool, fp16_input: bool) -> &'static [u8] {
         match (self, bt2020) {
             (PixFmt::Nv12, _) => RGBA_TO_NV12_SPV,
             (PixFmt::P010, false) => RGBA_TO_P010_SPV,
-            // HDR render-path spike: when WOLF_HDR_SPIKE is set, the RGBA render target is fp16
-            // linear (1.0 == SDR ref white, may exceed 1.0), so use the linear-input PQ shader
-            // instead of the sRGB-input BT.2020/PQ tone-map. Unset = the normal BT.2020 shader.
             (PixFmt::P010, true) => {
-                if std::env::var("WOLF_HDR_SPIKE").is_ok() {
+                if fp16_input {
                     RGBA_TO_P010_HDR_SPV
                 } else {
                     RGBA_TO_P010_BT2020_SPV
@@ -462,6 +465,7 @@ impl VulkanNv12 {
         video_info: VideoInfoDmaDrm,
         fmt: PixFmt,
         bt2020: bool,
+        fp16_input: bool,
     ) -> Option<Self> {
         let width = video_info.width();
         let height = video_info.height();
@@ -474,7 +478,17 @@ impl VulkanNv12 {
             DRM_FORMAT_MOD_INVALID => DRM_FORMAT_MOD_LINEAR,
             m => m,
         };
-        match unsafe { Self::new_inner(width, height, modifier, target_minor, fmt, bt2020) } {
+        match unsafe {
+            Self::new_inner(
+                width,
+                height,
+                modifier,
+                target_minor,
+                fmt,
+                bt2020,
+                fp16_input,
+            )
+        } {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::error!("VulkanNv12::new_inner failed: {e}");
@@ -483,6 +497,7 @@ impl VulkanNv12 {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn new_inner(
         width: u32,
         height: u32,
@@ -490,6 +505,7 @@ impl VulkanNv12 {
         target_minor: u32,
         fmt: PixFmt,
         bt2020: bool,
+        fp16_input: bool,
     ) -> Result<Self, Err> {
         let entry = ash::Entry::load()?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
@@ -546,11 +562,11 @@ impl VulkanNv12 {
         let queue = device.get_device_queue(qfi, 0);
         let memp = instance.get_physical_device_memory_properties(pd);
 
-        // ---- compute pipeline (shader selected by output format) ----
+        // ---- compute pipeline (shader selected by output format + input format) ----
         let module = device.create_shader_module(
             &vk::ShaderModuleCreateInfo {
-                code_size: fmt.shader(bt2020).len(),
-                p_code: fmt.shader(bt2020).as_ptr() as *const u32,
+                code_size: fmt.shader(bt2020, fp16_input).len(),
+                p_code: fmt.shader(bt2020, fp16_input).as_ptr() as *const u32,
                 ..Default::default()
             },
             None,
@@ -716,6 +732,7 @@ impl VulkanNv12 {
     /// `vkCmdCopyImage`'d into the pool's encode-src image, left in `VIDEO_ENCODE_SRC`
     /// layout for `vulkanh264enc` to view zero-copy. Same device as the encoder, so ordering
     /// is a plain fence wait (the encoder does its own input acquire).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_on_shared(
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
@@ -725,10 +742,11 @@ impl VulkanNv12 {
         height: u32,
         fmt: PixFmt,
         bt2020: bool,
+        fp16_input: bool,
     ) -> Option<Self> {
         match unsafe {
             Self::new_on_shared_inner(
-                device_gst, raw, nv12_caps, profile, width, height, fmt, bt2020,
+                device_gst, raw, nv12_caps, profile, width, height, fmt, bt2020, fp16_input,
             )
         } {
             Ok(v) => Some(v),
@@ -739,6 +757,7 @@ impl VulkanNv12 {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn new_on_shared_inner(
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
@@ -748,6 +767,7 @@ impl VulkanNv12 {
         height: u32,
         fmt: PixFmt,
         bt2020: bool,
+        fp16_input: bool,
     ) -> Result<Self, Err> {
         // Drive ash on the encoder's existing instance/device (do NOT create our own).
         let entry = ash::Entry::load()?;
@@ -759,8 +779,8 @@ impl VulkanNv12 {
         // ---- compute pipeline (same as the dmabuf path, on the shared device) ----
         let module = device.create_shader_module(
             &vk::ShaderModuleCreateInfo {
-                code_size: fmt.shader(bt2020).len(),
-                p_code: fmt.shader(bt2020).as_ptr() as *const u32,
+                code_size: fmt.shader(bt2020, fp16_input).len(),
+                p_code: fmt.shader(bt2020, fp16_input).as_ptr() as *const u32,
                 ..Default::default()
             },
             None,

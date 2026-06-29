@@ -1,4 +1,5 @@
 use smithay::{
+    backend::allocator::{Buffer as _, Fourcc},
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
@@ -25,6 +26,48 @@ use smithay::{
 };
 
 use crate::comp::{ClientState, FocusTarget, State};
+
+/// Whether `WOLF_HDR_CM` is set (read once). Gates the per-surface client-buffer-format
+/// logging below, which would otherwise be hot in the commit path.
+fn hdr_cm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("WOLF_HDR_CM").is_ok())
+}
+
+/// WOLF_HDR_CM diagnostic: log the fourcc (and modifier) of the dmabuf a client just
+/// committed to `surface`, so we can see what pixel format an HDR game actually submits
+/// (e.g. `Abgr16161616f` for scRGB-fp16, `Abgr2101010` for 10-bit). Logged only when the
+/// fourcc changes per surface (avoids per-frame spam); SHM / non-dmabuf buffers are skipped.
+fn log_client_buffer_fourcc(surface: &WlSurface) {
+    use std::cell::Cell;
+    with_states(surface, |states| {
+        let buffer = states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .buffer
+            .clone();
+        let Some(BufferAssignment::NewBuffer(buffer)) = buffer else {
+            return;
+        };
+        let Ok(dmabuf) = get_dmabuf(&buffer) else {
+            return; // not a dmabuf (e.g. SHM); nothing to report
+        };
+        let fourcc = dmabuf.format().code;
+        let last = states
+            .data_map
+            .get_or_insert::<Cell<Option<Fourcc>>, _>(|| Cell::new(None));
+        if last.get() != Some(fourcc) {
+            last.set(Some(fourcc));
+            tracing::info!(
+                surface = ?surface.id(),
+                "client_buffer fourcc={fourcc:?} modifier={:?}",
+                dmabuf.format().modifier
+            );
+        }
+    });
+}
 
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
@@ -100,6 +143,12 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // WOLF_HDR_CM: report what pixel format the client committed (so we can confirm an
+        // HDR game submits fp16 / 10-bit buffers). Off (no-op) unless WOLF_HDR_CM is set.
+        if hdr_cm_enabled() {
+            log_client_buffer_fourcc(surface);
+        }
 
         if let Some(window) = self
             .space

@@ -151,6 +151,47 @@ pub struct State {
     color_mgmt_global: Option<GlobalId>,
 }
 
+/// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
+/// renderer can import them): fp16 scRGB-linear (`Abgr16161616f`) and 10-bit (`Abgr2101010`
+/// / `Argb2101010`). These let HDR clients submit real HDR buffers instead of 8-bit sRGB.
+const HDR_IMPORT_FOURCCS: [Fourcc; 3] = [
+    Fourcc::Abgr16161616f,
+    Fourcc::Abgr2101010,
+    Fourcc::Argb2101010,
+];
+
+/// Add the HDR-capable dmabuf formats (fp16 / 10-bit) the GLES renderer can actually
+/// *import* (queried from `ImportDma::dmabuf_formats`, i.e. the EGL texture-import set) to
+/// `formats`, so HDR clients submit HDR buffers. Only the HDR fourccs the renderer supports
+/// are added (never widening the SDR advertisement), skipping any already present. Logs the
+/// formats advertised. Called only when WOLF_HDR_CM is set.
+fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFormat>) {
+    use smithay::backend::renderer::ImportDma;
+    let importable = renderer.dmabuf_formats();
+    let mut added = Vec::new();
+    for f in importable
+        .iter()
+        .filter(|f| HDR_IMPORT_FOURCCS.contains(&f.code))
+    {
+        if !formats.contains(f) {
+            formats.push(*f);
+            added.push((f.code, f.modifier));
+        }
+    }
+    if added.is_empty() {
+        tracing::warn!(
+            "WOLF_HDR_CM: GLES renderer imports no fp16/10-bit dmabuf formats; HDR clients \
+             will fall back to 8-bit"
+        );
+    } else {
+        tracing::info!(
+            "WOLF_HDR_CM: advertising {} HDR-capable dmabuf import format(s): {:?}",
+            added.len(),
+            added
+        );
+    }
+}
+
 impl State {
     pub fn new(
         render_target: &RenderTarget,
@@ -192,10 +233,18 @@ impl State {
 
         let shm_state = ShmState::new::<State>(&dh, vec![]);
         let dmabuf_global = if let RenderTarget::Hardware(node) = render_target {
-            let formats = Bind::<Dmabuf>::supported_formats(&renderer)
+            let mut formats = Bind::<Dmabuf>::supported_formats(&renderer)
                 .expect("Failed to query formats")
                 .into_iter()
                 .collect::<Vec<_>>();
+
+            // WOLF_HDR_CM: additionally advertise the fp16 / 10-bit dmabuf formats the GLES
+            // renderer can *import*, so HDR clients submit HDR (scRGB-fp16 / 10-bit PQ)
+            // buffers instead of 8-bit sRGB. Only HDR-capable fourccs the renderer actually
+            // imports are added; unset = exactly the render-target format set as before.
+            if std::env::var("WOLF_HDR_CM").is_ok() {
+                advertise_hdr_dmabuf_formats(&renderer, &mut formats);
+            }
 
             let dmabuf_default_feedback =
                 DmabufFeedbackBuilder::new(node.dev_id(), formats.clone()).build();
