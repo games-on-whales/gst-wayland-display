@@ -451,6 +451,19 @@ impl State {
     }
 }
 
+/// True when `new` differs from `prev` ONLY in colorimetry -- same pixel format, width, height,
+/// and frame rate, but a different colorimetry (matrix/transfer/primaries/range, e.g. a dynamic
+/// HDR bt709<->bt2100-pq flip). Used under `WOLF_HDR_CM` to skip the Vulkan converter rebuild
+/// for such a re-negotiation: the converter produces correct pixels per frame regardless of the
+/// caps colorimetry, so only the downstream caps tag needs to change.
+fn colorimetry_only_change(prev: &VideoInfo, new: &VideoInfo) -> bool {
+    prev.format() == new.format()
+        && prev.width() == new.width()
+        && prev.height() == new.height()
+        && prev.fps() == new.fps()
+        && prev.colorimetry() != new.colorimetry()
+}
+
 /// Apply a newly-negotiated `GstVideoInfo` to the compositor state: create or update
 /// the (single) Output's mode, rebuild the damage tracker + allocator, recenter the
 /// pointer, and re-send configure to every mapped toplevel clamped to the new size.
@@ -508,93 +521,112 @@ pub(crate) fn apply_video_info(
     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
     state.pointer_location = position;
     state.pointer_absolute_location = position;
+    let prev_video_info = state.video_info.clone();
     state.video_info = Some(video_info.clone().into());
-    match render_target {
-        RenderTarget::Hardware(_) => match video_info {
-            GstVideoInfo::RAW(base_info) => {
-                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
+
+    // WOLF_HDR_CM (dynamic HDR): the producer flips its output caps colorimetry mid-stream
+    // (bt709 SDR <-> bt2100-pq HDR) on the SAME format/resolution/fps. Tearing down and
+    // rebuilding the Vulkan converter (GsNv12Buf / VulkanNv12) on the compositor thread for
+    // that starves frame production and crashes the live stream. The converter produces correct
+    // pixels per frame from current_input_is_pq regardless of the caps colorimetry, so a
+    // colorimetry-only re-negotiation can keep the existing converter. The caps tag still
+    // propagates to the encoder via the producer's caps event independently of this.
+    let keep_converter = std::env::var("WOLF_HDR_CM").is_ok()
+        && state.output_buffer.is_some()
+        && prev_video_info
+            .as_ref()
+            .is_some_and(|prev| colorimetry_only_change(prev, &base_info));
+    if keep_converter {
+        tracing::info!("apply_video_info: colorimetry-only change, keeping converter");
+    } else {
+        match render_target {
+            RenderTarget::Hardware(_) => match video_info {
+                GstVideoInfo::RAW(base_info) => {
+                    let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
+                        .expect("Failed to create GsGlesbuffer");
+                    state.output_buffer = Some(GsBufferType::RAW(allocator));
+                }
+                GstVideoInfo::DMA(base_info) => {
+                    let node = render_node.unwrap();
+                    // NV12/P010 output goes through the Vulkan converter (render RGBA -> Vulkan
+                    // RGBA->NV12/P010 -> exported dmabuf); any other DMA format is the existing
+                    // direct path.
+                    let fourcc = gst_video_format_to_drm_fourcc(&base_info);
+                    let conv_fmt = match fourcc {
+                        Some(smithay::reexports::drm::buffer::DrmFourcc::Nv12) => {
+                            Some(crate::utils::vulkan_nv12::PixFmt::Nv12)
+                        }
+                        Some(smithay::reexports::drm::buffer::DrmFourcc::P010) => {
+                            Some(crate::utils::vulkan_nv12::PixFmt::P010)
+                        }
+                        _ => None,
+                    };
+                    if let Some(conv_fmt) = conv_fmt {
+                        let allocator =
+                            GsNv12Buf::new(&mut state.renderer, node, base_info, conv_fmt)
+                                .expect("Failed to create GsNv12Buf");
+                        state.output_buffer = Some(GsBufferType::NV12(allocator));
+                    } else {
+                        let allocator =
+                            GsDmaBuf::new(node, base_info).expect("Failed to create GsDmaBuf");
+                        state.output_buffer = Some(GsBufferType::DMA(allocator));
+                    }
+                }
+                GstVideoInfo::VULKAN(params) => {
+                    let node = render_node.unwrap();
+                    // The downstream encoder shares its GstVulkanDevice via a GstContext
+                    // absorbed in set_context on the *streaming* thread, which races this
+                    // (compositor-thread) allocation. Wait for the device to arrive instead
+                    // of panicking when it merely hasn't been shared yet. If it never comes,
+                    // leave output_buffer unset -- the render loop turns that into a clean
+                    // FlowError rather than aborting the process.
+                    if crate::utils::vulkan_share::wait_for_shared_device(Duration::from_secs(5))
+                        .is_some()
+                    {
+                        match GsVulkanBuf::new(
+                            &mut state.renderer,
+                            node,
+                            params.video_info,
+                            params.profile,
+                        ) {
+                            Some(allocator) => {
+                                state.output_buffer = Some(GsBufferType::VULKAN(allocator))
+                            }
+                            None => tracing::error!(
+                                "Failed to create Vulkan output buffer despite a shared GstVulkanDevice"
+                            ),
+                        }
+                    } else {
+                        tracing::error!(
+                            "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder \
+                         never shared its device. Cannot produce memory:VulkanImage output."
+                        );
+                    }
+                }
+                #[cfg(feature = "cuda")]
+                GstVideoInfo::CUDA(base_info) => {
+                    let egl_display = state
+                        .renderer
+                        .egl_context()
+                        .display()
+                        .get_display_handle()
+                        .handle;
+                    let allocator = GsCUDABuf::new(
+                        render_node.unwrap(),
+                        base_info.cuda_context,
+                        base_info.video_info,
+                        Arc::new(Mutex::new(None)),
+                        &egl_display,
+                    )
+                    .expect("Failed to create GsCUDABuf");
+                    state.output_buffer = Some(GsBufferType::CUDA(allocator));
+                }
+            },
+            RenderTarget::Software => {
+                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
                     .expect("Failed to create GsGlesbuffer");
                 state.output_buffer = Some(GsBufferType::RAW(allocator));
             }
-            GstVideoInfo::DMA(base_info) => {
-                let node = render_node.unwrap();
-                // NV12/P010 output goes through the Vulkan converter (render RGBA -> Vulkan
-                // RGBA->NV12/P010 -> exported dmabuf); any other DMA format is the existing
-                // direct path.
-                let fourcc = gst_video_format_to_drm_fourcc(&base_info);
-                let conv_fmt = match fourcc {
-                    Some(smithay::reexports::drm::buffer::DrmFourcc::Nv12) => {
-                        Some(crate::utils::vulkan_nv12::PixFmt::Nv12)
-                    }
-                    Some(smithay::reexports::drm::buffer::DrmFourcc::P010) => {
-                        Some(crate::utils::vulkan_nv12::PixFmt::P010)
-                    }
-                    _ => None,
-                };
-                if let Some(conv_fmt) = conv_fmt {
-                    let allocator = GsNv12Buf::new(&mut state.renderer, node, base_info, conv_fmt)
-                        .expect("Failed to create GsNv12Buf");
-                    state.output_buffer = Some(GsBufferType::NV12(allocator));
-                } else {
-                    let allocator =
-                        GsDmaBuf::new(node, base_info).expect("Failed to create GsDmaBuf");
-                    state.output_buffer = Some(GsBufferType::DMA(allocator));
-                }
-            }
-            GstVideoInfo::VULKAN(params) => {
-                let node = render_node.unwrap();
-                // The downstream encoder shares its GstVulkanDevice via a GstContext
-                // absorbed in set_context on the *streaming* thread, which races this
-                // (compositor-thread) allocation. Wait for the device to arrive instead
-                // of panicking when it merely hasn't been shared yet. If it never comes,
-                // leave output_buffer unset -- the render loop turns that into a clean
-                // FlowError rather than aborting the process.
-                if crate::utils::vulkan_share::wait_for_shared_device(Duration::from_secs(5))
-                    .is_some()
-                {
-                    match GsVulkanBuf::new(
-                        &mut state.renderer,
-                        node,
-                        params.video_info,
-                        params.profile,
-                    ) {
-                        Some(allocator) => {
-                            state.output_buffer = Some(GsBufferType::VULKAN(allocator))
-                        }
-                        None => tracing::error!(
-                            "Failed to create Vulkan output buffer despite a shared GstVulkanDevice"
-                        ),
-                    }
-                } else {
-                    tracing::error!(
-                        "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder \
-                         never shared its device. Cannot produce memory:VulkanImage output."
-                    );
-                }
-            }
-            #[cfg(feature = "cuda")]
-            GstVideoInfo::CUDA(base_info) => {
-                let egl_display = state
-                    .renderer
-                    .egl_context()
-                    .display()
-                    .get_display_handle()
-                    .handle;
-                let allocator = GsCUDABuf::new(
-                    render_node.unwrap(),
-                    base_info.cuda_context,
-                    base_info.video_info,
-                    Arc::new(Mutex::new(None)),
-                    &egl_display,
-                )
-                .expect("Failed to create GsCUDABuf");
-                state.output_buffer = Some(GsBufferType::CUDA(allocator));
-            }
-        },
-        RenderTarget::Software => {
-            let allocator = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
-                .expect("Failed to create GsGlesbuffer");
-            state.output_buffer = Some(GsBufferType::RAW(allocator));
         }
     }
 

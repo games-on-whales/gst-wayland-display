@@ -609,7 +609,7 @@ impl VulkanNv12 {
         let pipeline = build_compute_pipeline(
             &device,
             pipeline_layout,
-            fmt.shader(bt2020, fp16_input),
+            normal_shader(fmt, bt2020, fp16_input),
             sdr_ref_white,
         )?;
         let pipeline_pq = build_pq_passthrough(
@@ -802,7 +802,7 @@ impl VulkanNv12 {
         let pipeline = build_compute_pipeline(
             &device,
             pipeline_layout,
-            fmt.shader(bt2020, fp16_input),
+            normal_shader(fmt, bt2020, fp16_input),
             sdr_ref_white,
         )?;
         let pipeline_pq = build_pq_passthrough(
@@ -1519,6 +1519,30 @@ fn sdr_reference_white() -> f32 {
         .unwrap_or(203.0)
 }
 
+/// `WOLF_HDR_CM`: dynamic-colorimetry HDR mode. When set, the fp16 P010 converter builds BOTH
+/// the SDR (`RGBA_TO_P010_SPV`, BT.709 matrix, no PQ) and PQ-passthrough
+/// (`RGBA_PQPASS_TO_P010_SPV`) pipelines up front -- independent of the negotiated caps
+/// colorimetry -- and `convert()` picks per frame by `pq_passthrough`, so a producer's
+/// mid-stream bt709<->bt2100-pq caps flip never rebuilds the converter (which would stall the
+/// compositor thread). Read once; unset == byte-identical prior behavior.
+fn wolf_hdr_cm() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("WOLF_HDR_CM").is_ok())
+}
+
+/// The "normal" (`pq_passthrough = false`) converter shader. Under `WOLF_HDR_CM` on the fp16
+/// P010 path this is the BT.709-matrix `RGBA_TO_P010_SPV` (true SDR, no PQ) regardless of the
+/// negotiated caps `bt2020` flag, so the pipeline survives a mid-stream bt709<->bt2100-pq
+/// colorimetry flip without a rebuild; the per-frame PQ-passthrough pipeline handles already-PQ
+/// HDR content. With `WOLF_HDR_CM` unset this is exactly `PixFmt::shader` (caps-driven).
+fn normal_shader(fmt: PixFmt, bt2020: bool, fp16_input: bool) -> &'static [u8] {
+    if wolf_hdr_cm() && fmt == PixFmt::P010 && fp16_input {
+        RGBA_TO_P010_SPV
+    } else {
+        fmt.shader(bt2020, fp16_input)
+    }
+}
+
 /// Build one RGBA->NV12/P010 compute pipeline from `spv` on `device` with `layout`, binding the
 /// SDR reference-white value to specialization constant 0 (constant_id 0; Vulkan ignores it for
 /// a shader that doesn't reference it). The shader module is freed before returning.
@@ -1562,11 +1586,13 @@ unsafe fn build_compute_pipeline(
     Ok(result.map_err(|(_, e)| e)?[0])
 }
 
-/// Build the per-frame PQ-passthrough pipeline, or `None` when it isn't applicable. It's only
-/// needed on the HDR fp16 P010 path (`fmt == P010 && bt2020 && fp16_input`, i.e. `WOLF_HDR_CM`),
-/// where a frame from a 10-bit already-PQ client buffer must skip the tone-map. Best-effort: a
-/// build failure (e.g. the placeholder `.spv` hasn't been compiled with glslc yet) leaves it
-/// `None` so the normal pipeline still runs -- byte-identical to the prior behavior.
+/// Build the per-frame PQ-passthrough pipeline, or `None` when it isn't applicable. Needed on the
+/// HDR fp16 P010 path, where a frame from a 10-bit already-PQ client buffer must skip the
+/// tone-map. The static HDR path builds it when the caps are `bt2020`; under `WOLF_HDR_CM` it's
+/// built for ANY fp16 P010 negotiation (independent of the caps `bt2020` flag) so it survives a
+/// bt709-tagged negotiation / a mid-stream colorimetry flip. Best-effort: a build failure (e.g.
+/// the placeholder `.spv` hasn't been compiled with glslc yet) leaves it `None` so the normal
+/// pipeline still runs -- byte-identical to the prior behavior.
 unsafe fn build_pq_passthrough(
     device: &ash::Device,
     layout: vk::PipelineLayout,
@@ -1575,7 +1601,8 @@ unsafe fn build_pq_passthrough(
     fp16_input: bool,
     sdr_ref_white: f32,
 ) -> Option<vk::Pipeline> {
-    if !(fmt == PixFmt::P010 && bt2020 && fp16_input) {
+    let want = fmt == PixFmt::P010 && fp16_input && (bt2020 || wolf_hdr_cm());
+    if !want {
         return None;
     }
     match build_compute_pipeline(device, layout, RGBA_PQPASS_TO_P010_SPV, sdr_ref_white) {
