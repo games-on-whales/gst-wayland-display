@@ -45,7 +45,7 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
         // BufferAssignment isn't Clone, so match the committed buffer by reference and pull
         // out just the (Copy) fourcc + modifier; the cached_state guard stays alive for the
         // borrow.
-        let attrs = states.cached_state.get::<SurfaceAttributes>();
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
         let (fourcc, modifier) = match &attrs.current().buffer {
             Some(BufferAssignment::NewBuffer(buffer)) => match get_dmabuf(buffer) {
                 Ok(dmabuf) => (dmabuf.format().code, dmabuf.format().modifier),
