@@ -163,11 +163,21 @@ pub struct State {
     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
     /// log + signal on an actual change. Defaults to `false` (SDR).
     last_hdr_state: bool,
+    /// When the current candidate HDR<->SDR flip was first observed; the flip is only
+    /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
+    /// flip. See [`State::update_hdr_state`].
+    hdr_candidate_since: Option<Instant>,
 }
 
 /// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
 /// renderer can import them): fp16 scRGB-linear (`Abgr16161616f`) and 10-bit (`Abgr2101010`
 /// / `Argb2101010`). These let HDR clients submit real HDR buffers instead of 8-bit sRGB.
+/// How long a candidate HDR<->SDR output-state change must hold before it's committed
+/// (and the TV is told to switch mode). Filters the rapid flicker from stray 8-bit frames
+/// between 10-bit game frames; each real switch blanks the TV ~1-2s, so brief flips must not
+/// trigger it.
+const HDR_DEBOUNCE: Duration = Duration::from_millis(600);
+
 const HDR_IMPORT_FOURCCS: [Fourcc; 6] = [
     Fourcc::Abgr16161616f,
     Fourcc::Xbgr16161616f,
@@ -405,6 +415,7 @@ impl State {
             color_mgmt_global,
             hdr_state_tx: None,
             last_hdr_state: false,
+            hdr_candidate_since: None,
         }
     }
 
@@ -441,12 +452,28 @@ impl State {
         }
         let hdr = self.output_hdr_state();
         if hdr == self.last_hdr_state {
+            // Settled back to the current committed state -> cancel any pending flip.
+            // This is what filters the rapid HDR<->SDR flicker: a stray 8-bit UI frame
+            // between 10-bit game frames flips output_hdr_state for a few ms, but it
+            // returns to HDR before the debounce elapses, so the candidate is cancelled
+            // and the TV never switches mode.
+            self.hdr_candidate_since = None;
             return;
         }
-        self.last_hdr_state = hdr;
-        tracing::info!("output HDR state -> {}", if hdr { "HDR" } else { "SDR" });
-        if let Some(tx) = &self.hdr_state_tx {
-            let _ = tx.send(Command::HdrState(hdr));
+        // `hdr` differs from the committed state -> a candidate flip. Only commit it once
+        // it has held continuously for HDR_DEBOUNCE; each real change blanks the TV ~1-2s,
+        // so brief transitions (loading screens, menu overlays) must NOT switch it.
+        match self.hdr_candidate_since {
+            Some(since) if since.elapsed() >= HDR_DEBOUNCE => {
+                self.last_hdr_state = hdr;
+                self.hdr_candidate_since = None;
+                tracing::info!("output HDR state -> {} (debounced)", if hdr { "HDR" } else { "SDR" });
+                if let Some(tx) = &self.hdr_state_tx {
+                    let _ = tx.send(Command::HdrState(hdr));
+                }
+            }
+            Some(_) => {} // candidate still maturing
+            None => self.hdr_candidate_since = Some(Instant::now()),
         }
     }
 }
