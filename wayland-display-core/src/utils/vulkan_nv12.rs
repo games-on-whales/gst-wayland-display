@@ -86,6 +86,14 @@ const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt20
 /// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is an
 /// empty placeholder; compile `shaders/rgba_to_p010_hdr.comp` with glslc before using the spike.
 const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv");
+/// PQ-passthrough variant of the P010 converter (`WOLF_HDR_CM`). Same topology/bindings as
+/// [`RGBA_TO_P010_BT2020_SPV`], but it applies ONLY the BT.2020 limited-range Y'CbCr matrix --
+/// no sRGB EOTF, no 709->2020 gamut, no PQ OETF -- because its input is already PQ-encoded
+/// BT.2020 (gamescope's 10-bit XB30/AB30/XR30/AR30 HDR output, composited into the fp16
+/// target). Selected per frame via `convert(pq_passthrough=true)` so a 10-bit client frame
+/// isn't double-PQ'd (washed out) by the tone-mapping shader. NOTE: the checked-in `.spv` is an
+/// empty placeholder; compile `shaders/rgba_pqpass_to_p010.comp` with glslc before using it.
+const RGBA_PQPASS_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_pqpass_to_p010.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
@@ -419,6 +427,9 @@ pub struct VulkanNv12 {
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
     pipeline: vk::Pipeline,
+    /// Per-frame PQ-passthrough pipeline (matrix-only, already-PQ BT.2020 input). `Some` only on
+    /// the HDR fp16 P010 path; `convert(pq_passthrough=true)` binds it instead of `pipeline`.
+    pipeline_pq: Option<vk::Pipeline>,
     pipeline_layout: vk::PipelineLayout,
     desc_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
@@ -562,15 +573,7 @@ impl VulkanNv12 {
         let queue = device.get_device_queue(qfi, 0);
         let memp = instance.get_physical_device_memory_properties(pd);
 
-        // ---- compute pipeline (shader selected by output format + input format) ----
-        let module = device.create_shader_module(
-            &vk::ShaderModuleCreateInfo {
-                code_size: fmt.shader(bt2020, fp16_input).len(),
-                p_code: fmt.shader(bt2020, fp16_input).as_ptr() as *const u32,
-                ..Default::default()
-            },
-            None,
-        )?;
+        // ---- compute pipeline(s) (shader selected by output format + input format) ----
         let binds = [
             dsl_bind(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             dsl_bind(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -591,39 +594,25 @@ impl VulkanNv12 {
                 .push_constant_ranges(&pcr),
             None,
         )?;
-        let entry_name = c"main";
         // SDR reference white (nits) -> specialization constant 0 of the BT.2020/PQ shader,
         // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
         // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
         // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
-        let sdr_ref_white: f32 = std::env::var("WOLF_SDR_REFERENCE_WHITE")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(203.0);
-        let spec_data = sdr_ref_white.to_ne_bytes();
-        let spec_entries = [vk::SpecializationMapEntry::default()
-            .constant_id(0)
-            .offset(0)
-            .size(std::mem::size_of::<f32>())];
-        let spec_info = vk::SpecializationInfo::default()
-            .map_entries(&spec_entries)
-            .data(&spec_data);
-        let pipeline = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::COMPUTE)
-                            .module(module)
-                            .name(entry_name)
-                            .specialization_info(&spec_info),
-                    )
-                    .layout(pipeline_layout)],
-                None,
-            )
-            .map_err(|(_, e)| e)?[0];
-        device.destroy_shader_module(module, None);
+        let sdr_ref_white = sdr_reference_white();
+        let pipeline = build_compute_pipeline(
+            &device,
+            pipeline_layout,
+            fmt.shader(bt2020, fp16_input),
+            sdr_ref_white,
+        )?;
+        let pipeline_pq = build_pq_passthrough(
+            &device,
+            pipeline_layout,
+            fmt,
+            bt2020,
+            fp16_input,
+            sdr_ref_white,
+        );
 
         // One descriptor set + command buffer per ring slot (pipelined, no contention).
         let psizes = [
@@ -706,6 +695,7 @@ impl VulkanNv12 {
             queue,
             cmd_pool,
             pipeline,
+            pipeline_pq,
             pipeline_layout,
             desc_layout,
             desc_pool,
@@ -776,15 +766,7 @@ impl VulkanNv12 {
         let queue = device.get_device_queue(raw.gfx_queue_family, 0);
         let memp = instance.get_physical_device_memory_properties(raw.physical);
 
-        // ---- compute pipeline (same as the dmabuf path, on the shared device) ----
-        let module = device.create_shader_module(
-            &vk::ShaderModuleCreateInfo {
-                code_size: fmt.shader(bt2020, fp16_input).len(),
-                p_code: fmt.shader(bt2020, fp16_input).as_ptr() as *const u32,
-                ..Default::default()
-            },
-            None,
-        )?;
+        // ---- compute pipeline(s) (same as the dmabuf path, on the shared device) ----
         let binds = [
             dsl_bind(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             dsl_bind(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -805,39 +787,25 @@ impl VulkanNv12 {
                 .push_constant_ranges(&pcr),
             None,
         )?;
-        let entry_name = c"main";
         // SDR reference white (nits) -> specialization constant 0 of the BT.2020/PQ shader,
         // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
         // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
         // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
-        let sdr_ref_white: f32 = std::env::var("WOLF_SDR_REFERENCE_WHITE")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(203.0);
-        let spec_data = sdr_ref_white.to_ne_bytes();
-        let spec_entries = [vk::SpecializationMapEntry::default()
-            .constant_id(0)
-            .offset(0)
-            .size(std::mem::size_of::<f32>())];
-        let spec_info = vk::SpecializationInfo::default()
-            .map_entries(&spec_entries)
-            .data(&spec_data);
-        let pipeline = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::COMPUTE)
-                            .module(module)
-                            .name(entry_name)
-                            .specialization_info(&spec_info),
-                    )
-                    .layout(pipeline_layout)],
-                None,
-            )
-            .map_err(|(_, e)| e)?[0];
-        device.destroy_shader_module(module, None);
+        let sdr_ref_white = sdr_reference_white();
+        let pipeline = build_compute_pipeline(
+            &device,
+            pipeline_layout,
+            fmt.shader(bt2020, fp16_input),
+            sdr_ref_white,
+        )?;
+        let pipeline_pq = build_pq_passthrough(
+            &device,
+            pipeline_layout,
+            fmt,
+            bt2020,
+            fp16_input,
+            sdr_ref_white,
+        );
         let psizes = [
             pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, RING as u32),
             pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * RING as u32),
@@ -881,6 +849,7 @@ impl VulkanNv12 {
             queue,
             cmd_pool,
             pipeline,
+            pipeline_pq,
             pipeline_layout,
             desc_layout,
             desc_pool,
@@ -902,12 +871,14 @@ impl VulkanNv12 {
     }
 
     /// Import the compositor's `rgba` dmabuf and convert it RGBA->NV12 into the next
-    /// export ring slot.
-    pub fn convert(&mut self, rgba: &Dmabuf) -> Result<(), Err> {
-        unsafe { self.convert_inner(rgba) }
+    /// export ring slot. `pq_passthrough` selects the per-frame PQ-passthrough shader (the
+    /// frame's content came from a 10-bit, already-PQ BT.2020 client buffer) when that pipeline
+    /// is available (HDR fp16 P010 path); otherwise the normal tone-mapping shader runs.
+    pub fn convert(&mut self, rgba: &Dmabuf, pq_passthrough: bool) -> Result<(), Err> {
+        unsafe { self.convert_inner(rgba, pq_passthrough) }
     }
 
-    unsafe fn convert_inner(&mut self, rgba: &Dmabuf) -> Result<(), Err> {
+    unsafe fn convert_inner(&mut self, rgba: &Dmabuf, pq_passthrough: bool) -> Result<(), Err> {
         // Cache key: the source dmabuf's primary fd. The compositor renders into a single
         // stable RGBA buffer, so this is constant across frames and each slot's import is
         // built only once.
@@ -966,6 +937,12 @@ impl VulkanNv12 {
         let cmd = slot.cmd;
         let fence = slot.fence;
         let direct = self.direct;
+        // Per-frame shader: the PQ-passthrough pipeline when this frame is already-PQ 10-bit
+        // content and that pipeline exists, else the normal (tone-mapping / BT.601) pipeline.
+        let pipeline = match (pq_passthrough, self.pipeline_pq) {
+            (true, Some(p)) => p,
+            _ => self.pipeline,
+        };
         // Where the compute shader writes: scratch (tiled) or the export image (direct).
         let compute_target = match slot.scratch {
             Some((s, _)) => s,
@@ -1029,7 +1006,7 @@ impl VulkanNv12 {
             &[to_read, t_y, t_uv],
         );
         self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -1505,6 +1482,9 @@ impl Drop for VulkanNv12 {
             self.device
                 .destroy_descriptor_set_layout(self.desc_layout, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            if let Some(p) = self.pipeline_pq {
+                self.device.destroy_pipeline(p, None);
+            }
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             // On the shared/encode-src path the VkDevice + VkInstance are owned by the
@@ -1520,6 +1500,91 @@ impl Drop for VulkanNv12 {
 }
 
 // --- helpers ---
+
+/// SDR diffuse white (nits) for the BT.2020/PQ tone-map: Wolf's `[gstreamer.video]
+/// sdr_reference_white` passed as `WOLF_SDR_REFERENCE_WHITE`, default 203 (BT.2408 graphics
+/// white). Bound to specialization constant 0 of every converter pipeline (ignored by shaders
+/// that don't declare it).
+fn sdr_reference_white() -> f32 {
+    std::env::var("WOLF_SDR_REFERENCE_WHITE")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(203.0)
+}
+
+/// Build one RGBA->NV12/P010 compute pipeline from `spv` on `device` with `layout`, binding the
+/// SDR reference-white value to specialization constant 0 (constant_id 0; Vulkan ignores it for
+/// a shader that doesn't reference it). The shader module is freed before returning.
+unsafe fn build_compute_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    spv: &[u8],
+    sdr_ref_white: f32,
+) -> Result<vk::Pipeline, Err> {
+    let module = device.create_shader_module(
+        &vk::ShaderModuleCreateInfo {
+            code_size: spv.len(),
+            p_code: spv.as_ptr() as *const u32,
+            ..Default::default()
+        },
+        None,
+    )?;
+    let spec_data = sdr_ref_white.to_ne_bytes();
+    let spec_entries = [vk::SpecializationMapEntry::default()
+        .constant_id(0)
+        .offset(0)
+        .size(std::mem::size_of::<f32>())];
+    let spec_info = vk::SpecializationInfo::default()
+        .map_entries(&spec_entries)
+        .data(&spec_data);
+    let entry_name = c"main";
+    let result = device.create_compute_pipelines(
+        vk::PipelineCache::null(),
+        &[vk::ComputePipelineCreateInfo::default()
+            .stage(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(module)
+                    .name(entry_name)
+                    .specialization_info(&spec_info),
+            )
+            .layout(layout)],
+        None,
+    );
+    device.destroy_shader_module(module, None);
+    Ok(result.map_err(|(_, e)| e)?[0])
+}
+
+/// Build the per-frame PQ-passthrough pipeline, or `None` when it isn't applicable. It's only
+/// needed on the HDR fp16 P010 path (`fmt == P010 && bt2020 && fp16_input`, i.e. `WOLF_HDR_CM`),
+/// where a frame from a 10-bit already-PQ client buffer must skip the tone-map. Best-effort: a
+/// build failure (e.g. the placeholder `.spv` hasn't been compiled with glslc yet) leaves it
+/// `None` so the normal pipeline still runs -- byte-identical to the prior behavior.
+unsafe fn build_pq_passthrough(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    fmt: PixFmt,
+    bt2020: bool,
+    fp16_input: bool,
+    sdr_ref_white: f32,
+) -> Option<vk::Pipeline> {
+    if !(fmt == PixFmt::P010 && bt2020 && fp16_input) {
+        return None;
+    }
+    match build_compute_pipeline(device, layout, RGBA_PQPASS_TO_P010_SPV, sdr_ref_white) {
+        Ok(p) => {
+            tracing::debug!("VulkanNv12: PQ-passthrough pipeline ready (per-frame 10-bit input)");
+            Some(p)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "VulkanNv12: PQ-passthrough pipeline unavailable ({e}); 10-bit frames will use \
+                 the tone-mapping shader (double-PQ). Compile shaders/rgba_pqpass_to_p010.comp."
+            );
+            None
+        }
+    }
+}
 
 /// LINEAR NV12/P010 image with per-plane storage views (R8/R8G8 for NV12, R16/R16G16 for
 /// P010). Storage works on LINEAR; it does not on DCC modifiers. Used as the tiled path's

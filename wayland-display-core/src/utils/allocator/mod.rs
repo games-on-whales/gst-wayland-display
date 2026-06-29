@@ -459,6 +459,7 @@ pub trait GsBuffer<R: Renderer> {
         &self,
         target: &mut GlesTarget,
         renderer: &mut R,
+        pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>>;
 
     // Returns the underlying VideoInfo or VideoInfoDmaDrm
@@ -485,6 +486,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
+        pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         match self {
             GsBufferType::RAW(buffer) => {
@@ -593,12 +595,12 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba)?;
+                v.convert(&buffer.rgba, pq_passthrough)?;
                 v.to_gst_buffer()
             }
             GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba)?;
+                v.convert(&buffer.rgba, pq_passthrough)?;
                 v.to_gst_buffer()
             }
             #[cfg(feature = "cuda")]
@@ -621,6 +623,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
+        pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         match self {
             GsBufferType::RAW(buffer) => {
@@ -726,12 +729,12 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba)?;
+                v.convert(&buffer.rgba, pq_passthrough)?;
                 v.to_gst_buffer()
             }
             GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba)?;
+                v.convert(&buffer.rgba, pq_passthrough)?;
                 v.to_gst_buffer()
             }
         }
@@ -919,7 +922,7 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.unwrap().buffer, 10, 10);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer)
+            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
             .expect("Failed to convert buffer");
         assert!(gst_buffer.is_writable());
         assert_eq!(gst_buffer.size(), video_info.size());
@@ -995,7 +998,7 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer)
+            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
             .expect("Failed to convert buffer");
         let gst_buffer_size = gst_buffer.size();
         assert!(gst_buffer_size >= 4096); // There might be padding but it should at least contain our data
@@ -1127,7 +1130,7 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer)
+            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
             .expect("Failed to convert buffer");
 
         let gst_buffer_size = gst_buffer.size();

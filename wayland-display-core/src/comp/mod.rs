@@ -114,6 +114,12 @@ pub struct State {
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
+    /// WOLF_HDR_CM per-frame PQ-passthrough selector: true when the active fullscreen surface's
+    /// most-recent committed buffer is a 10-bit fourcc (gamescope's already-PQ BT.2020 HDR
+    /// output, XB30/AB30/XR30/AR30). Threaded into the Vulkan converter's `convert()` so a
+    /// 10-bit frame uses the matrix-only passthrough shader instead of re-applying PQ. Always
+    /// false unless WOLF_HDR_CM is set (set only in the compositor commit handler).
+    pub(crate) current_input_is_pq: bool,
 
     // management
     pub output: Option<Output>,
@@ -366,6 +372,7 @@ impl State {
             dmabuf_global,
             video_info: None,
             last_render: None,
+            current_input_is_pq: false,
 
             space,
             popups: PopupManager::default(),

@@ -236,12 +236,15 @@ impl State {
             }
         }
 
-        match self
-            .output_buffer
-            .clone()
-            .unwrap()
-            .to_gs_buffer(&mut target, &mut self.renderer)
-        {
+        // WOLF_HDR_CM: per-frame PQ-passthrough flag (true when the active surface's last
+        // committed buffer was a 10-bit, already-PQ BT.2020 client buffer). Always false unless
+        // WOLF_HDR_CM is set, so the converter behaves identically to before by default.
+        let pq_passthrough = self.current_input_is_pq;
+        match self.output_buffer.clone().unwrap().to_gs_buffer(
+            &mut target,
+            &mut self.renderer,
+            pq_passthrough,
+        ) {
             Ok(buffer) => Ok((buffer, render_output_result)),
             Err(e) => {
                 tracing::warn!("Failed to convert buffer to gst buffer: {:?}", e);

@@ -66,6 +66,30 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
     });
 }
 
+/// The fourcc of the dmabuf the client just committed to `surface`, or `None` for an SHM /
+/// non-dmabuf / no buffer commit. Used by the WOLF_HDR_CM per-frame PQ-passthrough decision.
+fn committed_dmabuf_fourcc(surface: &WlSurface) -> Option<Fourcc> {
+    with_states(surface, |states| {
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        match &attrs.current().buffer {
+            Some(BufferAssignment::NewBuffer(buffer)) => {
+                get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.format().code)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// True for the 10-bit packed RGB fourccs gamescope emits for already-PQ BT.2020 HDR output
+/// (XB30/AB30/XR30/AR30). Such a frame is already PQ-encoded, so the converter must take the
+/// matrix-only passthrough path rather than re-applying the PQ tone-map.
+fn is_pq_fourcc(fourcc: Fourcc) -> bool {
+    matches!(
+        fourcc,
+        Fourcc::Xbgr2101010 | Fourcc::Abgr2101010 | Fourcc::Xrgb2101010 | Fourcc::Argb2101010
+    )
+}
+
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
@@ -155,6 +179,27 @@ impl CompositorHandler for State {
             window.on_commit();
         }
         self.popups.commit(surface);
+
+        // WOLF_HDR_CM: track whether the active fullscreen surface's latest buffer is 10-bit
+        // already-PQ content, so the Vulkan converter picks the per-frame passthrough shader.
+        // Only the toplevel window's content drives this (cursors / popups are ignored); the
+        // surface's buffer fourcc flips between 8-bit (Steam UI -> false) and 10-bit (the HDR
+        // game -> true) within one gamescope surface. Off (no-op) unless WOLF_HDR_CM is set.
+        if hdr_cm_enabled() {
+            let is_window = self
+                .space
+                .elements()
+                .any(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false));
+            if is_window {
+                let pq = committed_dmabuf_fourcc(surface)
+                    .map(is_pq_fourcc)
+                    .unwrap_or(false);
+                if self.current_input_is_pq != pq {
+                    self.current_input_is_pq = pq;
+                    tracing::info!("pq_passthrough -> {pq}");
+                }
+            }
+        }
 
         // send the initial configure if relevant
         if let Some(idx) = self
