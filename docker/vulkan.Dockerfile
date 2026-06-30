@@ -117,7 +117,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # Cache-bust the plugin source COPY + compile. The registry build cache (cache-from/
 # cache-to mode=max) can serve a STALE `cargo cinstall` layer even when src/ changed,
 # leaving an outdated plugin .so in the image. Bump this to force a clean recompile.
-ARG PLUGIN_CACHEBUST=2026-06-30-disable-lavapipe-icd
+ARG PLUGIN_CACHEBUST=2026-06-30-fmt-fix
 RUN echo "plugin rebuild: ${PLUGIN_CACHEBUST}"
 
 COPY . /src

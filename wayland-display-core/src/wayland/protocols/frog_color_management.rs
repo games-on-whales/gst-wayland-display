@@ -150,17 +150,27 @@ where
                     .unwrap_or(1000)
                     .min(65535);
                 let max_full_frame = (peak_nits * 2 / 5).max(100);
+                // preferred_metadata args: transfer function, then BT.2020 R/G/B + D65 white
+                // chromaticities in frog's 0.00002 units (R 0.708,0.292  G 0.170,0.797
+                // B 0.131,0.046  W 0.3127,0.3290), then max / min / max-full-frame luminance.
                 cms.preferred_metadata(
                     TransferFunction::St2084Pq,
-                    35400, 14600, // red   x,y  (BT.2020 0.708, 0.292)
-                    8500, 39850, // green x,y  (0.170, 0.797)
-                    6550, 2300, // blue  x,y  (0.131, 0.046)
-                    15635, 16450, // white x,y  (D65 0.3127, 0.3290)
-                    peak_nits, // max_luminance        (nits)
-                    1,         // min_luminance        (0.0001 cd/m²)
-                    max_full_frame, // max_full_frame_lum   (nits)
+                    35400,
+                    14600,
+                    8500,
+                    39850,
+                    6550,
+                    2300,
+                    15635,
+                    16450,
+                    peak_nits,
+                    1,
+                    max_full_frame,
                 );
-                tracing::info!(peak_nits, "frog: sent preferred_metadata ST2084_PQ/BT2020 (HDR output) to client");
+                tracing::info!(
+                    peak_nits,
+                    "frog: sent preferred_metadata ST2084_PQ/BT2020 (HDR output) to client"
+                );
             }
             frog_color_management_factory_v1::Request::Destroy => {}
         }
