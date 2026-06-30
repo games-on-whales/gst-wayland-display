@@ -1194,8 +1194,18 @@ impl VulkanNv12 {
         // the tiled copy or the encoder. Off unless WOLF_VULKAN_DUMP is set; once, a few
         // frames in (let the scene settle). Failures are logged, never fatal.
         if let Some(path) = dump_path() {
-            if DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == dump_frame_target()
-            {
+            // Fire either at the fixed frame target (one-shot) OR on demand whenever a
+            // `<path>.now` trigger file exists -- consumed each time so every touch captures
+            // exactly one fresh frame. The trigger lets a specific live gameplay frame be
+            // snapped (the fixed-frame path lands on deterministic loading screens).
+            let trigger = format!("{path}.now");
+            let by_trigger = std::path::Path::new(&trigger).exists();
+            let by_frame =
+                DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == dump_frame_target();
+            if by_trigger || by_frame {
+                if by_trigger {
+                    let _ = std::fs::remove_file(&trigger);
+                }
                 self.device.device_wait_idle().ok();
                 let pix = match self.fmt {
                     PixFmt::Nv12 => "nv12",
