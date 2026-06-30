@@ -6,6 +6,18 @@ pub mod utils;
 mod waylandsrc;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
+    // Disable the lavapipe (llvmpipe) Vulkan ICD process-wide before any Vulkan instance is
+    // created. On mixed-GPU / software-fallback hosts the loader otherwise dlopen()s lavapipe
+    // during vkCreateInstance, and its libLLVM static init collides with the libLLVM already
+    // loaded by the mesa GLES renderer -- "CommandLine Option registered more than once" ->
+    // llvm::report_fatal_error -> abort (crashes in supported_modifiers()/caps and in gst's
+    // gst.vulkan.instance). lavapipe can't do Vulkan video encode anyway, so the producer and
+    // the encoder never want it. Honour an explicit user override.
+    if std::env::var_os("VK_LOADER_DRIVERS_DISABLE").is_none() {
+        // SAFETY: plugin_init runs once at plugin load, before any Vulkan use or worker threads
+        // touch the loader, so there is no concurrent env access.
+        unsafe { std::env::set_var("VK_LOADER_DRIVERS_DISABLE", "*lvp_icd*") };
+    }
     waylandsrc::register(plugin)?;
     tracing_subscriber::fmt::try_init().ok();
     #[cfg(feature = "cuda")]
