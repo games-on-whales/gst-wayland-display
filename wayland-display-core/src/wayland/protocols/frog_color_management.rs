@@ -139,17 +139,28 @@ where
                 // are BT.2020 + D65 in frog's 0.00002 units (== gst ×50000); luminance
                 // is the display peak gamescope tone-maps the game to. Only runs under
                 // WOLF_HDR_CM (the global is gated there).
+                // Display peak luminance advertised to gamescope (what the game calibrates
+                // its HDR to). Tunable via WOLF_HDR_PEAK_NITS (nits, default 1000) so it can
+                // be matched to the client TV without a rebuild; clamped to frog's u16 range.
+                // max-full-frame ~= 40% of peak (typical sustained-fullscreen ceiling).
+                let peak_nits: u32 = std::env::var("WOLF_HDR_PEAK_NITS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1000)
+                    .min(65535);
+                let max_full_frame = (peak_nits * 2 / 5).max(100);
                 cms.preferred_metadata(
                     TransferFunction::St2084Pq,
                     35400, 14600, // red   x,y  (BT.2020 0.708, 0.292)
                     8500, 39850, // green x,y  (0.170, 0.797)
                     6550, 2300, // blue  x,y  (0.131, 0.046)
                     15635, 16450, // white x,y  (D65 0.3127, 0.3290)
-                    1000, // max_luminance        (nits)
-                    1,    // min_luminance        (0.0001 cd/m²)
-                    400,  // max_full_frame_lum   (nits)
+                    peak_nits, // max_luminance        (nits)
+                    1,         // min_luminance        (0.0001 cd/m²)
+                    max_full_frame, // max_full_frame_lum   (nits)
                 );
-                tracing::info!("frog: sent preferred_metadata ST2084_PQ/BT2020 (HDR output) to client");
+                tracing::info!(peak_nits, "frog: sent preferred_metadata ST2084_PQ/BT2020 (HDR output) to client");
             }
             frog_color_management_factory_v1::Request::Destroy => {}
         }
