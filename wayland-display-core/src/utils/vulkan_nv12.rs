@@ -1200,8 +1200,8 @@ impl VulkanNv12 {
             // snapped (the fixed-frame path lands on deterministic loading screens).
             let trigger = format!("{path}.now");
             let by_trigger = std::path::Path::new(&trigger).exists();
-            let by_frame =
-                DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == dump_frame_target();
+            let by_frame = DUMP_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == dump_frame_target();
             if by_trigger || by_frame {
                 if by_trigger {
                     let _ = std::fs::remove_file(&trigger);
