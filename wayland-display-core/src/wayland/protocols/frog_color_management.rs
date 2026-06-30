@@ -123,13 +123,33 @@ where
                 surface,
                 callback,
             } => {
-                data_init.init(
+                let cms = data_init.init(
                     callback,
                     FrogSurfaceData {
                         surface: surface.downgrade(),
                         accum: Mutex::new(FrogColorAccum::default()),
                     },
                 );
+                // Tell gamescope (our nested frog CLIENT) that the output it targets is
+                // HDR: ST2084 PQ / BT.2020. gamescope gates nested HDR exposure on this
+                // event's transfer_function == ST2084_PQ (WaylandBackend.cpp
+                // `bExposeHDRSupport = cv_hdr_enabled && tf == ST2084_PQ`); without it,
+                // `gamescope --hdr-enabled` silently falls back to SDR and the game's
+                // in-game HDR (and its luminance slider) never engages. Primaries/white
+                // are BT.2020 + D65 in frog's 0.00002 units (== gst ×50000); luminance
+                // is the display peak gamescope tone-maps the game to. Only runs under
+                // WOLF_HDR_CM (the global is gated there).
+                cms.preferred_metadata(
+                    TransferFunction::St2084Pq,
+                    35400, 14600, // red   x,y  (BT.2020 0.708, 0.292)
+                    8500, 39850, // green x,y  (0.170, 0.797)
+                    6550, 2300, // blue  x,y  (0.131, 0.046)
+                    15635, 16450, // white x,y  (D65 0.3127, 0.3290)
+                    1000, // max_luminance        (nits)
+                    1,    // min_luminance        (0.0001 cd/m²)
+                    400,  // max_full_frame_lum   (nits)
+                );
+                tracing::info!("frog: sent preferred_metadata ST2084_PQ/BT2020 (HDR output) to client");
             }
             frog_color_management_factory_v1::Request::Destroy => {}
         }
