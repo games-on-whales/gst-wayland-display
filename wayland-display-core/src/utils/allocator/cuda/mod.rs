@@ -280,6 +280,22 @@ impl CUDABufferPool {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
+            // `gst_buffer_pool_get_config()` is (transfer full) -- it returns a fresh
+            // `gst_structure_copy()` of the pool's config and the caller must free it.
+            // (`configure()` above is safe because `gst_buffer_pool_set_config()` consumes
+            // its copy.) The copy also re-refs every field value, including the
+            // `cuda-stream` `GstCudaStream` that `configure()` installed, and
+            // `gst_cuda_stream_new()` holds a `gst_object_ref()` on its `GstCudaContext`.
+            // Leaking this structure therefore pins the CUDA context for the lifetime of
+            // the process, and nothing can reclaim it: the retaining structure is detached
+            // from every object, so no teardown path reaches it.
+            //
+            // Must stay paired with the `Caps::from_glib_none` fix in
+            // `waylandsrc/imp.rs::decide_allocation` -- that borrowed caps pointer used to
+            // be adopted with `from_glib_full`, leaving the negotiated caps one reference
+            // short. This config copy holds a ref on the same caps, so freeing it here
+            // while that over-unref is present drops the caps below its true count.
+            gst::ffi::gst_structure_free(config);
         }
         Ok(size)
     }
