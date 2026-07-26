@@ -88,6 +88,7 @@ use crate::utils::allocator::{
 };
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
+use crate::utils::vulkan_share::VulkanShare;
 use crate::{
     utils::RenderTarget,
     wayland::protocols::{
@@ -175,6 +176,12 @@ pub struct State {
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
     hdr_candidate_since: Option<Instant>,
+    /// This element's Vulkan-encode device share. A clone of the gst element's own
+    /// `Arc<VulkanShare>`, so the compositor thread reads the SAME per-element device the
+    /// element mints -- not a process-global singleton. Read in `apply_video_info` when
+    /// building the `memory:VulkanImage` output ring. Replaced by the real share in [`init`];
+    /// the `State::new` default is an empty placeholder.
+    pub(crate) vulkan_share: Arc<VulkanShare>,
 }
 
 /// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
@@ -444,6 +451,7 @@ impl State {
             frog_color_mgmt_global,
             hdr_state_tx: None,
             last_hdr_state: false,
+            vulkan_share: VulkanShare::new(),
             hdr_candidate_since: None,
         }
     }
@@ -669,7 +677,11 @@ pub(crate) fn apply_video_info(
                     // of panicking when it merely hasn't been shared yet. If it never comes,
                     // leave output_buffer unset -- the render loop turns that into a clean
                     // FlowError rather than aborting the process.
-                    if crate::utils::vulkan_share::wait_for_shared_device(Duration::from_secs(5))
+                    // Clone the Arc so it can be passed to GsVulkanBuf::new while
+                    // `state.renderer` is borrowed mutably below.
+                    let vulkan_share = Arc::clone(&state.vulkan_share);
+                    if vulkan_share
+                        .wait_for_shared_device(Duration::from_secs(5))
                         .is_some()
                     {
                         match GsVulkanBuf::new(
@@ -677,6 +689,7 @@ pub(crate) fn apply_video_info(
                             node,
                             params.video_info,
                             params.profile,
+                            &vulkan_share,
                         ) {
                             Some(allocator) => {
                                 state.output_buffer = Some(GsBufferType::VULKAN(allocator))
@@ -759,6 +772,7 @@ pub(crate) fn init(
     devices_tx: Sender<Vec<CString>>,
     envs_tx: Sender<Vec<CString>>,
     hdr_state_tx: Sender<Command>,
+    vulkan_share: Arc<VulkanShare>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -775,6 +789,7 @@ pub(crate) fn init(
     let libinput_backend = LibinputInputBackend::new(libinput_context);
 
     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
+    state.vulkan_share = vulkan_share;
 
     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.

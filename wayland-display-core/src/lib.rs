@@ -5,6 +5,7 @@ pub use smithay::reexports::calloop::channel::{Channel, Sender, channel};
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::CUDABufferPool;
 use crate::utils::device::gpu::GPUDevice;
+use crate::utils::vulkan_share::VulkanShare;
 pub use smithay::backend::allocator::{
     Format as DrmFormat, Fourcc, Modifier as DrmModifier, Vendor as DrmVendor, format::FormatSet,
 };
@@ -140,6 +141,11 @@ impl WaylandDisplay {
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
         // Reverse channel (compositor -> element) for HDR-state notifications.
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        // This constructor has no gst element to answer context queries, so nothing outside
+        // the compositor thread mints on it -- but comp::init needs one, and making it
+        // per-instance keeps the process-global slots gone on this path too.
+        let vulkan_share = VulkanShare::new();
+        let compositor_vulkan_share = Arc::clone(&vulkan_share);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -155,6 +161,7 @@ impl WaylandDisplay {
                     devices_tx,
                     envs_tx,
                     hdr_state_tx,
+                    compositor_vulkan_share,
                 );
             }) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -176,11 +183,16 @@ impl WaylandDisplay {
         render_node: Option<String>,
         command_tx: Sender<Command>,
         commands_rx: Channel<Command>,
+        vulkan_share: Arc<VulkanShare>,
     ) -> Result<WaylandDisplay, CreateDrmNodeError> {
         let (devices_tx, devices_rx) = std::sync::mpsc::channel();
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
         // Reverse channel (compositor -> element) for HDR-state notifications.
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        // Per-element Vulkan share: the gst element owns one for its whole lifetime and hands
+        // the compositor thread a clone, so producer + compositor + encoder all resolve THIS
+        // element's device instead of a process-global singleton.
+        let compositor_vulkan_share = Arc::clone(&vulkan_share);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -192,6 +204,7 @@ impl WaylandDisplay {
                 devices_tx,
                 envs_tx,
                 hdr_state_tx,
+                compositor_vulkan_share,
             );
         });
 
