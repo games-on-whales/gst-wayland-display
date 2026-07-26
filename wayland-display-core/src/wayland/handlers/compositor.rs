@@ -168,6 +168,16 @@ impl CompositorHandler for State {
             } else {
                 let loc = (0, 0);
                 self.space.map_element(window.clone(), loc, true);
+                // Window::bbox() stays (0,0) until on_commit() recomputes it from the
+                // surface tree, and the per-commit on_commit() above only runs for
+                // surfaces already in the space. A client that never re-commits its
+                // root toplevel after this mapping commit (an idle wev, a launcher
+                // rendering via subsurfaces) would keep an empty bbox forever, so
+                // Space::element_under() never resolves it and wl_pointer focus is
+                // never assigned (keyboard focus, set directly below, is unaffected).
+                // Refresh the bbox from the buffer committed just now -- the same fix
+                // tests/fixture.rs applies manually for the pointer tests to work.
+                window.on_commit();
                 self.seat.get_keyboard().unwrap().set_focus(
                     self,
                     Some(FocusTarget::from(window)),
