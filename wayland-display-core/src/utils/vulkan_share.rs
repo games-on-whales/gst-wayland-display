@@ -36,6 +36,24 @@ use std::sync::{Mutex, OnceLock};
 const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR: u32 = 0x0000_2000;
 const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
 
+fn encode_image_usage(direct_storage: bool) -> vk::ImageUsageFlags {
+    vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR)
+        | if direct_storage {
+            vk::ImageUsageFlags::STORAGE
+        } else {
+            vk::ImageUsageFlags::empty()
+        }
+}
+
+fn encode_image_flags(direct_storage: bool) -> vk::ImageCreateFlags {
+    if direct_storage {
+        vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE
+    } else {
+        vk::ImageCreateFlags::empty()
+    }
+}
+
 // --- repr(C) overlays of the public gst-vulkan structs (fields the -sys crate omits). ---
 
 /// `struct _GstVulkanDevice { GstObject parent; GstVulkanInstance *instance;
@@ -395,19 +413,41 @@ pub fn encode_src_pool(
     }
 }
 
-/// Allocate ONE encode-src NV12 image as a `GstVulkanImageMemory`, built directly via
-/// `gst_vulkan_image_memory_alloc_with_image_info` so we control the `VkImageCreateInfo`
-/// (usage `TRANSFER_DST | VIDEO_ENCODE_SRC` + the H.264 `VkVideoProfileListInfoKHR` chained
-/// in). This bypasses `GstVulkanImageBufferPool`'s generic-format-feature check, which
-/// rejects NV12 on NVIDIA because the encode-input feature is only reported via the
-/// profile-specific query. Returns a `GstBuffer` holding the single image memory + VideoMeta.
-pub fn alloc_encode_src_buffer(
-    device: &VulkanDevice,
-    width: u32,
-    height: u32,
+pub struct EncodeSrcAllocation {
+    pub buffer: gst::Buffer,
+    pub direct_storage: bool,
+}
+
+fn plane_storage_supported(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    format: vk::Format,
+    tiling: vk::ImageTiling,
+) -> bool {
+    let properties = unsafe { instance.get_physical_device_format_properties(physical, format) };
+    let features = match tiling {
+        vk::ImageTiling::LINEAR => properties.linear_tiling_features,
+        vk::ImageTiling::OPTIMAL => properties.optimal_tiling_features,
+        _ => return false,
+    };
+    features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+}
+
+/// Ask Vulkan whether an encode-profile-compatible image may also expose storage views.
+unsafe fn direct_encode_storage_supported(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
     profile: &str,
     fmt: PixFmt,
-) -> Option<gst::Buffer> {
+    tiling: vk::ImageTiling,
+) -> bool {
+    if !plane_storage_supported(instance, physical, fmt.y_view_format(), tiling)
+        || !plane_storage_supported(instance, physical, fmt.uv_view_format(), tiling)
+    {
+        return false;
+    }
+
     let std_h264_idc = match profile {
         "high" | "constrained-high" | "progressive-high" => {
             vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
@@ -415,32 +455,92 @@ pub fn alloc_encode_src_buffer(
         "main" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
         _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
     };
-    unsafe {
-        // Profile chain (matches what the encoder's pool builds from caps): the codec struct
-        // chained off the VkVideoProfileInfoKHR; usage info omitted. P010 -> H.265 Main-10
-        // 10-bit (for vulkanh265enc); NV12 -> H.264 8-bit (the default Vulkan-encode path).
-        let mut h264 = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
-        let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default()
-            .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10);
-        let bit_depth = match fmt {
-            PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
-            PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-        };
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(bit_depth)
-            .chroma_bit_depth(bit_depth);
-        profile_info = match fmt {
-            PixFmt::P010 => profile_info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-                .push_next(&mut h265),
-            PixFmt::Nv12 => profile_info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-                .push_next(&mut h264),
-        };
-        let profiles = [profile_info];
-        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+    let mut h264 = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
+    let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default()
+        .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10);
+    let bit_depth = match fmt {
+        PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+        PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+    };
+    let mut profile_info = vk::VideoProfileInfoKHR::default()
+        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .luma_bit_depth(bit_depth)
+        .chroma_bit_depth(bit_depth);
+    profile_info = match fmt {
+        PixFmt::P010 => profile_info
+            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+            .push_next(&mut h265),
+        PixFmt::Nv12 => profile_info
+            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+            .push_next(&mut h264),
+    };
+    let profiles = [profile_info];
+    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+    let requested_usage = encode_image_usage(true);
+    let video_queue = ash::khr::video_queue::Instance::new(entry, instance);
+    let video_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(requested_usage)
+        .push_next(&mut profile_list);
+    let mut count = 0;
+    let query = video_queue
+        .fp()
+        .get_physical_device_video_format_properties_khr;
+    let first = query(physical, &video_info, &mut count, std::ptr::null_mut());
+    if first != vk::Result::SUCCESS || count == 0 {
+        return false;
+    }
+    let mut video_formats = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+    let second = query(
+        physical,
+        &video_info,
+        &mut count,
+        video_formats.as_mut_ptr(),
+    );
+    if second != vk::Result::SUCCESS {
+        return false;
+    }
+    if !video_formats[..count as usize].iter().any(|properties| {
+        properties.format == fmt.image_format()
+            && properties.image_tiling == tiling
+            && properties.image_type == vk::ImageType::TYPE_2D
+            && properties.image_usage_flags.contains(requested_usage)
+    }) {
+        return false;
+    }
 
+    let view_formats = [
+        fmt.image_format(),
+        fmt.y_view_format(),
+        fmt.uv_view_format(),
+    ];
+    let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(fmt.image_format())
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(tiling)
+        .usage(requested_usage)
+        .flags(encode_image_flags(true))
+        .push_next(&mut profile_list)
+        .push_next(&mut format_list);
+    let mut properties = vk::ImageFormatProperties2::default();
+    instance
+        .get_physical_device_image_format_properties2(physical, &info, &mut properties)
+        .is_ok()
+}
+
+/// Allocate an encode-src image directly on the encoder device. Unsupported storage/video
+/// combinations retain the existing scratch-and-copy allocation contract.
+pub fn alloc_encode_src_buffer(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    device: &VulkanDevice,
+    width: u32,
+    height: u32,
+    profile: &str,
+    fmt: PixFmt,
+) -> Option<EncodeSrcAllocation> {
+    unsafe {
         // RX 9070 / GFX12 (RDNA4) workaround: radv mishandles a LINEAR->tiled (different
         // swizzle mode) vkCmdCopyImage on GFX12 (cf. Mesa 26.0.2 "radv: fix copying images
         // with different swizzle modes on SDMA7"), corrupting the encoder's tiled NV12 input
@@ -464,30 +564,74 @@ pub fn alloc_encode_src_buffer(
             PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
         };
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(image_format)
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(tiling)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR),
+        let requested_direct =
+            direct_encode_storage_supported(entry, instance, physical, profile, fmt, tiling);
+        let allocate = |direct_storage: bool| {
+            let mut h264 =
+                vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
+            let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
+                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10,
+            );
+            let bit_depth = match fmt {
+                PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+                PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            };
+            let mut profile_info = vk::VideoProfileInfoKHR::default()
+                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(bit_depth)
+                .chroma_bit_depth(bit_depth);
+            profile_info = match fmt {
+                PixFmt::P010 => profile_info
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                    .push_next(&mut h265),
+                PixFmt::Nv12 => profile_info
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                    .push_next(&mut h264),
+            };
+            let profiles = [profile_info];
+            let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+            let view_formats = [
+                fmt.image_format(),
+                fmt.y_view_format(),
+                fmt.uv_view_format(),
+            ];
+            let mut format_list =
+                vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+            let mut image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(image_format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(tiling)
+                .usage(encode_image_usage(direct_storage))
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut profile_list);
+            if direct_storage {
+                image_info = image_info
+                    .flags(encode_image_flags(true))
+                    .push_next(&mut format_list);
+            }
+            gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+                device.to_glib_none().0,
+                &image_info as *const vk::ImageCreateInfo as *mut _,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .push_next(&mut profile_list);
-
-        let mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
-            device.to_glib_none().0,
-            &image_info as *const vk::ImageCreateInfo as *mut _,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
+        };
+        let mut direct_storage = requested_direct;
+        let mut mem_ptr = allocate(direct_storage);
+        if mem_ptr.is_null() && direct_storage {
+            tracing::warn!(
+                "vulkan_share: direct encode storage allocation was rejected; using scratch+copy"
+            );
+            direct_storage = false;
+            mem_ptr = allocate(false);
+        }
         if mem_ptr.is_null() {
             tracing::warn!("vulkan_share: gst_vulkan_image_memory_alloc_with_image_info failed");
             return None;
@@ -546,7 +690,33 @@ pub fn alloc_encode_src_buffer(
                 height,
             );
         }
-        Some(buffer)
+        Some(EncodeSrcAllocation {
+            buffer,
+            direct_storage,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_encode_images_request_storage_and_video_encode_usage() {
+        let usage = encode_image_usage(true);
+        assert!(usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        assert!(usage.contains(vk::ImageUsageFlags::from_raw(
+            VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR
+        )));
+        assert!(encode_image_flags(true).contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
+        assert!(encode_image_flags(true).contains(vk::ImageCreateFlags::EXTENDED_USAGE));
+    }
+
+    #[test]
+    fn portable_encode_images_do_not_claim_storage_views() {
+        assert!(!encode_image_usage(false).contains(vk::ImageUsageFlags::STORAGE));
+        assert!(encode_image_flags(false).is_empty());
     }
 }
 

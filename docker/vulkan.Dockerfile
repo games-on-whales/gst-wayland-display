@@ -126,7 +126,8 @@ COPY . /src
 WORKDIR /src
 # Install the plugin .so into /opt/gst's plugin dir (so anything FROM this image,
 # e.g. wolf:vulkan, inherits it on GST_PLUGIN_PATH) plus its pkg-config/header.
-RUN cargo cinstall --release \
+RUN cargo test --release -p wayland-display-core direct_encode && \
+    cargo cinstall --release \
       --prefix=/opt/gst \
       --libdir=/opt/gst/lib64/gstreamer-1.0 \
       --pkgconfigdir=/opt/gst/lib64/pkgconfig
