@@ -55,11 +55,13 @@ RUN dnf install -y \
 # --- Patched GStreamer 1.28.4 -> /opt/gst -----------------------------------
 COPY patches/vkh264enc-dpb-pool-in-new-sequence.patch /tmp/dpb.patch
 COPY patches/vulkanh265enc.patch /tmp/h265.patch
+COPY patches/vulkan-image-create-flags-1.28.patch /tmp/image-create-flags.patch
 RUN git clone --depth 1 --branch ${GST_VERSION} \
       https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
     cd /tmp/gstreamer && \
     git apply /tmp/dpb.patch && \
     git apply /tmp/h265.patch && \
+    git apply /tmp/image-create-flags.patch && \
     # auto_features=disabled leaves several subprojects' docs/meson.build referring
     # to an undefined plugins_cache_generator; short-circuit each when doc is off.
     for d in subprojects/*/docs/meson.build docs/meson.build; do \
@@ -86,7 +88,7 @@ RUN git clone --depth 1 --branch ${GST_VERSION} \
       -Dnls=disabled -Dgst-examples=disabled -Drs=disabled && \
     meson compile -C build && \
     meson install -C build && \
-    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch
+    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch /tmp/image-create-flags.patch
 
 ENV PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig \
     LD_LIBRARY_PATH=/opt/gst/lib64 \
