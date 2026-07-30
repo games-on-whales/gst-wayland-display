@@ -1,0 +1,13 @@
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c
+index 2a78935..5888d4b 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c
+@@ -191,5 +191,7 @@ _vk_image_mem_new_alloc_with_image_info (GstAllocator * allocator,
++  /* Validate the exact create contract. In particular EXTENDED_USAGE permits
++   * multiplanar images whose storage capability is exposed through plane views. */
+   err = vkGetPhysicalDeviceImageFormatProperties (gpu, image_info->format,
+-      VK_IMAGE_TYPE_2D, image_info->tiling, image_info->usage, 0,
++      VK_IMAGE_TYPE_2D, image_info->tiling, image_info->usage, image_info->flags,
+       &mem->format_properties);
+   if (gst_vulkan_error_to_g_error (err, &error,
+           "vkGetPhysicalDeviceImageFormatProperties") < 0)

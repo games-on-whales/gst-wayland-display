@@ -178,7 +178,7 @@ pub enum PixFmt {
 
 impl PixFmt {
     /// The multiplanar Vulkan format of the output/scratch image.
-    fn image_format(self) -> vk::Format {
+    pub(crate) fn image_format(self) -> vk::Format {
         match self {
             PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
@@ -188,7 +188,7 @@ impl PixFmt {
     /// the plane is `R10X6_UNORM_PACK16`; we view it as `R16_UNORM` -- both are in Vulkan's
     /// 16-bit format-compatibility class, so the view is size/class-compatible -- and a
     /// normalized store lands across all 16 bits (the P010 reader takes the top 10).
-    fn y_view_format(self) -> vk::Format {
+    pub(crate) fn y_view_format(self) -> vk::Format {
         match self {
             PixFmt::Nv12 => vk::Format::R8_UNORM,
             PixFmt::P010 => vk::Format::R16_UNORM,
@@ -196,7 +196,7 @@ impl PixFmt {
     }
     /// Per-plane storage-view format for the interleaved Cb/Cr plane (`R10X6G10X6` <-> R16G16,
     /// 32-bit class, compatible).
-    fn uv_view_format(self) -> vk::Format {
+    pub(crate) fn uv_view_format(self) -> vk::Format {
         match self {
             PixFmt::Nv12 => vk::Format::R8G8_UNORM,
             PixFmt::P010 => vk::Format::R16G16_UNORM,
@@ -430,6 +430,7 @@ struct Nv12Out {
 pub struct VulkanNv12 {
     _entry: ash::Entry,
     instance: ash::Instance,
+    physical: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
@@ -449,12 +450,8 @@ pub struct VulkanNv12 {
     sem_fd: Option<ash::khr::external_semaphore_fd::Device>,
     /// AMD/Intel: hand downstream a dmabuf write-fence and don't stall. Nvidia: block.
     implicit_sync: bool,
-    /// LINEAR direct path (compute writes the export image; no scratch/copy).
-    direct: bool,
-    /// Shared-device encode path: outputs are NV12 `GstVulkanImageMemory` from the encoder's
-    /// own pool (single multiplanar `VIDEO_ENCODE_SRC` images); compute writes a storage
-    /// scratch then copies into the pool image, which is left in `VIDEO_ENCODE_SRC` layout
-    /// for the encoder to view zero-copy. No dmabuf export, no implicit-sync fence.
+    /// Shared-device encode path: outputs are encoder-owned NV12/P010 images. Each record
+    /// either exposes storage plane views directly or retains a storage scratch fallback.
     encode_src: bool,
     /// Keeps the shared `GstVulkanDevice` alive for the converter's lifetime (the encode-src
     /// images are allocated on it).
@@ -670,13 +667,13 @@ impl VulkanNv12 {
             }
             Ok(outputs)
         };
-        let (outputs, direct) = match (want_direct, build(want_direct)) {
-            (_, Ok(o)) => (o, want_direct),
+        let outputs = match (want_direct, build(want_direct)) {
+            (_, Ok(o)) => o,
             (true, Err(e)) => {
                 tracing::warn!(
                     "VulkanNv12: LINEAR direct path unavailable ({e}); using scratch+copy"
                 );
-                (build(false)?, false)
+                build(false)?
             }
             (false, Err(e)) => return Err(e),
         };
@@ -698,6 +695,7 @@ impl VulkanNv12 {
         Ok(VulkanNv12 {
             _entry: entry,
             instance,
+            physical: pd,
             device,
             queue,
             cmd_pool,
@@ -711,7 +709,6 @@ impl VulkanNv12 {
             sync_sem,
             sem_fd,
             implicit_sync,
-            direct,
             encode_src: false,
             _shared_device: None,
             outputs,
@@ -725,10 +722,8 @@ impl VulkanNv12 {
 
     /// Shared-device encode path: wrap the downstream encoder's `GstVulkanDevice` and build
     /// an output ring of NV12 `GstVulkanImageMemory` buffers from its encode-src pool. The
-    /// compositor's RGBA dmabuf is imported + converted (compute -> storage scratch) and
-    /// `vkCmdCopyImage`'d into the pool's encode-src image, left in `VIDEO_ENCODE_SRC`
-    /// layout for `vulkanh264enc` to view zero-copy. Same device as the encoder, so ordering
-    /// is a plain fence wait (the encoder does its own input acquire).
+    /// compositor's RGBA dmabuf is converted directly into the encoder image when supported,
+    /// otherwise through the existing storage scratch and image-copy fallback.
     #[allow(clippy::too_many_arguments)]
     pub fn new_on_shared(
         device_gst: gstreamer_vulkan::VulkanDevice,
@@ -836,6 +831,9 @@ impl VulkanNv12 {
         let mut outputs = Vec::with_capacity(RING);
         for _ in 0..RING {
             outputs.push(create_encode_output(
+                &entry,
+                &instance,
+                raw.physical,
                 &device,
                 &memp,
                 &device_gst,
@@ -852,6 +850,7 @@ impl VulkanNv12 {
         Ok(VulkanNv12 {
             _entry: entry,
             instance,
+            physical: raw.physical,
             device,
             queue,
             cmd_pool,
@@ -865,7 +864,6 @@ impl VulkanNv12 {
             sync_sem: vk::Semaphore::null(),
             sem_fd: None,
             implicit_sync: false,
-            direct: false,
             encode_src: true,
             _shared_device: Some(device_gst),
             outputs,
@@ -943,7 +941,7 @@ impl VulkanNv12 {
         let desc_set = slot.desc_set;
         let cmd = slot.cmd;
         let fence = slot.fence;
-        let direct = self.direct;
+        let direct = slot.scratch.is_none();
         // Per-frame shader: the PQ-passthrough pipeline when this frame is already-PQ 10-bit
         // content and that pipeline exists, else the normal (tone-mapping / BT.601) pipeline.
         let pipeline = match (pq_passthrough, self.pipeline_pq) {
@@ -1034,14 +1032,18 @@ impl VulkanNv12 {
             .cmd_dispatch(cmd, (self.width / 2 + 7) / 8, (self.height / 2 + 7) / 8, 1);
 
         if direct {
-            // LINEAR direct: the compute output *is* the export image. Flush the shader
-            // writes so the dmabuf consumer sees them (ordering to the consumer is the
-            // implicit dma-buf write-fence / the CPU wait below).
+            // Direct path: the compute output is the consumer image. The encoder path must
+            // publish it in VIDEO_ENCODE_SRC rather than leaving it in GENERAL.
+            let final_layout = if self.encode_src {
+                vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR)
+            } else {
+                vk::ImageLayout::GENERAL
+            };
             let f_y = img_barrier(
                 out_img,
                 vk::ImageAspectFlags::PLANE_0,
                 vk::ImageLayout::GENERAL,
-                vk::ImageLayout::GENERAL,
+                final_layout,
                 vk::AccessFlags::SHADER_WRITE,
                 vk::AccessFlags::empty(),
             );
@@ -1049,7 +1051,7 @@ impl VulkanNv12 {
                 out_img,
                 vk::ImageAspectFlags::PLANE_1,
                 vk::ImageLayout::GENERAL,
-                vk::ImageLayout::GENERAL,
+                final_layout,
                 vk::AccessFlags::SHADER_WRITE,
                 vk::AccessFlags::empty(),
             );
@@ -1898,12 +1900,13 @@ unsafe fn create_output(
     })
 }
 
-/// Build one encode-src ring slot: a buffer from the encoder's `GstVulkanImageBufferPool`
-/// (a single multiplanar NV12 `VIDEO_ENCODE_SRC` image), a LINEAR storage scratch the
-/// compute shader writes, and the per-slot cmd/fence/descriptor set. No dmabuf export --
-/// the pool owns the output image's memory.
+/// Build one encode-src record. A compatible encoder image receives storage writes directly;
+/// all other drivers retain the portable scratch-and-copy path.
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_encode_output(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
     device: &ash::Device,
     memp: &vk::PhysicalDeviceMemoryProperties,
     gst_device: &gstreamer_vulkan::VulkanDevice,
@@ -1915,32 +1918,56 @@ unsafe fn create_encode_output(
     height: u32,
     fmt: PixFmt,
 ) -> Result<Nv12Out, Err> {
-    let buffer = crate::utils::vulkan_share::alloc_encode_src_buffer(
-        gst_device, width, height, profile, fmt,
+    let allocation = crate::utils::vulkan_share::alloc_encode_src_buffer(
+        entry, instance, physical, gst_device, width, height, profile, fmt,
     )
     .ok_or("encode-src image allocation failed")?;
+    let buffer = allocation.buffer;
     let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)
         .ok_or("encode-src buffer is not a single GstVulkanImageMemory")?;
 
-    // LINEAR storage scratch (compute writes here; copied into the encode-src image).
-    let (s_img, s_mem, y_view, uv_view) = create_storage(
-        device,
-        memp,
-        width,
-        height,
-        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-        false,
-        fmt,
-    )?;
+    let (scratch, y_view, uv_view) = if allocation.direct_storage {
+        (
+            None,
+            plane_view(
+                device,
+                out_img,
+                fmt.y_view_format(),
+                vk::ImageAspectFlags::PLANE_0,
+            )?,
+            plane_view(
+                device,
+                out_img,
+                fmt.uv_view_format(),
+                vk::ImageAspectFlags::PLANE_1,
+            )?,
+        )
+    } else {
+        let (scratch_image, scratch_memory, y_view, uv_view) = create_storage(
+            device,
+            memp,
+            width,
+            height,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            false,
+            fmt,
+        )?;
+        (Some((scratch_image, scratch_memory)), y_view, uv_view)
+    };
 
     // Diagnostic for the RX 9070 green-bar/jump report: if the encoder's pool gives us an
     // encode-src image padded beyond width*height*3/2 (e.g. RDNA4 row-alignment), our copy
     // fills only `height` rows and the padding stays zeroed -> green at the bottom.
-    let tight_nv12 = width as u64 * height as u64 * 3 / 2;
+    let tight_nv12 = width as u64 * height as u64 * fmt.y_bytes() * 3 / 2;
+    let scratch_size = scratch
+        .map(|(image, _)| device.get_image_memory_requirements(image).size)
+        .unwrap_or(0);
     tracing::debug!(
-        "encode-src slot: req={width}x{height} NV12; out_img mem={} scratch mem={} tight={tight_nv12}",
+        "encode-src slot: req={width}x{height} {:?}; out_img mem={} scratch mem={} tight={tight_nv12} direct_storage={}",
+        fmt,
         device.get_image_memory_requirements(out_img).size,
-        device.get_image_memory_requirements(s_img).size,
+        scratch_size,
+        allocation.direct_storage,
     );
 
     let cmd = device.allocate_command_buffers(
@@ -1970,7 +1997,7 @@ unsafe fn create_encode_output(
         mem: vk::DeviceMemory::null(), // the pool owns the encode-src image memory
         buffer,
         export_fd: -1,
-        scratch: Some((s_img, s_mem)),
+        scratch,
         y_view,
         uv_view,
         cmd,

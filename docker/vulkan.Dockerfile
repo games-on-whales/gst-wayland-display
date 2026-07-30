@@ -55,11 +55,13 @@ RUN dnf install -y \
 # --- Patched GStreamer 1.28.4 -> /opt/gst -----------------------------------
 COPY patches/vkh264enc-dpb-pool-in-new-sequence.patch /tmp/dpb.patch
 COPY patches/vulkanh265enc.patch /tmp/h265.patch
+COPY patches/vulkan-image-create-flags-1.28.patch /tmp/image-create-flags.patch
 RUN git clone --depth 1 --branch ${GST_VERSION} \
       https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
     cd /tmp/gstreamer && \
     git apply /tmp/dpb.patch && \
     git apply /tmp/h265.patch && \
+    git apply /tmp/image-create-flags.patch && \
     # auto_features=disabled leaves several subprojects' docs/meson.build referring
     # to an undefined plugins_cache_generator; short-circuit each when doc is off.
     for d in subprojects/*/docs/meson.build docs/meson.build; do \
@@ -86,7 +88,7 @@ RUN git clone --depth 1 --branch ${GST_VERSION} \
       -Dnls=disabled -Dgst-examples=disabled -Drs=disabled && \
     meson compile -C build && \
     meson install -C build && \
-    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch
+    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch /tmp/image-create-flags.patch
 
 ENV PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig \
     LD_LIBRARY_PATH=/opt/gst/lib64 \
@@ -117,14 +119,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # Cache-bust the plugin source COPY + compile. The registry build cache (cache-from/
 # cache-to mode=max) can serve a STALE `cargo cinstall` layer even when src/ changed,
 # leaving an outdated plugin .so in the image. Bump this to force a clean recompile.
-ARG PLUGIN_CACHEBUST=2026-06-30-fmt-fix2
+ARG PLUGIN_CACHEBUST=2026-07-30-direct-encode-storage
 RUN echo "plugin rebuild: ${PLUGIN_CACHEBUST}"
 
 COPY . /src
 WORKDIR /src
 # Install the plugin .so into /opt/gst's plugin dir (so anything FROM this image,
 # e.g. wolf:vulkan, inherits it on GST_PLUGIN_PATH) plus its pkg-config/header.
-RUN cargo cinstall --release \
+RUN cargo test --release -p wayland-display-core direct_encode && \
+    cargo cinstall --release \
       --prefix=/opt/gst \
       --libdir=/opt/gst/lib64/gstreamer-1.0 \
       --pkgconfigdir=/opt/gst/lib64/pkgconfig

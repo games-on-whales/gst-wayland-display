@@ -6,6 +6,7 @@ Apply against a gstreamer monorepo checkout before building:
 ```
 git apply patches/vkh264enc-dpb-pool-in-new-sequence.patch
 git apply patches/vulkanh265enc.patch
+git apply patches/vulkan-image-create-flags-1.28.patch
 ```
 
 ## vkh264enc-dpb-pool-in-new-sequence.patch
@@ -35,6 +36,17 @@ the H.264 patch (independent files; no conflict).
 Status: compiles + links + loads clean on 1.28.4; HEVC bitstream design
 roundtable-approved. Pending hardware validation on AMD (RADV
 `RADV_PERFTEST=video_encode`) before any upstream MR.
+
+## vulkan-image-create-flags-1.28.patch
+
+Keeps Vulkan image-format capability validation aligned with the flags used to
+create an image from `GstVulkanImageMemoryCreateInfo`. This is required when
+the direct encode path requests `MUTABLE_FORMAT` and `EXTENDED_USAGE` for an
+image that is both storage-writable and `VIDEO_ENCODE_SRC`.
+
+The patch intentionally covers the 1.28 allocation-with-image-info path used
+by this plugin. It does not alter the legacy wrapped-image helper, which also
+uses zero flags on this GStreamer branch.
 
 (The Vulkan-encode path also needs the device to enable the external-memory
 extensions that `GstVulkanDevice` does not — `VK_KHR_external_memory_fd` etc. —
