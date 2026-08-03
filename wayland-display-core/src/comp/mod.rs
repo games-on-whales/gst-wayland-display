@@ -322,9 +322,19 @@ impl State {
                 dmabuf_state.create_global::<State>(&dh, formats.clone())
             };
 
+            // The only product of this bind is the `EGLBufferReader` used by the legacy
+            // wl_drm / EGL-image import path. Both client-buffer routes here go through
+            // `import_dmabuf` (`handlers/dmabuf.rs`, and `handlers/wl_drm.rs` -- mesa's wl_drm
+            // is implemented over dmabuf), so a failed bind does not disable hardware
+            // acceleration and does not affect dmabuf import. Logging it as
+            // "Failed to initialize EGL hardware-acceleration" is misleading: on render nodes
+            // where the bind always fails it reads as a fallback to software rendering.
             match renderer.bind_wl_display(&dh) {
                 Ok(_) => tracing::info!("EGL hardware-acceleration enabled"),
-                Err(err) => tracing::info!(?err, "Failed to initialize EGL hardware-acceleration"),
+                Err(err) => tracing::debug!(
+                    ?err,
+                    "EGL wl_display bind unavailable (legacy wl_drm/EGL-image import disabled; dmabuf import unaffected)"
+                ),
             }
 
             // wl_drm (mesa protocol, so we don't need EGL_WL_bind_display)
