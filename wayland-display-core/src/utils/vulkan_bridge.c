@@ -50,7 +50,7 @@ wayland_display_vk_prepare_encode_image (GstMemory *memory)
   if (image->barrier.parent.semaphore != VK_NULL_HANDLE)
     vkDestroySemaphore (image->device->device,
         image->barrier.parent.semaphore, NULL);
-  image->barrier.parent.queue = NULL;
+  gst_clear_object (&image->barrier.parent.queue);
   image->barrier.parent.semaphore = VK_NULL_HANDLE;
   image->barrier.parent.semaphore_value = 0;
   image->barrier.image_layout = VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR;

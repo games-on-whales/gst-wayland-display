@@ -459,8 +459,6 @@ pub struct VulkanNv12 {
     /// Keeps the shared `GstVulkanDevice` alive for the converter's lifetime (the encode-src
     /// images are allocated on it).
     _shared_device: Option<gstreamer_vulkan::VulkanDevice>,
-    /// The exact GStreamer graphics queue used by `queue`; retained so every custom
-    /// `vkQueueSubmit` participates in GStreamer's external-submit lock.
     outputs: Vec<Nv12Out>,
     next: usize, // next ring slot to write
     cur: usize,  // last slot written (the one to_gst_buffer returns)
@@ -905,11 +903,17 @@ impl VulkanNv12 {
             self.outputs[idx].in_flight = false;
         }
 
-        // vulkanh26x waits its GstVulkanOperation before returning from encode, and retains
-        // the input buffer until then. Writability is therefore the PR #37 completion gate.
+        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
+        // downstream encoders at once (interpipe delivers it to every consumer). Our own
+        // graphics fence above only proves *our* last write to this slot finished -- it says
+        // nothing about the consumers' encode *reads*, which run on the encode queue with no
+        // shared sync to us. Overwriting the slot's image while an encode still reads it is a
+        // GPU data hazard that wedges the encoder. Block until every consumer has dropped its
+        // ref (the buffer is writable again, refcount back to 1) before reusing the slot.
         if self.encode_src {
             let mut waited = 0u32;
             while self.outputs[idx].buffer.get_mut().is_none() {
+                // ~1s cap so a paused/stalled consumer can't deadlock the producer forever.
                 if waited >= 10_000 {
                     tracing::warn!(
                         "VulkanNv12: encode-src slot {idx} still referenced after 1s; reusing anyway"
