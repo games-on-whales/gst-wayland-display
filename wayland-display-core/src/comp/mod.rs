@@ -121,6 +121,10 @@ pub struct State {
     pub(crate) pointer_location: Point<f64, Logical>,
     pub(crate) pointer_absolute_location: Point<f64, Logical>,
     last_pointer_movement: Instant,
+    /// Edge trigger for a forced wl_pointer refocus. Set at initial toplevel map,
+    /// consumed by the next `pointer_motion()` that has a surface under the pointer;
+    /// see `comp::input::pointer_motion`.
+    pub(crate) pending_pointer_refocus: bool,
     cursor_element: MemoryRenderBuffer,
     pub cursor_state: CursorImageStatus,
     surpressed_keys: HashSet<u32>,
@@ -277,6 +281,7 @@ impl State {
             pointer_location: (0., 0.).into(),
             pointer_absolute_location: (0., 0.).into(),
             last_pointer_movement: Instant::now(),
+            pending_pointer_refocus: false,
             cursor_element,
             cursor_state: CursorImageStatus::default_named(),
             cursor_event_count: 0,

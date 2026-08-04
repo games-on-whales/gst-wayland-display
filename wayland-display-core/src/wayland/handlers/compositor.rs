@@ -198,6 +198,18 @@ impl CompositorHandler for State {
                     (0., 0.).into(),
                     (0., 0.).into(),
                 );
+                // Arm the edge-triggered pointer refocus for the NEXT motion: the enter
+                // emitted by the synthetic motion above reaches only the wl_pointer
+                // resources that exist at this instant, and a client that calls
+                // wl_seat.get_pointer afterwards (rootful Xwayland always; gamescope
+                // intermittently) would never see one, because smithay records focus
+                // regardless and every later motion then takes its same-target arm.
+                //
+                // ORDER IS LOAD-BEARING: this must be set AFTER the synthetic motion.
+                // That motion is itself a pointer_motion() call, so arming the flag first
+                // would let it consume itself inside the exact race window this fix
+                // exists to escape.
+                self.pending_pointer_refocus = true;
             }
 
             return;
