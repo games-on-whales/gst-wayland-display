@@ -15,6 +15,31 @@ fn move_mouse() {
     f.round_trip();
     f.create_window(320, 240);
 
+    {
+        // Mapping a toplevel now resolves pointer focus immediately: the map handler emits a
+        // synthetic zero-delta motion, so the client receives its wl_pointer.enter at the
+        // pointer's *current* location without waiting for a physical motion event.
+        let map_location = f.server.pointer_location;
+
+        let client_events = f.client.get_client_events();
+        assert!(!client_events.is_empty());
+        let MouseEvents::Pointer(client_event) = client_events.remove(0) else {
+            panic!("Unexpected event: {:?}", client_events);
+        };
+        let wl_pointer::Event::Enter {
+            surface_x,
+            surface_y,
+            ..
+        } = client_event
+        else {
+            panic!("Unexpected event: {:?}", client_event);
+        };
+        assert_eq!(surface_x, map_location.x);
+        assert_eq!(surface_y, map_location.y);
+
+        clean_events(client_events);
+    }
+
     let expected_location = Point::from((0.0, 0.0));
     f.server.pointer_motion_absolute(0, expected_location);
     f.round_trip();
@@ -29,8 +54,9 @@ fn move_mouse() {
         let MouseEvents::Pointer(client_event) = client_events.remove(0) else {
             panic!("Unexpected event: {:?}", client_events);
         };
-        let wl_pointer::Event::Enter {
-            // First time, we are entering the window
+        let wl_pointer::Event::Motion {
+            // The enter already arrived at map time (above), so this first physical motion
+            // is a same-surface move: wl_pointer.motion, not another enter.
             surface_x,
             surface_y,
             ..

@@ -183,6 +183,21 @@ impl CompositorHandler for State {
                     Some(FocusTarget::from(window)),
                     SERIAL_COUNTER.next_serial(),
                 );
+                // Synthetic zero-delta motion: delivers wl_pointer.enter to the newly
+                // mapped (and just-raised) toplevel immediately -- without waiting for
+                // the next physical motion event -- and runs
+                // maybe_activate_pointer_constraint(), so a client that requested a
+                // pointer lock/confine before mapping (nested gamescope with
+                // --force-grab-cursor) gets its constraint activated the moment its
+                // surface is focusable. Pointer focus thereby follows the newest
+                // toplevel exactly like keyboard focus above.
+                let time: std::time::Duration = self.clock.now().into();
+                self.pointer_motion(
+                    time.as_millis() as u32,
+                    time.as_micros() as u64,
+                    (0., 0.).into(),
+                    (0., 0.).into(),
+                );
             }
 
             return;
