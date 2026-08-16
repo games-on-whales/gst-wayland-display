@@ -110,9 +110,16 @@ RUN git clone --depth 1 https://github.com/games-on-whales/gst-interpipe.git /tm
 
 # --- Rust toolchain (gstreamer-rs 0.25 + cargo-c need >= 1.94) + the plugin ---
 ENV CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
+# cargo-c is pinned because it is installed from crates.io at build time, so an
+# unpinned `cargo install` picks up whatever is newest and drifts away from the
+# toolchain pinned above. cargo-c 0.10.24 raised its MSRV to rustc 1.95 and broke
+# this layer against RUST_VERSION=1.94.0; 0.10.23 is the last release supporting
+# 1.94. `--locked` uses cargo-c's own Cargo.lock so a transitive dependency
+# raising ITS MSRV cannot break the build again without a deliberate bump here.
+# Raise both this pin and RUST_VERSION together.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal && \
-    cargo install cargo-c
+    cargo install cargo-c --version 0.10.23 --locked
 
 # Cache-bust the plugin source COPY + compile. The registry build cache (cache-from/
 # cache-to mode=max) can serve a STALE `cargo cinstall` layer even when src/ changed,
