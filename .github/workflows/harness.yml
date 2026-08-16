@@ -1,0 +1,50 @@
+name: build & test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # CPU phases on a GitHub-hosted runner: lint, build (default + the cuda build
+  # is skipped without an Nvidia GPU), and the non-ignored tests. The GPU phases
+  # (gpu / integration / bench) self-skip when there is no render node.
+  harness:
+    name: harness (lint · build · unit)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/games-on-whales/gstreamer:1.26.7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl ca-certificates git libssl-dev libicu76 \
+            libwayland-dev libinput-dev libxkbcommon-dev libgbm-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libudev-dev libclang-dev clang \
+            libgl1-mesa-dri libegl-mesa0 mesa-vulkan-drivers hwdata \
+            librust-gstreamer-allocators-dev
+
+      - name: Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal \
+                --default-toolchain "${RUST_VERSION:-1.89.0}" --component rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Harness
+        run: bash ci/harness.sh lint build unit
+
+  # Full matrix (gpu / integration / bench) on real hardware. Off by default;
+  # enable by registering a self-hosted runner labelled `gpu` and setting the
+  # repository variable GPU_RUNNER=true.
+  harness-gpu:
+    name: harness (full · GPU)
+    if: ${{ vars.GPU_RUNNER == 'true' }}
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Harness (all phases)
+        run: bash ci/harness.sh
