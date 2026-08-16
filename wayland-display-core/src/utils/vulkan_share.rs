@@ -447,15 +447,13 @@ pub fn alloc_encode_src_buffer(
         // (green band / shifted image). Allocating the encode-src LINEAR makes the
         // scratch->encode-src copy LINEAR->LINEAR (no swizzle change), avoiding that path --
         // *if* the GFX12 VCN encoder accepts a linear input image. Opt-in (the tiled default
-        // works on RDNA3 and on a fixed radv); falls back to tiled if the linear alloc fails.
+        // works on RDNA3 and on a fixed radv); falls back to tiled if the LINEAR *allocation*
+        // fails (a driver that accepts the LINEAR image but corrupts or fails at encode time
+        // is not covered by the fallback).
         let linear_encsrc = std::env::var("WOLF_VULKAN_LINEAR_ENCSRC")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let tiling = if linear_encsrc {
-            tracing::info!(
-                "vulkan_share: encode-src tiling=LINEAR (WOLF_VULKAN_LINEAR_ENCSRC) -- copy is \
-                 LINEAR->LINEAR, avoids the GFX12 swizzle-mode copy"
-            );
             vk::ImageTiling::LINEAR
         } else {
             vk::ImageTiling::OPTIMAL
@@ -483,14 +481,37 @@ pub fn alloc_encode_src_buffer(
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut profile_list);
 
-        let mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+        let mut mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
             device.to_glib_none().0,
             &image_info as *const vk::ImageCreateInfo as *mut _,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         );
+        let mut effective_tiling = tiling;
+        if mem_ptr.is_null() && linear_encsrc {
+            // The tiled-fallback promised above: some encoders (NVIDIA Vulkan-Video)
+            // reject a LINEAR encode-src image outright, so a failed LINEAR alloc must
+            // not kill the whole vulkan output -- retry with the tiled default.
+            tracing::warn!(
+                "vulkan_share: LINEAR encode-src alloc failed (WOLF_VULKAN_LINEAR_ENCSRC) -- \
+                 falling back to tiled (OPTIMAL)"
+            );
+            let image_info = image_info.tiling(vk::ImageTiling::OPTIMAL);
+            effective_tiling = vk::ImageTiling::OPTIMAL;
+            mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+                device.to_glib_none().0,
+                &image_info as *const vk::ImageCreateInfo as *mut _,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+        }
         if mem_ptr.is_null() {
             tracing::warn!("vulkan_share: gst_vulkan_image_memory_alloc_with_image_info failed");
             return None;
+        }
+        if linear_encsrc {
+            tracing::info!(
+                "vulkan_share: encode-src allocated with tiling={:?} (WOLF_VULKAN_LINEAR_ENCSRC)",
+                effective_tiling
+            );
         }
 
         // Our converter always leaves this image in VIDEO_ENCODE_SRC layout (it CPU-waits the
