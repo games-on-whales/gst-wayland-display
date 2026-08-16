@@ -657,7 +657,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                             "Failed to get CUDA buffer pool from allocation pool: {}",
                             err
                         );
-                        unsafe { gst::ffi::gst_clear_object(pool.as_ptr() as *mut _) };
+                        // Nothing to release here. `query.allocation_pools()` parses with
+                        // `gst_query_parse_nth_allocation_pool`, which is (transfer full), so
+                        // `pools` owns this `BufferPool` and drops it at the end of the scope.
                         CUDABufferPool::new(&cuda_ctx)
                     }
                 },
