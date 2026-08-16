@@ -1097,7 +1097,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                             "Failed to get CUDA buffer pool from allocation pool: {}",
                             err
                         );
-                        unsafe { gst::ffi::gst_clear_object(pool.as_ptr() as *mut _) };
+                        // Nothing to release here. `query.allocation_pools()` parses with
+                        // `gst_query_parse_nth_allocation_pool`, which is (transfer full), so
+                        // `pools` owns this `BufferPool` and drops it at the end of the scope.
                         CUDABufferPool::new(&cuda_ctx)
                     }
                 },
@@ -1116,7 +1118,13 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
         match pool {
             Ok(pool) => {
-                let caps = unsafe { gst::Caps::from_glib_full(outcaps.unwrap().as_ptr()) };
+                // The allocation query only lends us its caps (`query.get()` borrows), so
+                // adopt it with `from_glib_none`. `from_glib_full` consumed a reference we
+                // never owned, leaving the negotiated caps one short. Paired with the
+                // `gst_structure_free` in `CUDABufferPool::get_updated_size()`: the pool
+                // config holds a ref on this same caps, so releasing the config copy while
+                // the over-unref is present drops the caps below its true count.
+                let caps = unsafe { gst::Caps::from_glib_none(outcaps.unwrap().as_ptr()) };
                 let stream = cuda_ctx.stream().expect("failed to get CUDA stream");
                 pool.configure(&caps, &stream, size, min, max)
                     .expect("failed to configure CUDA pool");

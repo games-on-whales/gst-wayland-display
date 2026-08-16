@@ -67,3 +67,54 @@ impl From<GstVideoInfo> for VideoInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::tests::test_init;
+
+    #[test]
+    fn raw_video_info_round_trips() {
+        test_init();
+
+        let info = VideoInfo::builder(gst_video::VideoFormat::Rgba, 1920, 1080)
+            .fps(gst::Fraction::new(60, 1))
+            .build()
+            .unwrap();
+
+        // VideoInfo -> GstVideoInfo::RAW -> VideoInfo is lossless.
+        let wrapped: GstVideoInfo = info.clone().into();
+        assert!(matches!(wrapped, GstVideoInfo::RAW(_)));
+
+        let back: VideoInfo = wrapped.into();
+        assert_eq!(back.format(), info.format());
+        assert_eq!(back.width(), info.width());
+        assert_eq!(back.height(), info.height());
+        assert_eq!(back.fps(), info.fps());
+    }
+
+    #[test]
+    fn dma_video_info_converts_to_raw_preserving_dimensions() {
+        test_init();
+
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(gst_video::VideoFormat::DmaDrm)
+            .field("drm-format", "RGBA")
+            .width(640)
+            .height(480)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        assert!(caps.is_fixed());
+        let dma = VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
+
+        let wrapped: GstVideoInfo = dma.into();
+        assert!(matches!(wrapped, GstVideoInfo::DMA(_)));
+
+        // The DMA arm resolves to a plain VideoInfo carrying the same geometry.
+        let back: VideoInfo = wrapped.into();
+        assert_eq!(back.width(), 640);
+        assert_eq!(back.height(), 480);
+    }
+}

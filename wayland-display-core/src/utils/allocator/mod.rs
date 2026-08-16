@@ -1228,4 +1228,56 @@ mod tests {
             Modifier::Unrecognized(0x0200000000042305)
         )
     }
+
+    #[test]
+    fn test_gst_video_format_name_to_drm_fourcc() {
+        // GStreamer names the channels in memory order; the DRM fourcc names
+        // them in the opposite order, so each maps to its byte-reversed twin.
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("ABGR".into()),
+            Some(DrmFourcc::Rgba8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("ARGB".into()),
+            Some(DrmFourcc::Bgra8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("BGRA".into()),
+            Some(DrmFourcc::Argb8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("BGRX".into()),
+            Some(DrmFourcc::Xrgb8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("RGBA".into()),
+            Some(DrmFourcc::Abgr8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("RGBX".into()),
+            Some(DrmFourcc::Xbgr8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("XBGR".into()),
+            Some(DrmFourcc::Rgbx8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("XRGB".into()),
+            Some(DrmFourcc::Bgrx8888)
+        );
+
+        // The match lowercases its input first, so case is irrelevant.
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("rgba".into()),
+            Some(DrmFourcc::Abgr8888)
+        );
+        assert_eq!(
+            gst_video_format_name_to_drm_fourcc("RgBa".into()),
+            Some(DrmFourcc::Abgr8888)
+        );
+
+        // Anything not in the table (incl. non-RGB formats) falls through.
+        assert_eq!(gst_video_format_name_to_drm_fourcc("NV12".into()), None);
+        assert_eq!(gst_video_format_name_to_drm_fourcc("".into()), None);
+    }
 }
