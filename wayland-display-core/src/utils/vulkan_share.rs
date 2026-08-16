@@ -11,8 +11,8 @@
 //! CUDA path's context sharing in Wolf. This module extracts + stashes the shared device
 //! (set from `ElementImpl::set_context`), exposes the raw `VkInstance`/`VkPhysicalDevice`/
 //! `VkDevice` + a graphics queue family so our `ash` compute/copy runs on the encoder's
-//! device, and builds a `GstVulkanImageBufferPool` of encode-src NV12 images whose
-//! `VkImage` we recover.
+//! device, and mints encode-src NV12 images one at a time via
+//! `gst_vulkan_image_memory_alloc_with_image_info`, whose `VkImage` we recover.
 //!
 //! `gstreamer-vulkan` (safe) leaves the Vulkan-typed calls unbound (gir skips vk types), so
 //! we call them through `gstreamer-vulkan-sys` (whose `vulkan::*` are ash `vk::*`
@@ -320,78 +320,6 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
             device: overlay.device,
             gfx_queue_family,
         })
-    }
-}
-
-/// Build the H.264 profile caps the encode-src image pool needs (matches what
-/// `vulkanh264enc`'s `propose_allocation` feeds its pool). NV12 ⇒ 4:2:0, 8-bit.
-pub fn h264_profile_caps(profile: &str) -> gst::Caps {
-    gst::Caps::builder("video/x-h264")
-        .field("profile", profile)
-        .field("chroma-format", "4:2:0")
-        .field("bit-depth-luma", 8u32)
-        .field("bit-depth-chroma", 8u32)
-        .build()
-}
-
-/// Create + activate a `GstVulkanImageBufferPool` of encode-src NV12 images on the shared
-/// device, configured exactly like the encoder's own input pool (usage
-/// `VIDEO_ENCODE_SRC | TRANSFER_DST`, the encode profile chained in), so a buffer acquired
-/// from it is a single multiplanar `GstVulkanImageMemory` the encoder views zero-copy.
-pub fn encode_src_pool(
-    device: &VulkanDevice,
-    nv12_caps: &gst::Caps,
-    profile_caps: &gst::Caps,
-    size: usize,
-    min_buffers: u32,
-    max_buffers: u32,
-) -> Option<gst::BufferPool> {
-    unsafe {
-        let pool_ptr = gstvk::gst_vulkan_image_buffer_pool_new(device.to_glib_none().0);
-        if pool_ptr.is_null() {
-            return None;
-        }
-        // Build the config entirely via the raw GstStructure that set_config consumes, so
-        // our Vulkan-typed allocation params (the VIDEO_ENCODE_SRC usage that makes the pool
-        // pick the multiplanar NV12 format) actually land -- mixing the safe BufferPoolConfig
-        // wrapper with raw-ptr FFI dropped them.
-        let pool_bp = pool_ptr as *mut gst::ffi::GstBufferPool;
-        let cfg = gst::ffi::gst_buffer_pool_get_config(pool_bp);
-        gst::ffi::gst_buffer_pool_config_set_params(
-            cfg,
-            nv12_caps.to_glib_none().0,
-            size as u32,
-            min_buffers,
-            max_buffers,
-        );
-        let usage = vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR);
-        let access =
-            (vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).as_raw() as u64;
-        gstvk::gst_vulkan_image_buffer_pool_config_set_allocation_params(
-            cfg,
-            usage,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR),
-            access,
-        );
-        gstvk::gst_vulkan_image_buffer_pool_config_set_encode_caps(
-            cfg,
-            profile_caps.to_glib_none().0,
-        );
-        let ok = gst::ffi::gst_buffer_pool_set_config(pool_bp, cfg); // transfer-full of cfg
-        let pool: gst::BufferPool = from_glib_full(pool_ptr);
-        if ok == gst::glib::ffi::GFALSE {
-            tracing::warn!(
-                "vulkan_share: encode-src pool set_config failed (caps={nv12_caps}, profile={profile_caps})"
-            );
-            return None;
-        }
-        if pool.set_active(true).is_err() {
-            tracing::warn!("vulkan_share: failed to activate encode-src pool");
-            return None;
-        }
-        Some(pool)
     }
 }
 
