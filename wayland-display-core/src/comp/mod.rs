@@ -836,10 +836,6 @@ pub(crate) fn init(
                         }
                         if let Err(_) = match state.create_frame() {
                             Ok((buf, render_result)) => {
-                                render_result
-                                    .sync
-                                    .wait()
-                                    .expect("Error during render_result.sync"); // we need to wait before giving a hardware buffer to gstreamer or we might not be done writing to it
                                 let res = buffer_sender.send(Ok(buf));
                                 let rendered_states = &render_result.states;
                                 let rendered_damage = render_result.damage.is_some();
