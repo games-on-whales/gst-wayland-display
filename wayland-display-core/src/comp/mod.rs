@@ -4,7 +4,6 @@ use smithay::backend::SwapBuffersError;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::input::AxisSource;
 use smithay::backend::input::TouchSlot;
-use smithay::backend::renderer::ImportEgl;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::gbm::BufferObjectFlags;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
@@ -295,7 +294,9 @@ impl State {
 
         let render_node: Option<DrmNode> = render_target.clone().into();
 
-        let mut renderer = setup_renderer(render_node);
+        // No `mut`: with the `bind_wl_display` call gone, nothing in this scope takes
+        // `renderer` mutably before it moves into `State`.
+        let renderer = setup_renderer(render_node);
 
         let shm_state = ShmState::new::<State>(&dh, vec![]);
         let dmabuf_global = if let RenderTarget::Hardware(node) = render_target {
@@ -322,10 +323,16 @@ impl State {
                 dmabuf_state.create_global::<State>(&dh, formats.clone())
             };
 
-            match renderer.bind_wl_display(&dh) {
-                Ok(_) => tracing::info!("EGL hardware-acceleration enabled"),
-                Err(err) => tracing::info!(?err, "Failed to initialize EGL hardware-acceleration"),
-            }
+            // No `bind_wl_display` here. Its only product is the `EGLBufferReader` behind
+            // `BufferType::Egl`, and nothing in this compositor can produce such a buffer:
+            // every buffer-carrying global we advertise resolves earlier in smithay's
+            // `buffer_type()` dispatch. `ShmState` gives `Shm`, `DmabufState` gives `Dma`,
+            // `SinglePixelBufferState` gives `SinglePixel`, and our own `wl_drm` below hands
+            // the `WlBuffer` a `Dmabuf` as user data, so it resolves as `Dma` too. The bind
+            // therefore enabled an import path with no possible client, while logging
+            // "Failed to initialize EGL hardware-acceleration" on every start where the
+            // extension is missing -- which reads as a fallback to software rendering that
+            // never happened.
 
             // wl_drm (mesa protocol, so we don't need EGL_WL_bind_display)
             let wl_drm_global = create_drm_global::<State>(
