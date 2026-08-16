@@ -923,6 +923,26 @@ impl VulkanNv12 {
                 std::thread::sleep(std::time::Duration::from_micros(100));
                 waited += 1;
             }
+            // The slot's persistent GstBuffer is reused every RING frames and still carries
+            // the timestamps stamped onto it on its previous use. BaseSrc's do_timestamp only
+            // stamps a buffer whose PTS is NONE, so without a reset the exported PTS degenerate
+            // to the ring's ~4 recurring values (non-monotonic, duplicated), which downstream
+            // RTP payloading turns into timestamps libwebrtc cannot assemble. Reset the timing
+            // metadata here, right after the reuse gate, where the slot is uniquely owned on
+            // the normal path -- resetting in to_gst_buffer via make_mut() would copy the
+            // refcount-2 buffer and blind the gate above (the copy keeps outputs[idx].buffer
+            // at refcount 1 forever). On the gate's 1s-timeout escape the slot is NOT uniquely
+            // owned; get_mut() returns None and the reset is skipped (the stream is already
+            // degraded there, and an in-place write to a shared header would be worse).
+            if let Some(b) = self.outputs[idx].buffer.get_mut() {
+                b.set_pts(gst::ClockTime::NONE);
+                b.set_dts(gst::ClockTime::NONE);
+                b.set_duration(gst::ClockTime::NONE);
+            } else {
+                tracing::warn!(
+                    "VulkanNv12: encode-src slot {idx} PTS reset skipped (buffer still shared)"
+                );
+            }
         }
 
         // Ensure this slot's cached RGBA import matches the current dmabuf. Built once per
@@ -1462,6 +1482,13 @@ impl VulkanNv12 {
 
     /// The just-converted NV12 export slot as a gst buffer. Returns the slot's cached
     /// buffer (ref-counted) so the VA encoder reuses one stable surface per slot.
+    ///
+    /// On the `encode_src` path the returned buffer's PTS is `NONE` in normal steady state:
+    /// `convert_inner` resets the recycled slot's timing metadata right after the reuse gate,
+    /// so BaseSrc's `do_timestamp` re-stamps it with the current running-time each frame
+    /// (matching the RGBx/DMABuf paths, which build a fresh `GstBuffer` every frame). On the
+    /// gate's 1s-timeout escape the reset is skipped (buffer still shared) and the PTS may be
+    /// stale; `convert_inner` warns when that happens.
     pub fn to_gst_buffer(&self) -> Result<GstBuffer, Err> {
         Ok(self.outputs[self.cur].buffer.clone())
     }
