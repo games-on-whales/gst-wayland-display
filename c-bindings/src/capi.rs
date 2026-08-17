@@ -1,3 +1,13 @@
+// Every entry point in this crate is a C ABI function. The caller is C, the handles are
+// opaque pointers C owns, and dereferencing them is the contract rather than a mistake, so
+// `clippy::not_unsafe_ptr_arg_deref` fires on all of them. It is deny-by-default, which
+// aborts the whole workspace clippy run before it reaches anything else.
+//
+// Marking them `unsafe extern "C" fn` would satisfy the lint and is ABI-identical, but it
+// would warn nobody: this crate is built with cargo-c as a C library and no Rust code in the
+// workspace depends on it. Allow it here, at the one place where raw pointers are the point.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use gst::ffi::GstBuffer;
 use gst::glib::translate::FromGlibPtrNone;
 use gst_video::ffi::GstVideoInfo;
