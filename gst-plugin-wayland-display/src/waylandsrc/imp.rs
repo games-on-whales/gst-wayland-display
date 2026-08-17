@@ -586,11 +586,16 @@ impl ElementImpl for WaylandDisplaySrc {
             let elem_ptr =
                 self.obj().upcast_ref::<gst::Element>().as_ptr() as *mut std::ffi::c_void;
             let ctx_ptr = context.as_ptr() as *mut std::ffi::c_void;
-            waylanddisplaycore::utils::va_share::handle_set_context(
-                elem_ptr,
-                ctx_ptr,
-                &render_path,
-            );
+            // SAFETY: both pointers come straight from live GStreamer objects that
+            // outlive this call -- `elem_ptr` from `self.obj()`, `ctx_ptr` from the
+            // `context` argument set_context was handed.
+            unsafe {
+                waylanddisplaycore::utils::va_share::handle_set_context(
+                    elem_ptr,
+                    ctx_ptr,
+                    &render_path,
+                );
+            }
         }
 
         #[cfg(feature = "cuda")]
@@ -1302,7 +1307,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             .unwrap_or_else(|| "/dev/dri/renderD128".into());
         if render_node_backs_va_display(&va_node) {
             let elem_ptr = elem.as_ptr() as *mut std::ffi::c_void;
-            waylanddisplaycore::utils::va_share::ensure_shared_display(elem_ptr, &va_node);
+            // SAFETY: `elem` is a live GstElement reference held across this call.
+            unsafe {
+                waylanddisplaycore::utils::va_share::ensure_shared_display(elem_ptr, &va_node);
+            }
         }
 
         #[cfg(feature = "cuda")]
