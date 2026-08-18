@@ -16,8 +16,10 @@
 //!
 //! `gstreamer-vulkan` (safe) leaves the Vulkan-typed calls unbound (gir skips vk types), so
 //! we call them through `gstreamer-vulkan-sys` (whose `vulkan::*` are ash `vk::*`
-//! re-exports) and read the two public struct fields we need (`VkDevice`, `VkImage`) via
-//! `repr(C)` overlays anchored on `gst::ffi::{GstObject, GstMemory}` (correct ABI prefix).
+//! re-exports), and read the handles we need (`VkInstance`, `VkDevice`, `VkImage`, the
+//! queue family) through `utils/vulkan_bridge.c`, a small C shim compiled by `build.rs`
+//! against the target's own GStreamer Vulkan headers. Field access is therefore checked by
+//! the C compiler and tracks the headers, instead of being guessed at hand-computed offsets.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -26,9 +28,8 @@ use ash::vk;
 use gst::glib::translate::{ToGlibPtr, from_glib_full};
 use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
-use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice};
+use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
-use std::os::raw::c_void;
 use std::sync::{Mutex, OnceLock};
 
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
@@ -36,43 +37,13 @@ use std::sync::{Mutex, OnceLock};
 const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR: u32 = 0x0000_2000;
 const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
 
-// --- repr(C) overlays of the public gst-vulkan structs (fields the -sys crate omits). ---
-
-/// `struct _GstVulkanDevice { GstObject parent; GstVulkanInstance *instance;
-/// GstVulkanPhysicalDevice *physical_device; VkDevice device; ... }`
-#[repr(C)]
-struct GstVulkanDeviceOverlay {
-    parent: gst::ffi::GstObject,
-    instance: *mut c_void,        // GstVulkanInstance*
-    physical_device: *mut c_void, // GstVulkanPhysicalDevice*
-    device: vk::Device,           // ABI: a dispatchable handle (pointer)
-}
-
-/// `struct _GstVulkanInstance { GstObject parent; VkInstance instance; ... }`
-#[repr(C)]
-struct GstVulkanInstanceOverlay {
-    parent: gst::ffi::GstObject,
-    instance: vk::Instance,
-}
-
-/// `struct _GstVulkanQueue { GstObject parent; GstVulkanDevice *device; VkQueue queue;
-/// guint32 family; guint32 index; }`
-#[repr(C)]
-struct GstVulkanQueueOverlay {
-    parent: gst::ffi::GstObject,
-    device: *mut c_void,
-    queue: vk::Queue,
-    family: u32,
-    index: u32,
-}
-
-/// `struct _GstVulkanImageMemory { GstMemory parent; GstVulkanDevice *device;
-/// VkImage image; ... }`
-#[repr(C)]
-struct GstVulkanImageMemoryOverlay {
-    parent: gst::ffi::GstMemory,
-    device: *mut c_void,
-    image: vk::Image,
+unsafe extern "C" {
+    fn wayland_display_vk_instance(device: *mut gstvk::GstVulkanDevice) -> vk::Instance;
+    fn wayland_display_vk_instance_handle(instance: *mut gstvk::GstVulkanInstance) -> vk::Instance;
+    fn wayland_display_vk_device(device: *mut gstvk::GstVulkanDevice) -> vk::Device;
+    fn wayland_display_vk_queue_family(queue: *mut gstvk::GstVulkanQueue) -> u32;
+    fn wayland_display_vk_image(memory: *mut gst::ffi::GstMemory) -> vk::Image;
+    fn wayland_display_vk_prepare_encode_image(memory: *mut gst::ffi::GstMemory);
 }
 
 /// Raw Vulkan handles + queue family pulled out of the shared `GstVulkanDevice`, ready to
@@ -212,7 +183,7 @@ pub fn ensure_owned_device(target_minor: Option<u32>) -> Option<VulkanDevice> {
         tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
         return None;
     }
-    let vk_instance = unsafe { (*(instance.as_ptr() as *const GstVulkanInstanceOverlay)).instance };
+    let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
     let index = unsafe {
         let entry = match ash::Entry::load() {
             Ok(e) => e,
@@ -297,27 +268,28 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
         return None;
     }
     unsafe {
-        let overlay = &*(dev_ptr as *const GstVulkanDeviceOverlay);
-        if overlay.device == vk::Device::null() || overlay.instance.is_null() {
+        let vk_device = wayland_display_vk_device(dev_ptr);
+        let vk_instance = wayland_display_vk_instance(dev_ptr);
+        if vk_device == vk::Device::null() || vk_instance == vk::Instance::null() {
             return None;
         }
-        let vk_instance = (*(overlay.instance as *const GstVulkanInstanceOverlay)).instance;
         let vk_physical = gstvk::gst_vulkan_device_get_physical_device(dev_ptr);
         if vk_physical == vk::PhysicalDevice::null() {
             return None;
         }
-        // A queue that can run our compute + copy (the encoder owns its own encode queue).
-        let queue =
+        // `gst_vulkan_device_select_queue()` is transfer-full: take ownership of the
+        // returned GstVulkanQueue so it is not leaked once the family index is read.
+        let gfx_ptr =
             gstvk::gst_vulkan_device_select_queue(dev_ptr, vk::QueueFlags::GRAPHICS.as_raw());
-        let gfx_queue_family = if queue.is_null() {
-            0
-        } else {
-            (*(queue as *const GstVulkanQueueOverlay)).family
-        };
+        if gfx_ptr.is_null() {
+            return None;
+        }
+        let gfx_queue_family = wayland_display_vk_queue_family(gfx_ptr);
+        drop(from_glib_full::<_, VulkanQueue>(gfx_ptr));
         Some(RawVk {
             instance: vk_instance,
             physical: vk_physical,
-            device: overlay.device,
+            device: vk_device,
             gfx_queue_family,
         })
     }
@@ -442,42 +414,19 @@ pub fn alloc_encode_src_buffer(
             );
         }
 
-        // Our converter always leaves this image in VIDEO_ENCODE_SRC layout (it CPU-waits the
-        // copy fence before handing the buffer downstream). Seed gst's *tracked* layout to match.
-        // Otherwise `gst_vulkan_operation_add_frame_barrier` reads the stale alloc-time layout
-        // (UNDEFINED) and records an UNDEFINED->VIDEO_ENCODE_SRC layout *write* transition for the
-        // input image on every encode. With one encoder that's merely wasteful; with the interpipe
-        // fan-out (one buffer -> N encoders) two such concurrent layout writes on the shared image,
-        // on the video-encode queue with no semaphore between them, deadlock the GPU at frame 2.
-        // With the tracked layout already SRC, each encoder's barrier is old==new == a pure read
-        // barrier (VIDEO_ENCODE_READ), which is safe to issue concurrently from multiple encoders.
-        //
-        // `barrier.image_layout` offset in GstVulkanImageMemory (public struct, ABI-stable since
-        // 1.18); verified against the running gst headers (sizeof=472, image@120, barrier@288,
-        // barrier.image_layout@368).
-        // GstVulkanImageMemory.barrier field offsets, verified against the running gst headers
-        // (sizeof=472, image@120, barrier@288) and cross-checked against the gst 1.28.4 tag
-        // (deploy target): _GstVulkanImageMemory and _GstVulkanBarrierMemoryInfo have identical
-        // field order in 1.28.4 and 1.29.1, so these offsets hold for both. The struct is public
-        // and ABI-stable since 1.18; re-run the /tmp/off.c offsetof probe if targeting a newer gst.
-        const BARRIER_QUEUE_OFFSET: usize = 296; // barrier.parent.queue (GstVulkanQueue*)
-        const BARRIER_SEMAPHORE_OFFSET: usize = 320; // barrier.parent.semaphore (VkSemaphore)
-        const BARRIER_SEMAPHORE_VALUE_OFFSET: usize = 328; // barrier.parent.semaphore_value
-        const BARRIER_IMAGE_LAYOUT_OFFSET: usize = 368; // barrier.image_layout (VkImageLayout)
-        let base = mem_ptr as *mut u8;
-        *(base.add(BARRIER_IMAGE_LAYOUT_OFFSET) as *mut i32) = VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR;
-        // Null the per-memory cross-queue dependency so gst's encoder adds no timeline-semaphore
-        // wait/signal nor queue-ownership transfer against our image. gst's normal flow uses this
-        // per-memory timeline semaphore to order one consumer after the previous producer op; but
-        // (a) our converter already CPU-waits its write fence before handing the buffer downstream,
-        // so the write is GPU-complete, and (b) the encoders only READ the image. With the interpipe
-        // fan-out, leaving the semaphore set makes two encoders race the shared timeline value
-        // (each does add_dependency=read-value, encode=signal value+1, end=increment) -> two
-        // submissions signal the same value -> timeline corruption -> GPU hang. Read-only access by
-        // N encoders needs no cross-dependency, so clear it.
-        *(base.add(BARRIER_QUEUE_OFFSET) as *mut usize) = 0;
-        *(base.add(BARRIER_SEMAPHORE_OFFSET) as *mut u64) = 0;
-        *(base.add(BARRIER_SEMAPHORE_VALUE_OFFSET) as *mut u64) = 0;
+        // Seed gst's tracked layout to VIDEO_ENCODE_SRC and clear the per-memory timeline,
+        // as PR #37 intends -- but through the target's own headers instead of hand-computed
+        // ABI offsets. Both halves matter under the interpipe fan-out (one buffer -> N
+        // encoders):
+        //   * layout: our converter always leaves the image in VIDEO_ENCODE_SRC, so without
+        //     the seed every encoder records an UNDEFINED->VIDEO_ENCODE_SRC layout *write*.
+        //     Two concurrent layout writes on the shared image, on the video-encode queue with
+        //     no semaphore between them, deadlock the GPU at frame 2. Seeded, each encoder's
+        //     barrier is old==new, a pure VIDEO_ENCODE_READ barrier, safe to issue N-way.
+        //   * timeline: the encoders only READ, and the converter already CPU-waits its write
+        //     fence, so no cross-queue dependency is needed. Left set, two encoders race the
+        //     shared timeline value (each reads it, signals value+1) and corrupt it.
+        wayland_display_vk_prepare_encode_image(mem_ptr);
 
         let mem: gst::Memory = from_glib_full(mem_ptr);
         let mut buffer = gst::Buffer::new();
@@ -510,6 +459,7 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
         if gstvk::gst_is_vulkan_image_memory(mem_ptr) == gst::glib::ffi::GFALSE {
             return None;
         }
-        Some((*(mem_ptr as *const GstVulkanImageMemoryOverlay)).image)
+        let image = wayland_display_vk_image(mem_ptr);
+        (image != vk::Image::null()).then_some(image)
     }
 }
