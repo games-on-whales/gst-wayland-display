@@ -386,11 +386,75 @@ impl CUDAContext {
         })
     }
 
+    /// Make the slot's `GstCudaContext` safe for a [`CUDAContext`] wrapper to OWN.
+    ///
+    /// Both `gst_cuda_ensure_element_context()` and `gst_cuda_handle_set_context()` open
+    /// with the same short-circuit (gst-plugins-bad `gstcudautils.c`):
+    ///
+    /// ```c
+    ///   /* If we had context already, will not replace it */
+    ///   if (*cuda_ctx)
+    ///     return TRUE;
+    /// ```
+    ///
+    /// i.e. they report SUCCESS while transferring NOTHING. Every other SUCCESS path is
+    /// `(transfer full)` into the slot. [`CUDAContext::drop`] unconditionally
+    /// `gst_object_unref()`s `self.ptr`, so a wrapper built off that short-circuit
+    /// destroys a reference it never owned.
+    ///
+    /// That is exactly what happens on the compositor's OWN context.
+    /// `new_from_gstreamer()` calls `gst_cuda_ensure_element_context()`, which creates the
+    /// context (rc=1, into the slot) and publishes it -- and that publish re-enters
+    /// `waylanddisplaysrc::set_context()` SYNCHRONOUSLY, from inside the very call, with the
+    /// context it is still in the middle of creating. Confirmed live by a leaks-tracer
+    /// creation stack showing `gst_cuda_ensure_element_context` sandwiched BETWEEN two
+    /// waylanddisplaysrc frames.
+    ///
+    /// The re-entrancy is what makes the bug stick, because it inverts which wrapper is
+    /// kept: at re-entry `settings.cuda_context` is still `None` (the outer call has not
+    /// returned yet), so it is the INNER, non-owning wrapper -- the one built off the
+    /// short-circuit -- that gets STORED, and the OUTER wrapper, holding the one legitimate
+    /// `(transfer full)` reference, that `imp.rs` drops when the outer call finally returns
+    /// and finds `settings.cuda_context` already `Some`.
+    ///
+    /// So the session runs with the context held only by the published `GstContext` (plus
+    /// any `GstCudaStream`), while `settings.cuda_context` owns nothing but believes it
+    /// does. At teardown it drops => rc hits 0 => the `GstCudaContext` is finalized while
+    /// the pipeline's stored `GstContext` still points at it. Disposing the pipeline then
+    /// walks `element->contexts`, and `_gst_context_free` -> `gst_structure_free` ->
+    /// `g_value_unset` -> `g_object_unref` lands on freed memory: **SIGSEGV in
+    /// `g_type_check_instance_is_fundamentally_a`, at the end of every session teardown**.
+    ///
+    /// It only bites when nothing else outlives the pipeline: with an application-injected
+    /// context (a host that pins one `GstCudaContext` for the process lifetime, e.g.
+    /// Quasar's NVENC path) the extra owner keeps rc >= 1 and the same defect is invisible.
+    ///
+    /// Detecting the short-circuit is unambiguous: it is the only success path that leaves
+    /// the slot pointing at the same non-NULL object it held before the call.
+    ///
+    /// # Safety
+    /// `cuda_raw_ptr` must be a valid, readable slot, and `pre` must be the value read from
+    /// that same slot immediately before the call being adopted.
+    unsafe fn adopt_slot_ref(pre: *mut GstCudaContext, cuda_raw_ptr: *mut *mut GstCudaContext) {
+        // Edition 2024: `unsafe_op_in_unsafe_fn` warns by default, so an `unsafe fn` body
+        // still needs its own block.
+        unsafe {
+            let post = *cuda_raw_ptr;
+            if !post.is_null() && post == pre {
+                gst::ffi::gst_object_ref(post as *mut gst::ffi::GstObject);
+            }
+        }
+    }
+
     pub fn new_from_gstreamer(
         element: &Element,
         default_device_id: c_int,
         cuda_raw_ptr: *mut *mut GstCudaContext,
     ) -> Result<Self, String> {
+        // The slot value BEFORE the call: `gst_cuda_ensure_element_context()` starts with
+        // `if (*cuda_ctx) return TRUE;` -- it reports success WITHOUT transferring a
+        // reference when the slot is already populated. See `adopt_slot_ref` above.
+        let pre = unsafe { *cuda_raw_ptr };
         let result = unsafe {
             ffi::gst_cuda_ensure_element_context(
                 element.to_glib_none().0,
@@ -402,6 +466,7 @@ impl CUDAContext {
         if result == glib_ffi::GFALSE {
             Err("Failed to create CUDA context".into())
         } else {
+            unsafe { Self::adopt_slot_ref(pre, cuda_raw_ptr) };
             let stream = unsafe { ffi::gst_cuda_stream_new(*cuda_raw_ptr) };
             Ok(CUDAContext {
                 ptr: unsafe { *cuda_raw_ptr },
@@ -420,6 +485,10 @@ impl CUDAContext {
         default_device_id: c_int,
         cuda_raw_ptr: *mut *mut GstCudaContext,
     ) -> Result<Self, String> {
+        // Same short-circuit as `new_from_gstreamer` above: `gst_cuda_handle_set_context()`
+        // reports success without transferring a reference when the slot is already
+        // populated. See `adopt_slot_ref`.
+        let pre = unsafe { *cuda_raw_ptr };
         let result = unsafe {
             ffi::gst_cuda_handle_set_context(
                 element.to_glib_none().0,
@@ -432,6 +501,7 @@ impl CUDAContext {
         if result == glib_ffi::GFALSE {
             Err("Failed to create CUDA context".into())
         } else {
+            unsafe { Self::adopt_slot_ref(pre, cuda_raw_ptr) };
             let stream = unsafe { ffi::gst_cuda_stream_new(*cuda_raw_ptr) };
             Ok(CUDAContext {
                 ptr: unsafe { *cuda_raw_ptr },
