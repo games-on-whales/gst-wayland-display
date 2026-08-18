@@ -16,8 +16,10 @@
 //!
 //! `gstreamer-vulkan` (safe) leaves the Vulkan-typed calls unbound (gir skips vk types), so
 //! we call them through `gstreamer-vulkan-sys` (whose `vulkan::*` are ash `vk::*`
-//! re-exports) and read the two public struct fields we need (`VkDevice`, `VkImage`) via
-//! `repr(C)` overlays anchored on `gst::ffi::{GstObject, GstMemory}` (correct ABI prefix).
+//! re-exports), and read the handles we need (`VkInstance`, `VkDevice`, `VkImage`, the
+//! queue family) through `utils/vulkan_bridge.c`, a small C shim compiled by `build.rs`
+//! against the target's own GStreamer Vulkan headers. Field access is therefore checked by
+//! the C compiler and tracks the headers, instead of being guessed at hand-computed offsets.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 

@@ -13,7 +13,6 @@ fn main() {
         bridge.include(include);
     }
     bridge.compile("wayland_display_vulkan_bridge");
-    println!("cargo:rustc-link-lib=vulkan");
 
     // Check if the cuda feature is enabled
     #[cfg(feature = "cuda")]
