@@ -285,6 +285,7 @@ impl GsVulkanBuf {
         render_node: DrmNode,
         video_info: VideoInfo,
         profile: String,
+        vulkan_share: &crate::utils::vulkan_share::VulkanShare,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
 
@@ -318,8 +319,9 @@ impl GsVulkanBuf {
             rgba.format().modifier
         );
 
-        // The shared device must already have been absorbed from a GstContext.
-        let dev = crate::utils::vulkan_share::shared_device()?;
+        // This element's shared device must already have been absorbed from a GstContext
+        // (read THIS element's per-element share, not a process-global slot).
+        let dev = vulkan_share.shared_device()?;
         let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
         // NV12 (8-bit, vulkanh264enc) or P010 (10-bit, vulkanh265enc Main-10) per the
         // negotiated memory:VulkanImage format.

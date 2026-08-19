@@ -30,7 +30,7 @@ use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
 use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
 // values (stable, and avoids depending on the named ash constants existing).
@@ -56,39 +56,85 @@ pub struct RawVk {
     pub gfx_queue_family: u32,
 }
 
-/// Process-wide slot for the shared device, filled from `set_context` and read by the
-/// converter when it builds its output ring (mirrors `va_share`'s display slot).
-fn device_slot() -> &'static Mutex<Option<VulkanDevice>> {
-    static SLOT: OnceLock<Mutex<Option<VulkanDevice>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+/// Per-`waylanddisplaysrc`-element owner of the Vulkan objects the encode path shares.
+///
+/// Historically the
+/// owned `GstVulkanInstance` + `GstVulkanDevice` lived in *process-global* `OnceLock` slots,
+/// so every session in one process reused the first session's `VkDevice` (a single failure
+/// domain — one session's `DEVICE_LOST` corrupts all N; session 2..N's `target_minor`
+/// ignored; a deliberate per-process device leak). One `VulkanShare` is now created per
+/// element and cloned **once** into that element's compositor thread (mirroring the existing
+/// `app_surface_commits` / `renderer_degraded` `Arc`s threaded through
+/// `WaylandDisplay::new_with_channel` -> `comp::init`), so each `waylanddisplaysrc` mints,
+/// answers `gst.vulkan.{instance,device}` context queries with, and owns its **own** device,
+/// released when the element is finalized and this `Arc` drops. N concurrent Vulkan-encode
+/// sessions on one host therefore get N isolated devices — a `DEVICE_LOST` on one retires
+/// only that element's device, leaving the other N-1 untouched.
+///
+/// This is a **storage-location** change only: device creation
+/// ([`ensure_owned_device`](VulkanShare::ensure_owned_device)) is byte-identical to the
+/// previous global path, with no vendor branch, so the RADV path sees no behavioral change.
+/// The `wayland_display_vk_*` C bridge is untouched.
+pub struct VulkanShare {
+    /// The `GstVulkanInstance` we own (keeps it alive + lets us answer `gst.vulkan.instance`
+    /// context queries). Replaces the process-global `instance_slot()`.
+    instance: Mutex<Option<VulkanInstance>>,
+    /// The shared device, filled from `set_context`
+    /// ([`handle_set_context`](VulkanShare::handle_set_context)) or minted by
+    /// [`ensure_owned_device`](VulkanShare::ensure_owned_device), and read by the converter
+    /// when it builds its output ring. Replaces the process-global `device_slot()`.
+    device: Mutex<Option<VulkanDevice>>,
 }
 
-/// Pull the shared `GstVulkanDevice` out of a received `GstContext` and stash it. Call from
-/// `ElementImpl::set_context` for the `gst.vulkan.device` context type. Returns true if a
-/// device is now shared.
-pub fn handle_set_context(context: &gst::Context) -> bool {
-    let ctx_ptr = context.to_glib_none().0;
-    let mut dev_ptr: *mut gstvk::GstVulkanDevice = std::ptr::null_mut();
-    let got = unsafe { gstvk::gst_context_get_vulkan_device(ctx_ptr, &mut dev_ptr) };
-    if got == gst::glib::ffi::GFALSE || dev_ptr.is_null() {
-        return false;
+impl VulkanShare {
+    /// A fresh, empty per-element share. Cheap; holds no Vulkan objects until first use. Kept
+    /// behind an `Arc` so one clone can be handed to the compositor thread while the element
+    /// keeps the other (exactly like `app_surface_commits` / `renderer_degraded`).
+    pub fn new() -> Arc<VulkanShare> {
+        Arc::new(VulkanShare {
+            instance: Mutex::new(None),
+            device: Mutex::new(None),
+        })
     }
-    let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
-    tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
-    *device_slot().lock().unwrap() = Some(device);
-    true
-}
 
-/// The shared device, if one has been created (or absorbed).
-pub fn shared_device() -> Option<VulkanDevice> {
-    device_slot().lock().unwrap().clone()
-}
+    /// Pull the shared `GstVulkanDevice` out of a received `GstContext` and stash it in **this
+    /// element's** slot. Call from `ElementImpl::set_context` for the `gst.vulkan.device`
+    /// context type. Returns true if a device is now shared.
+    pub fn handle_set_context(&self, context: &gst::Context) -> bool {
+        let ctx_ptr = context.to_glib_none().0;
+        let mut dev_ptr: *mut gstvk::GstVulkanDevice = std::ptr::null_mut();
+        let got = unsafe { gstvk::gst_context_get_vulkan_device(ctx_ptr, &mut dev_ptr) };
+        if got == gst::glib::ffi::GFALSE || dev_ptr.is_null() {
+            return false;
+        }
+        let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
+        let mut slot = self.device.lock().unwrap();
+        // Keep the device this element already has. GstBin fans a have-context message to
+        // EVERY child, so with two waylanddisplaysrc in one bin the second element's encoder
+        // would otherwise overwrite the first element's device while that element's own
+        // encoder stays on the original -- producing buffers on one VkDevice and encoding
+        // them on another. Under the old process-global slot everyone shared one device and
+        // the overwrite was free; per element it is a cross-device hazard, so refuse it here
+        // rather than relying on the embedder to check.
+        if let Some(existing) = slot.as_ref() {
+            if existing.as_ptr() != device.as_ptr() {
+                tracing::warn!(
+                    "vulkan_share: ignoring a different GstVulkanDevice {dev_ptr:?} offered to an \
+                     element already on {:?}",
+                    existing.as_ptr()
+                );
+            }
+            return true;
+        }
+        tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
+        *slot = Some(device);
+        true
+    }
 
-/// Process-wide slot for the `GstVulkanInstance` we own (keeps it alive + lets us answer
-/// `gst.vulkan.instance` context queries).
-fn instance_slot() -> &'static Mutex<Option<VulkanInstance>> {
-    static SLOT: OnceLock<Mutex<Option<VulkanInstance>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+    /// This element's shared device, if one has been created (or absorbed).
+    pub fn shared_device(&self) -> Option<VulkanDevice> {
+        self.device.lock().unwrap().clone()
+    }
 }
 
 // VK_QUEUE_VIDEO_ENCODE_BIT_KHR — the encoder (gst_vulkan_encoder_create_from_queue) requires a
@@ -168,95 +214,117 @@ unsafe fn physical_index_for_minor(
     Some(0)
 }
 
-/// Create (once) the `GstVulkanInstance` + `GstVulkanDevice` that *we* own, on the GPU
-/// backing `target_minor`, with the external-memory extensions the RGBA-dmabuf import needs
-/// (`VK_KHR_external_memory_fd` etc.) enabled — which gst-vulkan's own device does not. This
-/// is the device we hand the encoder (see [`provide_context`]) so producer and encoder share
-/// one device with no zero-copy gap *and* no gstreamer fork. Idempotent.
-pub fn ensure_owned_device(target_minor: Option<u32>) -> Option<VulkanDevice> {
-    let mut slot = device_slot().lock().unwrap();
-    if let Some(d) = slot.clone() {
-        return Some(d);
-    }
-    let instance = VulkanInstance::new();
-    if let Err(e) = instance.open() {
-        tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
-        return None;
-    }
-    let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
-    let index = unsafe {
-        let entry = match ash::Entry::load() {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("vulkan_share: ash entry load failed: {e}");
-                return None;
-            }
-        };
-        let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
-        physical_index_for_minor(&ash_inst, target_minor)?
-    };
-    let physical = VulkanPhysicalDevice::new(&instance, index);
-    let device = VulkanDevice::new(&physical);
-    for ext in [
-        "VK_KHR_external_memory_fd",
-        "VK_EXT_external_memory_dma_buf",
-        "VK_EXT_image_drm_format_modifier",
-        "VK_KHR_external_semaphore_fd",
-    ] {
-        device.enable_extension(ext);
-    }
-    if let Err(e) = device.open() {
-        tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
-        return None;
-    }
-    *instance_slot().lock().unwrap() = Some(instance);
-    *slot = Some(device.clone());
-    tracing::info!(
-        "vulkan_share: created shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
-    );
-    Some(device)
-}
-
-/// Answer a `gst.vulkan.{instance,device}` context query on `element` with the device we own,
-/// creating it on `target_minor`'s GPU on first ask. The downstream encoder's
-/// `gst_vulkan_ensure_element_data` then adopts *our* device instead of minting its own.
-pub fn provide_context(
-    element: &gst::Element,
-    query: &mut gst::QueryRef,
-    target_minor: Option<u32>,
-) -> bool {
-    if ensure_owned_device(target_minor).is_none() {
-        return false;
-    }
-    let inst = instance_slot().lock().unwrap().clone();
-    let dev = device_slot().lock().unwrap().clone();
-    unsafe {
-        gstvk::gst_vulkan_handle_context_query(
-            element.as_ptr() as *mut _,
-            query.as_mut_ptr() as *mut _,
-            std::ptr::null_mut(),
-            inst.as_ref().map_or(std::ptr::null_mut(), |i| i.as_ptr()) as *mut _,
-            dev.as_ref().map_or(std::ptr::null_mut(), |d| d.as_ptr()) as *mut _,
-        ) != gst::glib::ffi::GFALSE
-    }
-}
-
-/// Wait up to `timeout` for our shared `GstVulkanDevice` to be available.
-///
-/// The encoder shares its device via a `GstContext` delivered to `set_context` on the
-/// streaming thread, which races the compositor thread that allocates our Vulkan output
-/// buffer. Polling here lets the allocation wait for the device to arrive instead of
-/// failing when it merely hasn't been shared *yet*. Returns `None` if it never arrives.
-pub fn wait_for_shared_device(timeout: std::time::Duration) -> Option<VulkanDevice> {
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(dev) = shared_device() {
-            return Some(dev);
+impl VulkanShare {
+    /// Create (once, on **this element**) the `GstVulkanInstance` + `GstVulkanDevice` that *we*
+    /// own, on the GPU backing `target_minor`, with the external-memory extensions the
+    /// RGBA-dmabuf import needs (`VK_KHR_external_memory_fd` etc.) enabled — which gst-vulkan's
+    /// own device does not. This is the device we hand the encoder (see
+    /// [`provide_context`](VulkanShare::provide_context)) so producer and encoder share one
+    /// device with no zero-copy gap *and* no gstreamer fork. Idempotent **per element** (not
+    /// per process): the first call on *this* share mints on *this* element's `target_minor`.
+    ///
+    /// Device creation below is unchanged from the pre-patch process-global path — no vendor
+    /// branch — so RADV behaves byte-identically; only where the result is stored moved from a
+    /// `static` slot to `self`.
+    /// LOCK ORDER: `device` then `instance`, and this is the only method that holds both.
+    /// The `device` guard is deliberately held across the instance open, `Entry::load` and
+    /// device enumeration below -- it is the mutual exclusion that stops two threads each
+    /// minting a `VkDevice` for this element. Every other accessor takes a single lock as a
+    /// temporary (`provide_context` clones instance and device in separate statements, so it
+    /// never holds both), which is why the inverse order cannot arise.
+    pub fn ensure_owned_device(&self, target_minor: Option<u32>) -> Option<VulkanDevice> {
+        let mut slot = self.device.lock().unwrap();
+        if let Some(d) = slot.clone() {
+            // Whatever this element already has wins over target_minor. Usually that is the
+            // device minted below on that very node, so the two agree; the slot records no
+            // provenance, so this branch cannot tell the two apart. When they disagree the
+            // device was injected by an embedder and the encoder is already bound to it, and
+            // minting a second device on the requested node would put producer and encoder on
+            // different VkDevices, which is worse than honouring the wrong node.
+            return Some(d);
         }
-        if start.elapsed() >= timeout {
+        let instance = VulkanInstance::new();
+        if let Err(e) = instance.open() {
+            tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
+        let index = unsafe {
+            let entry = match ash::Entry::load() {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("vulkan_share: ash entry load failed: {e}");
+                    return None;
+                }
+            };
+            let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
+            physical_index_for_minor(&ash_inst, target_minor)?
+        };
+        let physical = VulkanPhysicalDevice::new(&instance, index);
+        let device = VulkanDevice::new(&physical);
+        for ext in [
+            "VK_KHR_external_memory_fd",
+            "VK_EXT_external_memory_dma_buf",
+            "VK_EXT_image_drm_format_modifier",
+            "VK_KHR_external_semaphore_fd",
+        ] {
+            device.enable_extension(ext);
+        }
+        if let Err(e) = device.open() {
+            tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
+            return None;
+        }
+        *self.instance.lock().unwrap() = Some(instance);
+        *slot = Some(device.clone());
+        tracing::info!(
+            "vulkan_share: created per-element shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
+        );
+        Some(device)
+    }
+
+    /// Answer a `gst.vulkan.{instance,device}` context query on `element` with the device we
+    /// own, creating it on `target_minor`'s GPU on first ask. The downstream encoder's
+    /// `gst_vulkan_ensure_element_data` then adopts *our* device instead of minting its own.
+    pub fn provide_context(
+        &self,
+        element: &gst::Element,
+        query: &mut gst::QueryRef,
+        target_minor: Option<u32>,
+    ) -> bool {
+        if self.ensure_owned_device(target_minor).is_none() {
+            return false;
+        }
+        let inst = self.instance.lock().unwrap().clone();
+        let dev = self.device.lock().unwrap().clone();
+        unsafe {
+            gstvk::gst_vulkan_handle_context_query(
+                element.as_ptr() as *mut _,
+                query.as_mut_ptr() as *mut _,
+                std::ptr::null_mut(),
+                inst.as_ref().map_or(std::ptr::null_mut(), |i| i.as_ptr()) as *mut _,
+                dev.as_ref().map_or(std::ptr::null_mut(), |d| d.as_ptr()) as *mut _,
+            ) != gst::glib::ffi::GFALSE
+        }
+    }
+
+    /// Wait up to `timeout` for **this element's** shared `GstVulkanDevice` to be available.
+    ///
+    /// The encoder shares its device via a `GstContext` delivered to `set_context` on the
+    /// streaming thread, which races the compositor thread that allocates this element's Vulkan
+    /// output buffer. Polling here lets the allocation wait for the device to arrive instead of
+    /// failing when it merely hasn't been shared *yet*. The race is **per element**, so the
+    /// poll is retained, scoped to this share. Returns `None` if it never arrives.
+    pub fn wait_for_shared_device(&self, timeout: std::time::Duration) -> Option<VulkanDevice> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(dev) = self.shared_device() {
+                return Some(dev);
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 

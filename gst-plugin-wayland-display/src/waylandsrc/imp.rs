@@ -47,6 +47,14 @@ pub struct WaylandDisplaySrc {
     /// `caps()` falls back to the hardcoded `HDR_MASTERING` / `HDR_CLL` defaults. Driven in
     /// `create()`, read in `caps()`. Never consulted when WOLF_HDR_CM is unset.
     hdr_meta: Mutex<(Option<String>, Option<String>)>,
+    /// This element's OWN Vulkan-encode device share, replacing the process-global
+    /// `vulkan_share` slots so N concurrent Vulkan sessions in one process each mint, own and
+    /// destroy their own `VkDevice` (an isolated failure domain). Lives for the element's whole
+    /// lifetime (created in `Default`) so `set_context`, the context query and `set_caps` can
+    /// reach it regardless of start/stop ordering; a clone goes to this element's compositor
+    /// thread in `start()`. The device is retired by ownership: when the element is finalized
+    /// its `Arc` drops, so N sessions do not leak N devices.
+    vulkan_share: Arc<waylanddisplaycore::utils::vulkan_share::VulkanShare>,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -59,6 +67,7 @@ impl Default for WaylandDisplaySrc {
             command_rx: Mutex::new(Some(command_rx)),
             hdr_active: AtomicBool::new(false),
             hdr_meta: Mutex::new((None, None)),
+            vulkan_share: waylanddisplaycore::utils::vulkan_share::VulkanShare::new(),
         }
     }
 }
@@ -569,9 +578,9 @@ impl ElementImpl for WaylandDisplaySrc {
     fn set_context(&self, context: &Context) {
         // Absorb a downstream encoder's shared GstVulkanDevice so the Vulkan-encode path can
         // mint encode-src images on the same device (best-effort; no-op for other contexts).
-        if waylanddisplaycore::utils::vulkan_share::handle_set_context(context) {
-            tracing::info!("waylandsrc: absorbed shared GstVulkanDevice for Vulkan encode path");
-        }
+        // Returns true whenever a device is shared afterwards, including when the guard kept
+        // the one this element already had; vulkan_share logs which of the two happened.
+        self.vulkan_share.handle_set_context(context);
 
         // Absorb a downstream VA encoder's GstVaDisplay context so our NV12 buffers can
         // attach VA surfaces on the same display (best-effort).
@@ -705,11 +714,8 @@ impl WaylandDisplaySrc {
         }
         let node = render_node.unwrap_or_else(|| "/dev/dri/renderD128".into());
         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
-        waylanddisplaycore::utils::vulkan_share::provide_context(
-            self.obj().upcast_ref::<gst::Element>(),
-            query,
-            minor,
-        )
+        self.vulkan_share
+            .provide_context(self.obj().upcast_ref::<gst::Element>(), query, minor)
     }
 }
 
@@ -1175,7 +1181,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .clone()
                 .unwrap_or_else(|| "/dev/dri/renderD128".into());
             let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
-            waylanddisplaycore::utils::vulkan_share::ensure_owned_device(minor);
+            self.vulkan_share.ensure_owned_device(minor);
             let base_video_info =
                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
             // P010 ⇒ the Vulkan HEVC encoder (vulkanh265enc) Main-10; NV12 ⇒ vulkanh264enc.
@@ -1278,6 +1284,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 render_node.clone(),
                 self.command_tx.clone(),
                 command_rx.deref_mut().take().unwrap(),
+                // Hand this element's compositor thread a clone of OUR share, so producer +
+                // compositor + encoder resolve THIS element's device.
+                Arc::clone(&self.vulkan_share),
             )
         }) else {
             return Err(gst::error_msg!(
