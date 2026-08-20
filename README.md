@@ -146,7 +146,7 @@ Vulkan encode:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WOLF_VULKAN_LINEAR_ENCSRC` | unset | Allocate the encode-src image `LINEAR` instead of tiled. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR to tiled `vkCmdCopyImage`. Falls back to tiled if the LINEAR allocation is rejected. |
-| `WOLF_VULKAN_RING` | `4` | Number of encode-src ring slots cycled, 1 to 4. `1` pins a single slot, which isolates whether per-slot image addresses are behind a tiling artifact. |
+| `WOLF_VULKAN_RING` | `4` | Number of encode-src ring slots cycled, 1 to 4. `1` pins a single slot, which isolates whether per-slot image addresses are behind a tiling artifact. **`1` throttles the stream.** The reuse gate waits for a slot's buffer to become writable. A downstream sink holding a reference keeps it non-writable, and `GstBaseSink` leaves `enable-last-sample` on by default, so the sink pins the newest buffer until the next one arrives. At 4 slots the ring rotates past the pinned one. At 1 slot there is nothing to rotate to, so every frame waits the full 1s timeout, drops, and re-emits the previous output. Set `enable-last-sample=false` on the sink when using `1`, or expect about 1 fps. |
 
 Diagnostics:
 
