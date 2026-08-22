@@ -1,0 +1,227 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 6841983..d3ddfdb 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -740,6 +740,13 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+         && self->profile.profile.chromaBitDepth == bit_depth_chroma
+         && self->profile.profile.lumaBitDepth == bit_depth_luma
+         && self->profile.codec.h264enc.stdProfileIdc == vk_profile) {
++      /* Same profile: the session is not restarted, but a reconfigure may have
++       * changed the bitrate (or other rate-control values). Re-apply rate
++       * control to the driver via vkCmdControlVideoCoding; otherwise a live
++       * bitrate change is silently ignored. This is the *update* request, not
++       * a reset: a reset would raise VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR,
++       * invalidate the DPB and force an IDR on every ABR retarget. */
++      gst_vulkan_encoder_request_rc_update (self->encoder);
+       return GST_FLOW_OK;
+     } else {
+       GST_DEBUG_OBJECT (self, "Restarting vulkan encoder");
+@@ -769,6 +776,7 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+     self->rc.quality = gst_vulkan_encoder_quality_level (self->encoder);
+     update_property_uint (self, &self->prop.quality, self->rc.quality,
+         PROP_QUALITY);
++    gst_vulkan_encoder_set_rc_mode (self->encoder, self->prop.ratecontrol);
+     self->rc.ratecontrol = gst_vulkan_encoder_rc_mode (self->encoder);
+     update_property_uint (self, &self->prop.ratecontrol, self->rc.ratecontrol,
+         PROP_RATECONTROL);
+@@ -1993,6 +2001,38 @@ gst_vulkan_h264_encoder_get_property (GObject * object, guint property_id,
+   GST_OBJECT_UNLOCK (self);
+ }
+ 
++/* PATCH (rc-fix): apply a bitrate change to an already-STARTED encoder without
++ * a reconfigure. Mirrors the rate half of _configure_rate_control() (clamp to
++ * the driver maximum, then CBR: max == average / VBR: the 66% target
++ * percentage); cpb_size is deliberately left alone, being a ratio of the two and
++ * therefore independent of the setpoint magnitude. */
++static void
++_update_live_bitrate (GstVulkanH264Encoder * self)
++{
++  GstVulkanVideoCapabilities vk_caps;
++  guint max_kbps;
++
++  if (!gst_vulkan_encoder_caps (self->encoder, &vk_caps))
++    return;
++
++  max_kbps = vk_caps.encoder.caps.maxBitrate / 1024;
++
++  GST_OBJECT_LOCK (self);
++  self->rc.bitrate = MIN (self->prop.bitrate, max_kbps);
++  if (self->rc.ratecontrol == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) {
++    self->rc.max_bitrate = MIN ((guint)
++        gst_util_uint64_scale_int (self->rc.bitrate, 100, 66), max_kbps);
++  } else {
++    self->rc.max_bitrate = self->rc.bitrate;
++  }
++  GST_OBJECT_UNLOCK (self);
++
++  GST_DEBUG_OBJECT (self, "live bitrate retarget to %u kbps (max %u): no "
++      "session reset, no reconfigure", self->rc.bitrate, self->rc.max_bitrate);
++
++  gst_vulkan_encoder_request_rc_update (self->encoder);
++}
++
+ static void
+ gst_vulkan_h264_encoder_set_property (GObject * object, guint property_id,
+     const GValue * value, GParamSpec * pspec)
+@@ -2000,12 +2040,13 @@ gst_vulkan_h264_encoder_set_property (GObject * object, guint property_id,
+   GstVulkanH264Encoder *self = GST_VULKAN_H264_ENCODER (object);
+   GstH264Encoder *h264enc = GST_H264_ENCODER (object);
+   gboolean reconfigure = FALSE;
++  gboolean bitrate_changed = FALSE;
+ 
+   GST_OBJECT_LOCK (self);
+   switch (property_id) {
+     case PROP_BITRATE:
+       self->prop.bitrate = g_value_get_uint (value);
+-      reconfigure = TRUE;
++      bitrate_changed = TRUE;
+       break;
+     case PROP_AUD:
+       self->prop.aud = g_value_get_boolean (value);
+@@ -2044,6 +2085,24 @@ gst_vulkan_h264_encoder_set_property (GObject * object, guint property_id,
+   }
+   GST_OBJECT_UNLOCK (self);
+ 
++  /* PATCH (rc-fix): a live bitrate change must NOT go through
++   * gst_h264_encoder_reconfigure(). The base class's configure() drains the
++   * encoder and calls gst_h264_encoder_reset(), which zeroes
++   * gop.cur_frame_index — so the very next frame is an IDR that restarts the
++   * GOP. Measured on Tower with deploy/diag/vulkan_rc_retarget_probe.c: with the
++   * reconfigure, a retarget emits a key frame 0-1 frames later and realigns
++   * idr-period to the retarget point, i.e. under sustained ABR the keyframe
++   * interval collapses to the retarget interval. Removing the video-session
++   * reset alone does not fix that; the reconfigure is the IDR's actual source.
++   * Before start() there is nothing live to update, so the normal reconfigure
++   * path still runs. */
++  if (bitrate_changed) {
++    if (self->encoder && gst_vulkan_encoder_is_started (self->encoder))
++      _update_live_bitrate (self);
++    else
++      reconfigure = TRUE;
++  }
++
+   if (reconfigure)
+     gst_h264_encoder_reconfigure (h264enc, FALSE);
+ }
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+index fec23f3..0b92160 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+@@ -55,6 +55,12 @@ struct _GstVulkanEncoderPrivate
+   guint32 quality;
+   VkVideoEncodeRateControlModeFlagBitsKHR rc_mode;
+ 
++  /* PATCH (rc-fix): one-shot request to re-apply rate control to the
++   * running video session WITHOUT resetting it. Unlike session_reset this
++   * raises no VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR, so the DPB survives
++   * and the next frame does not have to be an IDR. */
++  gboolean rc_update;
++
+   gboolean started;
+   gboolean session_reset;
+ 
+@@ -1148,7 +1154,7 @@ gst_vulkan_encoder_encode (GstVulkanEncoder * self, GstVideoInfo * info,
+   /* *INDENT-OFF* */
+   begin_coding = (VkVideoBeginCodingInfoKHR) {
+     .sType = VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR,
+-    .pNext = !priv->session_reset ? &rc_info : NULL,
++    .pNext = (priv->session_reset || priv->rc_update) ? NULL : &rc_info,
+     .videoSession = priv->session.session->handle,
+     .videoSessionParameters = priv->session_params->handle,
+     .referenceSlotCount = nb_refs + 1,
+@@ -1167,6 +1173,21 @@ gst_vulkan_encoder_encode (GstVulkanEncoder * self, GstVideoInfo * info,
+   if (priv->session_reset) {
+     priv->vk.CmdControlVideoCoding (cmd_buf->cmd, &coding_ctrl);
+     priv->session_reset = FALSE;
++    /* A reset re-applies rate control too, so a pending update is
++     * satisfied by it — clear it rather than issuing a second control. */
++    priv->rc_update = FALSE;
++  } else if (priv->rc_update) {
++    /* PATCH (rc-fix): re-apply rate control ONLY. No RESET_BIT, so the
++     * video session keeps its DPB and the next frame need not be an IDR.
++     * The quality level is not changing here, so QUALITY_LEVEL_BIT is left
++     * out and the pNext chain starts at the rate-control info
++     * (VUID-VkVideoCodingControlInfoKHR-flags-07018 requires the rate
++     * control info to be present; -08349 would require the quality level
++     * info only if that bit were set). */
++    coding_ctrl.pNext = &rc_info;
++    coding_ctrl.flags = VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR;
++    priv->vk.CmdControlVideoCoding (cmd_buf->cmd, &coding_ctrl);
++    priv->rc_update = FALSE;
+   }
+ 
+   /* Peek the output memory to be used by VkVideoEncodeInfoKHR.dstBuffer */
+@@ -1411,6 +1432,56 @@ gst_vulkan_encoder_set_rc_mode (GstVulkanEncoder * self,
+   priv->rc_mode = rc_mode;
+ }
+ 
++/**
++ * gst_vulkan_encoder_request_rc_update:
++ * @self: a #GstVulkanEncoder
++ *
++ * Request that the rate-control state be re-applied to the running video
++ * session on the next encode via vkCmdControlVideoCoding with
++ * %VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR **only**.
++ *
++ * This is the live-retarget path: unlike
++ * gst_vulkan_encoder_request_rc_reset() it does not raise
++ * %VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR, so the decoded-picture buffer is
++ * not invalidated and the encoder is not forced to emit a key frame. Use
++ * request_rc_reset() only for a genuine session restart (start, or a
++ * rate-control *mode* change).
++ */
++void
++gst_vulkan_encoder_request_rc_update (GstVulkanEncoder * self)
++{
++  GstVulkanEncoderPrivate *priv;
++
++  g_return_if_fail (GST_IS_VULKAN_ENCODER (self));
++
++  priv = gst_vulkan_encoder_get_instance_private (self);
++
++  if (priv->started)
++    priv->rc_update = TRUE;
++}
++
++/**
++ * gst_vulkan_encoder_request_rc_reset:
++ * @self: a #GstVulkanEncoder
++ *
++ * Request that the rate-control state be re-applied to the running video
++ * session on the next encode (via vkCmdControlVideoCoding). Use this after
++ * changing rate-control values (e.g. bitrate) that the encoder reads per-frame
++ * but only applies to the driver on a session reset.
++ */
++void
++gst_vulkan_encoder_request_rc_reset (GstVulkanEncoder * self)
++{
++  GstVulkanEncoderPrivate *priv;
++
++  g_return_if_fail (GST_IS_VULKAN_ENCODER (self));
++
++  priv = gst_vulkan_encoder_get_instance_private (self);
++
++  if (priv->started)
++    priv->session_reset = TRUE;
++}
++
+ GType
+ gst_vulkan_encoder_rate_control_mode_get_type (void)
+ {
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h
+index 9297736..033bd4c 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h
+@@ -174,6 +174,12 @@ GST_VULKAN_API
+ void                    gst_vulkan_encoder_set_rc_mode          (GstVulkanEncoder * self,
+                                                                  VkVideoEncodeRateControlModeFlagBitsKHR rc_mode);
+ 
++GST_VULKAN_API
++void                    gst_vulkan_encoder_request_rc_update    (GstVulkanEncoder * self);
++
++GST_VULKAN_API
++void                    gst_vulkan_encoder_request_rc_reset     (GstVulkanEncoder * self);
++
+ GST_VULKAN_API
+ gboolean                gst_vulkan_encoder_start                (GstVulkanEncoder * self,
+                                                                  GstVulkanVideoProfile * profile,

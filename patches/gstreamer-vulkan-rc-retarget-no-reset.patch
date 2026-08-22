@@ -1,0 +1,138 @@
+# gstreamer-vulkan-rc-retarget-no-reset.patch
+#
+# What: two independent, codec-neutral fixes to the shared Vulkan video-encode
+# library (gst-libs/gst/vulkan/gstvkencoder-private.{c,h}), no element files
+# touched:
+#
+#   A. gst_vulkan_encoder_request_rc_reset() no longer raises
+#      VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR. It becomes a synonym of
+#      gst_vulkan_encoder_request_rc_update() (ENCODE_RATE_CONTROL_BIT only).
+#      A genuine session (re)start is unaffected: gst_vulkan_encoder_start()
+#      and gst_vulkan_encoder_set_rc_mode() (an actual rate-control *mode*
+#      change) both set priv->session_reset directly and never call through
+#      this function, so they still take the RESET_BIT path in
+#      gst_vulkan_encoder_encode()'s VkVideoCodingControlInfoKHR.flags.
+#
+#   B. gst_vulkan_encoder_picture_clear() never released DPB slot 0
+#      (`if (pic->dpb_slot.slotIndex > 0)`), so whichever picture claims slot
+#      0 -- typically the first frame encoded in a session -- is never marked
+#      free again. Over a long-running session this steadily shrinks the
+#      usable DPB by one slot for good. -1 is this codebase's established
+#      "no slot" sentinel (see gst_vulkan_encoder_encode()'s own
+#      `ref_slots[nb_refs].slotIndex = -1` for the setup slot, and this same
+#      function's `pic->dpb_slot.slotIndex = -1` two lines below the guard it
+#      fixes); slot indices returned by gst_vulkan_encoder_encode() range over
+#      [0, maxDpbSlots), so 0 is a legitimate, frequently-hit slot and the
+#      guard must be `>= 0`.
+#
+# Why: A live ABR bitrate retarget calls (or, for a codec ported from the
+# H.264 template without care, MAY call) gst_vulkan_encoder_request_rc_reset()
+# to push the new setpoint to the driver. As shipped, that function sets
+# priv->session_reset, and the encoder's next vkCmdControlVideoCoding call
+# ORs in RESET_BIT unconditionally alongside RATE_CONTROL_BIT and
+# QUALITY_LEVEL_BIT -- a full video-session reset. RESET_BIT invalidates the
+# DPB, so the very next frame has no usable reference and has to be an IDR.
+# Under a sustained ABR loop retargeting every ~1-2s, that is a forced key
+# frame on (close to) every retarget: a bandwidth spike exactly when the path
+# is already congested enough to trigger the retarget in the first place.
+# This is codec-neutral -- it lives in the shared encode library, so it hits
+# H.264, H.265 and AV1 identically; whichever Vulkan codec element reaches
+# for the "reset" entry point pays the same DPB-invalidation tax. B is the
+# same story: any codec's session eventually recycles slot 0 back to the
+# free pool it can never return to.
+#
+# Symptom (measured, AV1, driver 610.57.04, harness
+# deploy/experiments/vulkanav1enc/vkvideoencodeav1cbr.c "rcreset-*-midgop"
+# control cases -- see deploy/experiments/vulkanav1enc/README.md:96-106):
+# a mid-GOP retarget through the reset path takes ~3 frames to converge and
+# costs a key frame at the element level, versus the update path's one-frame
+# convergence and zero key frames. Fix A makes both entry points behave like
+# the update path, so a codec element cannot regress into the reset behavior
+# merely by calling the more obviously-named function.
+#
+# Provenance: the update/reset split (gst_vulkan_encoder_request_rc_update(),
+# the priv->rc_update flag, and the RESET_BIT flags triple this patch's Fix A
+# leaves untouched at genuine-restart call sites) was introduced by
+# deploy/patches/vulkan/vkh264enc-rc-fix.patch (Fix B2, 2026-07-26) for
+# vulkanh264enc's own live-bitrate path, which calls
+# gst_vulkan_encoder_request_rc_update() directly and was already unaffected
+# by request_rc_reset()'s old behavior. This patch closes the same hazard for
+# any *other* caller (H.265, or the vulkanav1enc element under development)
+# that reaches for request_rc_reset() instead. The reset-free control path
+# this patch relies on (ENCODE_RATE_CONTROL_BIT with no RESET_BIT, no
+# QUALITY_LEVEL_BIT) was prototyped and driver-validated in
+# deploy/experiments/vulkanav1enc/README.md ("Reset-free retarget",
+# 2026-07-26 and the 610.57.04 AV1 re-run): the driver accepts it and the new
+# setpoint takes effect the very next frame, with the DPB intact.
+#
+# Dependency: this patch's Fix A requires vkh264enc-rc-fix.patch to already
+# be applied -- gst_vulkan_encoder_request_rc_reset(), the sibling
+# gst_vulkan_encoder_request_rc_update(), and the priv->rc_update field do
+# not exist in stock GStreamer 1.28.4. Apply after (in order) the Quasar
+# vulkan patch chain's vkh264enc-rc-fix.patch. Fix B has no such dependency;
+# gst_vulkan_encoder_picture_clear() is unmodified by any of the other
+# patches in the chain and the fix applies equally to stock 1.28.4. See
+# libpatch-NOTES.md for the full GOW-baseline and six-patch overlap analysis.
+#
+# Scope: no QUASAR_* anything, no Quasar policy -- pure library bugfix,
+# upstreamable independently of vulkanav1enc.patch. License: LGPL, inherited
+# from gst-plugins-bad, same as the file it touches.
+#
+# Upstream status: not filed as of 2026-08-21 (companion to the existing
+# unreported vkh264enc-rc-fix.patch / vkh264enc-num-slices.patch filings
+# against gstreamer/gstreamer noted in deploy/patches/vulkan/README.md).
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+index 0b92160..a1b2c3d 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+@@ -294,7 +294,11 @@ gst_vulkan_encoder_picture_clear (GstVulkanEncoderPicture * pic,
+
+   priv = gst_vulkan_encoder_get_instance_private (self);
+
+-  if (pic->dpb_slot.slotIndex > 0) {
++  /* PATCH (rc-retarget-no-reset): -1 is the "no slot" sentinel used
++   * throughout this file (see the setup slot below and the assignment two
++   * lines down); real slot indices from gst_vulkan_encoder_encode() start at
++   * 0, so a "> 0" guard here silently never released slot 0. */
++  if (pic->dpb_slot.slotIndex >= 0) {
+     priv->slots[pic->dpb_slot.slotIndex] = NULL;
+     pic->dpb_slot.slotIndex = -1;
+   }
+@@ -1580,17 +1584,28 @@ gst_vulkan_encoder_request_rc_update (GstVulkanEncoder * self)
+
+ /**
+  * gst_vulkan_encoder_request_rc_reset:
+  * @self: a #GstVulkanEncoder
+  *
+  * Request that the rate-control state be re-applied to the running video
+- * session on the next encode (via vkCmdControlVideoCoding). Use this after
+- * changing rate-control values (e.g. bitrate) that the encoder reads per-frame
+- * but only applies to the driver on a session reset.
++ * session on the next encode (via vkCmdControlVideoCoding).
++ *
++ * PATCH (rc-retarget-no-reset): despite the name, this raises
++ * %VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR only -- it no longer
++ * raises %VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR. It is now a synonym of
++ * gst_vulkan_encoder_request_rc_update(): both exist so a caller can use
++ * whichever name reads better at the call site. A rate-control *value*
++ * change (e.g. bitrate) never needs a real reset -- the DPB and reference
++ * state stay valid, so no key frame is forced. A genuine session (re)start
++ * still resets: gst_vulkan_encoder_start() and gst_vulkan_encoder_set_rc_mode()
++ * (an actual rate-control *mode* change) set priv->session_reset directly
++ * and do not go through this function, so they are unaffected and still
++ * raise RESET_BIT via the VkVideoCodingControlInfoKHR flags in
++ * gst_vulkan_encoder_encode().
+  */
+ void
+ gst_vulkan_encoder_request_rc_reset (GstVulkanEncoder * self)
+ {
+   GstVulkanEncoderPrivate *priv;
+
+   g_return_if_fail (GST_IS_VULKAN_ENCODER (self));
+
+   priv = gst_vulkan_encoder_get_instance_private (self);
+
+   if (priv->started)
+-    priv->session_reset = TRUE;
++    priv->rc_update = TRUE;
+ }
