@@ -1,5 +1,5 @@
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::renderer::{Renderer, sync::SyncPoint, utils::on_commit_buffer_handler},
     delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
     reexports::{
@@ -62,8 +62,12 @@ impl CompositorHandler for State {
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
-                // Explicit sync: block the commit on the client's acquire timeline point.
+                // Ensure cached EGLImages respect the acquire fence; keep the commit blocker as fallback.
                 if let Some(acquire_point) = acquire_point {
+                    let sync = SyncPoint::from(acquire_point.clone());
+                    if state.renderer.wait(&sync).is_ok() {
+                        return;
+                    }
                     if let Ok((blocker, source)) = acquire_point.generate_blocker() {
                         if let Some(client) = surface.client() {
                             let res = state.handle.insert_source(source, move |_, _, data| {
