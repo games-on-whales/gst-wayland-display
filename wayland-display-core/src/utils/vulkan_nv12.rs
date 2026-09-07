@@ -462,6 +462,12 @@ pub struct VulkanNv12 {
     outputs: Vec<Nv12Out>,
     next: usize, // next ring slot to write
     cur: usize,  // last slot written (the one to_gst_buffer returns)
+    /// True once at least one frame has completed conversion, so a busy-drop has a previous
+    /// output to safely re-emit rather than reusing a slot the encoder still references.
+    have_output: bool,
+    /// Count of frames dropped because the target encode-src slot was still referenced at
+    /// reuse time; drives rate-limited logging only.
+    busy_drops: u64,
     width: u32,
     height: u32,
     /// Target output format (NV12 8-bit or P010 10-bit); selects the compute shader, image
@@ -716,6 +722,8 @@ impl VulkanNv12 {
             _shared_device: None,
             outputs,
             next: 0,
+            have_output: false,
+            busy_drops: 0,
             cur: 0,
             width,
             height,
@@ -870,6 +878,8 @@ impl VulkanNv12 {
             _shared_device: Some(device_gst),
             outputs,
             next: 0,
+            have_output: false,
+            busy_drops: 0,
             cur: 0,
             width,
             height,
@@ -915,34 +925,32 @@ impl VulkanNv12 {
             while self.outputs[idx].buffer.get_mut().is_none() {
                 // ~1s cap so a paused/stalled consumer can't deadlock the producer forever.
                 if waited >= 10_000 {
-                    tracing::warn!(
-                        "VulkanNv12: encode-src slot {idx} still referenced after 1s; reusing anyway"
-                    );
-                    break;
+                    // Never overwrite a slot the encoder still references: that is exactly
+                    // the GPU data hazard this gate exists to prevent, and at RING=1 (one
+                    // slot) "reuse anyway" writes the image the encoder is reading. Drop the
+                    // freshly rendered frame instead and re-emit the last completed output;
+                    // to_gst_buffer returns `cur`, which this early return leaves unchanged.
+                    if !self.have_output {
+                        return Err(
+                            "VulkanNv12: encode-src ring busy before first completed frame".into(),
+                        );
+                    }
+                    self.busy_drops = self.busy_drops.saturating_add(1);
+                    if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
+                        tracing::warn!(
+                            slot = idx,
+                            busy_drops = self.busy_drops,
+                            "VulkanNv12: encode-src slot still referenced after 1s; dropping new frame, re-emitting previous output"
+                        );
+                    }
+                    return Ok(());
                 }
                 std::thread::sleep(std::time::Duration::from_micros(100));
                 waited += 1;
             }
-            // The slot's persistent GstBuffer is reused every RING frames and still carries
-            // the timestamps stamped onto it on its previous use. BaseSrc's do_timestamp only
-            // stamps a buffer whose PTS is NONE, so without a reset the exported PTS degenerate
-            // to the ring's ~4 recurring values (non-monotonic, duplicated), which downstream
-            // RTP payloading turns into timestamps libwebrtc cannot assemble. Reset the timing
-            // metadata here, right after the reuse gate, where the slot is uniquely owned on
-            // the normal path -- resetting in to_gst_buffer via make_mut() would copy the
-            // refcount-2 buffer and blind the gate above (the copy keeps outputs[idx].buffer
-            // at refcount 1 forever). On the gate's 1s-timeout escape the slot is NOT uniquely
-            // owned; get_mut() returns None and the reset is skipped (the stream is already
-            // degraded there, and an in-place write to a shared header would be worse).
-            if let Some(b) = self.outputs[idx].buffer.get_mut() {
-                b.set_pts(gst::ClockTime::NONE);
-                b.set_dts(gst::ClockTime::NONE);
-                b.set_duration(gst::ClockTime::NONE);
-            } else {
-                tracing::warn!(
-                    "VulkanNv12: encode-src slot {idx} PTS reset skipped (buffer still shared)"
-                );
-            }
+            // No timestamp reset on the parent here: to_gst_buffer hands downstream a fresh
+            // child header whose PTS is already NONE, and nothing stamps the parent header
+            // any more. The slot's own timestamps are never read.
         }
 
         // Ensure this slot's cached RGBA import matches the current dmabuf. Built once per
@@ -1247,6 +1255,7 @@ impl VulkanNv12 {
         }
 
         self.cur = idx;
+        self.have_output = true;
         Ok(())
     }
 
@@ -1480,17 +1489,44 @@ impl VulkanNv12 {
         }
     }
 
-    /// The just-converted NV12 export slot as a gst buffer. Returns the slot's cached
-    /// buffer (ref-counted) so the VA encoder reuses one stable surface per slot.
+    /// The just-converted NV12 export slot as a gst buffer.
     ///
-    /// On the `encode_src` path the returned buffer's PTS is `NONE` in normal steady state:
-    /// `convert_inner` resets the recycled slot's timing metadata right after the reuse gate,
-    /// so BaseSrc's `do_timestamp` re-stamps it with the current running-time each frame
-    /// (matching the RGBx/DMABuf paths, which build a fresh `GstBuffer` every frame). On the
-    /// gate's 1s-timeout escape the reset is skipped (buffer still shared) and the PTS may be
-    /// stale; `convert_inner` warns when that happens.
+    /// **VA / RGBx / DMABuf (`encode_src == false`):** the slot's cached buffer, ref-counted,
+    /// so the encoder reuses one stable surface per slot. Unchanged.
+    ///
+    /// **Vulkan encode path (`encode_src == true`):** a fresh CHILD header over the slot,
+    /// carrying `GstParentBufferMeta`, with PTS/DTS/duration cleared so BaseSrc's
+    /// `do_timestamp` stamps it with the current running-time each frame. The parent's own
+    /// timestamps are never read.
     pub fn to_gst_buffer(&self) -> Result<GstBuffer, Err> {
-        Ok(self.outputs[self.cur].buffer.clone())
+        let parent = &self.outputs[self.cur].buffer;
+        if !self.encode_src {
+            return Ok(parent.clone());
+        }
+        // Encode-src: hand downstream a FRESH child header over the slot, carrying
+        // GstParentBufferMeta that references the cached slot buffer.
+        //
+        // A bare clone is defeated by copy-on-write. BaseSrc calls
+        // gst_buffer_make_writable() on the DISCONT frame (gstbasesrc.c, "marking pending
+        // DISCONT"), and any downstream element that makes the header writable does the
+        // same. At refcount 2 that copies the header, so the cached slot buffer drops back
+        // to refcount 1 while the copy -- and the encoder reading through it -- still points
+        // at the same VkImage. The reuse gate in convert_inner then sees the slot as free
+        // and lets the producer overwrite an image an encode is still reading.
+        //
+        // ParentBufferMeta survives that: its COPY transform re-adds the meta and re-refs
+        // the parent, so every later header copy keeps the slot non-writable until the last
+        // child is dropped. Resetting the timestamps on the fresh child also gives BaseSrc's
+        // do_timestamp a PTS of NONE to stamp, without touching the shared slot.
+        let mut child = parent.copy();
+        let child_ref = child
+            .get_mut()
+            .ok_or("VulkanNv12: fresh output child unexpectedly shared")?;
+        child_ref.set_pts(gst::ClockTime::NONE);
+        child_ref.set_dts(gst::ClockTime::NONE);
+        child_ref.set_duration(gst::ClockTime::NONE);
+        gst::ParentBufferMeta::add(child_ref, parent);
+        Ok(child)
     }
 }
 
