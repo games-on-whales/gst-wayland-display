@@ -1,0 +1,34 @@
+From 1b44b7eb790ae88bbda25f8766cd8df795adcc82 Mon Sep 17 00:00:00 2001
+From: Eli Bosley <eli@bosley.dev>
+Date: Mon, 27 Jul 2026 09:27:21 -0400
+Subject: [PATCH] vulkan: preserve image flags in format query
+
+The allocator creates an image with the caller-supplied flags but then
+validates its format properties with flags set to zero. This can reject an
+image after vkCreateImage succeeds, including multiplanar images using
+MUTABLE_FORMAT and EXTENDED_USAGE where storage support is supplied by
+compatible plane views.
+
+Pass the original image flags to the format query, matching the wrapped-image
+allocation path.
+---
+ .../gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c     | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c
+index 9714d65..dbe4c2c 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkimagememory.c
+@@ -189,7 +189,8 @@ _vk_image_mem_new_alloc_with_image_info (GstAllocator * allocator,
+ 
+ 
+   err = vkGetPhysicalDeviceImageFormatProperties (gpu, image_info->format,
+-      VK_IMAGE_TYPE_2D, image_info->tiling, image_info->usage, 0,
++      VK_IMAGE_TYPE_2D, image_info->tiling, image_info->usage,
++      image_info->flags,
+       &mem->format_properties);
+   if (gst_vulkan_error_to_g_error (err, &error,
+           "vkGetPhysicalDeviceImageFormatProperties") < 0)
+-- 
+2.50.1 (Apple Git-155)
+

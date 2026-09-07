@@ -6,6 +6,7 @@ Apply against a gstreamer monorepo checkout before building:
 ```
 git apply patches/vkh264enc-dpb-pool-in-new-sequence.patch
 git apply patches/vulkanh265enc.patch
+git apply patches/gstvulkan-preserve-image-create-flags.patch
 ```
 
 ## vkh264enc-dpb-pool-in-new-sequence.patch
@@ -42,6 +43,20 @@ to import the compositor's RGBA dmabuf. Rather than fork gstreamer for that, the
 plugin **creates its own `GstVulkanInstance`/`GstVulkanDevice`** with those
 extensions enabled and hands it to the encoder via a context-query answer, so no
 gstreamer patch is required. See `wayland-display-core/src/utils/vulkan_share.rs`.)
+
+## gstvulkan-preserve-image-create-flags.patch
+
+Preserves the caller's `VkImageCreateInfo::flags` when
+`gst_vulkan_image_memory_alloc_with_image_info()` validates the created image
+with `vkGetPhysicalDeviceImageFormatProperties()`. Dropping
+`VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and
+`VK_IMAGE_CREATE_EXTENDED_USAGE_BIT` can reject a successfully created
+multiplanar NV12/P010 image whose compatible plane views provide storage-image
+support.
+
+Tested with NV12/H.264 and P010/H.265 Vulkan Video allocation on RADV. The fix
+is also prepared against GStreamer `main`; this local patch can be removed once
+the fix is available in the pinned GStreamer release.
 
 ## Building the patched gstreamer
 
