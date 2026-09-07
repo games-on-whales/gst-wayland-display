@@ -199,12 +199,66 @@ impl State {
         delta_unaccelerated: Point<f64, Logical>,
     ) {
         self.last_pointer_movement = Instant::now();
-        let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.seat.get_pointer().unwrap();
-        let under = self
+        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
             .space
             .element_under(self.pointer_location)
             .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+
+        // Edge-triggered pointer refocus.
+        //
+        // smithay only emits wl_pointer.enter on a focus TRANSITION, and broadcasts it to
+        // the wl_pointer resources that exist at that instant while recording the new focus
+        // unconditionally. This compositor resolves pointer focus once, via a synthetic
+        // zero-delta motion in the toplevel map handler. A client that calls
+        // wl_seat.get_pointer AFTER that instant loses the race: the enter reached zero
+        // resources, smithay's focus is already Some(surface), and every later motion takes
+        // smithay's same-target arm (wl_pointer.motion only) -- so the client never learns
+        // it has pointer focus and ignores all pointer input, forever. Rootful Xwayland
+        // (maps exactly once) fails deterministically; gamescope fails intermittently.
+        //
+        // Fix: on the first real motion after a map, force smithay's focus to None so the
+        // motion below takes the (focus, None) => enter arm and re-emits the enter.
+        //
+        // The flag is RETAINED (not consumed) when there is no surface under the pointer --
+        // there is nothing to refocus onto yet -- and while the pointer is grabbed, since
+        // smithay's default click grab is active for as long as a button is held and a
+        // forced leave mid-click-drag would break the drag.
+        let refocus_target = under
+            .as_ref()
+            .filter(|_| self.pending_pointer_refocus && !pointer.is_grabbed());
+        if let Some((target, _)) = refocus_target {
+            // An active pointer constraint proves the client already received its enter
+            // (constraints only activate on an entered surface), so the refocus is
+            // unnecessary rather than deferred -- clear the flag, don't retry.
+            let constrained = target
+                .wl_surface()
+                .map(|surface| {
+                    with_pointer_constraint(
+                        &surface,
+                        &pointer,
+                        |constraint| matches!(constraint, Some(c) if c.is_active()),
+                    )
+                })
+                .unwrap_or(false);
+
+            self.pending_pointer_refocus = false;
+            if !constrained {
+                pointer.motion(
+                    self,
+                    None,
+                    &MotionEvent {
+                        location: self.pointer_location,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: event_time_msec,
+                    },
+                );
+            }
+        }
+
+        // Allocated AFTER the refocus block: the re-emitted wl_pointer.enter below must carry
+        // a serial NEWER than the forced leave's, since clients echo enter serials back.
+        let serial = SERIAL_COUNTER.next_serial();
 
         let possible_pos = self.clamp_coords(self.pointer_location + delta);
 

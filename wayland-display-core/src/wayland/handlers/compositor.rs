@@ -168,11 +168,48 @@ impl CompositorHandler for State {
             } else {
                 let loc = (0, 0);
                 self.space.map_element(window.clone(), loc, true);
+                // Window::bbox() stays (0,0) until on_commit() recomputes it from the
+                // surface tree, and the per-commit on_commit() above only runs for
+                // surfaces already in the space. A client that never re-commits its
+                // root toplevel after this mapping commit (an idle wev, a launcher
+                // rendering via subsurfaces) would keep an empty bbox forever, so
+                // Space::element_under() never resolves it and wl_pointer focus is
+                // never assigned (keyboard focus, set directly below, is unaffected).
+                // Refresh the bbox from the buffer committed just now -- the same fix
+                // tests/fixture.rs applies manually for the pointer tests to work.
+                window.on_commit();
                 self.seat.get_keyboard().unwrap().set_focus(
                     self,
                     Some(FocusTarget::from(window)),
                     SERIAL_COUNTER.next_serial(),
                 );
+                // Synthetic zero-delta motion: delivers wl_pointer.enter to the newly
+                // mapped (and just-raised) toplevel immediately -- without waiting for
+                // the next physical motion event -- and runs
+                // maybe_activate_pointer_constraint(), so a client that requested a
+                // pointer lock/confine before mapping (nested gamescope with
+                // --force-grab-cursor) gets its constraint activated the moment its
+                // surface is focusable. Pointer focus thereby follows the newest
+                // toplevel exactly like keyboard focus above.
+                let time: std::time::Duration = self.clock.now().into();
+                self.pointer_motion(
+                    time.as_millis() as u32,
+                    time.as_micros() as u64,
+                    (0., 0.).into(),
+                    (0., 0.).into(),
+                );
+                // Arm the edge-triggered pointer refocus for the NEXT motion: the enter
+                // emitted by the synthetic motion above reaches only the wl_pointer
+                // resources that exist at this instant, and a client that calls
+                // wl_seat.get_pointer afterwards (rootful Xwayland always; gamescope
+                // intermittently) would never see one, because smithay records focus
+                // regardless and every later motion then takes its same-target arm.
+                //
+                // ORDER IS LOAD-BEARING: this must be set AFTER the synthetic motion.
+                // That motion is itself a pointer_motion() call, so arming the flag first
+                // would let it consume itself inside the exact race window this fix
+                // exists to escape.
+                self.pending_pointer_refocus = true;
             }
 
             return;
