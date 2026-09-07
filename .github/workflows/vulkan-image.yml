@@ -1,0 +1,67 @@
+name: vulkan image
+
+# Builds and publishes ghcr.io/<owner>/gst-wayland-display:vulkan — a Fedora image
+# with patched GStreamer 1.28.4 (Vulkan video encode) + this plugin installed.
+# wolf:vulkan builds FROM this image. The normal lint/build/test harness lives in
+# harness.yml and is unaffected.
+
+on:
+  push:
+    branches: [main, stable, feat/vulkan-encode]
+    paths-ignore:
+      - "docs/**"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+
+# Cancel an in-flight run when a newer commit lands on the same ref, so two
+# builds never race to publish :vulkan / write the shared buildcache.
+concurrency:
+  group: vulkan-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  vulkan-image:
+    name: build & push :vulkan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Publish ONLY on push events. A branch with an open PR fires BOTH a push
+      # and a pull_request run for the same commit; when both pushed :vulkan (and
+      # both wrote the shared buildcache) they raced — separate buildx caches,
+      # last-to-finish wins — non-deterministically publishing a STALE plugin .so.
+      # pull_request runs now build-validate only (no push, no cache write).
+      - name: Decide push
+        id: prep
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.prep.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push gst-wayland-display:vulkan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/vulkan.Dockerfile
+          push: ${{ steps.prep.outputs.push == 'true' }}
+          load: ${{ steps.prep.outputs.push == 'false' }}
+          tags: ghcr.io/${{ github.repository_owner }}/gst-wayland-display:vulkan
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/gst-wayland-display:vulkan-buildcache
+          cache-to: ${{ steps.prep.outputs.push == 'true' && format('type=registry,ref=ghcr.io/{0}/gst-wayland-display:vulkan-buildcache,mode=max', github.repository_owner) || '' }}

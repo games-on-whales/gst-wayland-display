@@ -237,6 +237,15 @@ phase_integration() {
       ! "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,$res" \
       ! dmabuftocuda render-node="$node" ! nvh265enc ! fakesink || ok=0
   fi
+  # Vulkan encode (any vendor with vulkanh264enc): the source harvests the
+  # encoder's GstVulkanDevice and hands it a shared-device NV12 memory:VulkanImage.
+  if gst-inspect-1.0 vulkanh264enc >/dev/null 2>&1; then
+    node="${FORCE_NODE:-${NODE_FOR_VENDOR[nvidia]:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-}}}}"
+    if [[ -n "$node" ]]; then
+      run_to_eos "vulkan:vulkanh264enc" waylanddisplaysrc render-node="$node" vulkan=true \
+        num-buffers=30 ! vulkanh264enc ! fakesink || ok=0
+    fi
+  fi
   [[ $ok -eq 1 ]]
 }
 

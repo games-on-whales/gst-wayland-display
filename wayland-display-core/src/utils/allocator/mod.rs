@@ -4,13 +4,17 @@ pub mod cuda;
 use crate::DrmModifier;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
+use crate::utils::device::PCIVendor;
+use crate::utils::device::gpu::GPUDevice;
+use crate::utils::vulkan_nv12::{PixFmt, VulkanNv12};
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
-use gstreamer_allocators::{DmaBufAllocator, FdMemoryFlags};
+use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
 use smithay::backend::drm::DrmNode;
+#[cfg(feature = "cuda")]
 use smithay::backend::egl::ffi::egl::types::EGLDisplay;
 use smithay::backend::renderer::gles::{GlesError, GlesRenderbuffer, GlesRenderer, GlesTarget};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
@@ -22,6 +26,20 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+/// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
+/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either `WOLF_HDR_SPIKE`
+/// (synthetic-bars spike) or `WOLF_HDR_CM` (real HDR client content) is set this becomes the
+/// 64bpp fp16 `Abgr16161616f` so the render target can carry linear values > 1.0 (HDR
+/// highlights) into the Vulkan P010/PQ converter instead of clamping them at 8-bit white.
+/// Both unset = byte-for-byte the current 8-bit path.
+fn rgba_render_fourcc() -> DrmFourcc {
+    if std::env::var("WOLF_HDR_SPIKE").is_ok() || std::env::var("WOLF_HDR_CM").is_ok() {
+        DrmFourcc::Abgr16161616f
+    } else {
+        DrmFourcc::Abgr8888
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GsGlesbuffer {
     buffer: GlesRenderbuffer,
@@ -31,7 +49,8 @@ pub struct GsGlesbuffer {
 
 impl GsGlesbuffer {
     pub fn new(renderer: &mut GlesRenderer, video_info: VideoInfo) -> Option<Self> {
-        let format = Fourcc::try_from(video_info.format().to_fourcc()).unwrap_or(Fourcc::Abgr8888);
+        let format = Fourcc::try_from(video_info.format().to_fourcc())
+            .unwrap_or_else(|_| rgba_render_fourcc());
 
         let result = renderer.create_buffer(
             format,
@@ -127,6 +146,213 @@ impl GsDmaBuf {
     }
 }
 
+/// NV12 output via the Vulkan converter: the compositor renders the scene into
+/// `rgba` (a GLES-renderable RGBA dmabuf), then [`VulkanNv12`] imports it, runs the
+/// RGBA->NV12 compute shader, and exports an NV12 dmabuf (the negotiated modifier --
+/// DCC on AMD, LINEAR elsewhere) for the encoders.
+#[derive(Debug, Clone)]
+pub struct GsNv12Buf {
+    /// GLES render target (RGBA); also the Vulkan converter's input dmabuf.
+    pub rgba: Dmabuf,
+    vulkan: Arc<Mutex<VulkanNv12>>,
+    /// The negotiated NV12 video info.
+    video_info: VideoInfoDmaDrm,
+}
+
+/// True if `m` is an AMD `AMD_FMT_MOD` modifier with DCC enabled: vendor byte `0x02`
+/// (`DRM_FORMAT_MOD_VENDOR_AMD`) and the DCC bit (`AMD_FMT_MOD_DCC`, shift 13) set, e.g.
+/// the RX 9070 (GFX12/RDNA4) preferred `NV12:0x0200000000082305`. A DCC-compressed RGBA
+/// render target is mis-sampled when `VulkanNv12` imports it cross-API on radv, so we keep
+/// such modifiers as a last resort (see [`rgba_modifier_order`]).
+fn is_amd_dcc_modifier(m: Modifier) -> bool {
+    let v: u64 = m.into();
+    ((v >> 56) & 0xff) == 0x02 && ((v >> 13) & 0x1) == 1
+}
+
+/// Order RGBA render-target modifier candidates so `VulkanNv12`'s cross-API import lands on
+/// a sampleable buffer.
+///   - Nvidia: keep the GPU's block-linear preferred modifier first (forcing LINEAR breaks
+///     its self-import); LINEAR last as a fallback.
+///   - Everyone else (AMD/Intel): LINEAR first, then plain tiled, then **DCC last**. On the
+///     RX 9070 / GFX12 the preferred modifier is DCC; without pushing DCC behind the other
+///     candidates, a failed LINEAR allocation falls straight back to the DCC modifier that
+///     the import mis-samples (image "jumps"/shifts, cursor dropped). DCC stays in the list
+///     as a last resort so we never end up with *no* buffer.
+fn rgba_modifier_order(mods: &[Modifier], is_nvidia: bool) -> Vec<Modifier> {
+    if is_nvidia {
+        return mods
+            .iter()
+            .copied()
+            .chain(std::iter::once(Modifier::Linear))
+            .collect();
+    }
+    let (dcc, non_dcc): (Vec<Modifier>, Vec<Modifier>) =
+        mods.iter().copied().partition(|m| is_amd_dcc_modifier(*m));
+    std::iter::once(Modifier::Linear)
+        .chain(non_dcc)
+        .chain(dcc)
+        .collect()
+}
+
+/// True when the negotiated colorimetry uses the BT.2020 matrix (i.e. HDR / BT.2100-PQ
+/// output): the RGBA->P010 converter must then use the BT.2020 luma/chroma matrix so the
+/// samples match the `matrix=bt2020` caps the encoder signals. SDR (BT.601/709) -> false.
+fn is_bt2020_matrix(colorimetry: &gst_video::VideoColorimetry) -> bool {
+    colorimetry.matrix() == gst_video::VideoColorMatrix::Bt2020
+}
+
+impl GsNv12Buf {
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        render_node: DrmNode,
+        video_info: VideoInfoDmaDrm,
+        fmt: PixFmt,
+    ) -> Option<Self> {
+        let (w, h) = (video_info.width(), video_info.height());
+        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
+        let rgba_fourcc = rgba_render_fourcc();
+        tracing::info!(
+            "GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
+            rgba_fourcc == DrmFourcc::Abgr16161616f
+        );
+        // RGBA render-target modifier candidates the GLES renderer supports (INVALID last).
+        let formats =
+            <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
+        let mut mods: Vec<Modifier> = formats
+            .iter()
+            .filter(|f| f.code == rgba_fourcc)
+            .map(|f| f.modifier)
+            .collect();
+        mods.sort_by_key(|m| *m == Modifier::Invalid);
+        let gbm = new_gbm_device(render_node)?;
+        let mut dma = DmabufAllocator(GbmAllocator::new(gbm, GbmBufferFlags::RENDERING));
+
+        // Pick the RGBA modifier. VulkanNv12 imports this buffer on the GPU that produced it.
+        //  - Nvidia: keep the GPU's preferred modifier -- its Vulkan imports its own
+        //    block-linear RGBA, and forcing LINEAR makes the import fail (no frames).
+        //  - Everyone else: prefer LINEAR. On AMD the preferred Abgr8888 modifier is
+        //    DCC-compressed, and a DCC render target is mis-sampled when VulkanNv12 imports
+        //    it cross-API on radv -- the cursor overlay (drawn last) is silently dropped from
+        //    the converted NV12. This buffer is a transient render-once/import-once
+        //    intermediate, so DCC buys nothing; LINEAR avoids it and imports cleanly (and is
+        //    no slower in practice). Fall back to the other modifiers if LINEAR won't allocate.
+        let is_nvidia = matches!(
+            GPUDevice::try_from(render_node).map(|d| *d.pci_vendor() == PCIVendor::NVIDIA),
+            Ok(true)
+        );
+        let order = rgba_modifier_order(&mods, is_nvidia);
+        let rgba = order
+            .iter()
+            .find_map(|m| dma.create_buffer(w, h, rgba_fourcc, &[*m]).ok())?;
+        tracing::debug!(
+            "GsNv12Buf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
+            rgba.format().modifier
+        );
+        // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
+        let bt2020 = video_info
+            .to_video_info()
+            .ok()
+            .is_some_and(|vi| is_bt2020_matrix(&vi.colorimetry()));
+        // The converter samples the fp16 (linear) render target when it was allocated as such
+        // (WOLF_HDR_SPIKE / WOLF_HDR_CM); the input format -- not the env -- selects the shader.
+        let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
+        let vulkan = VulkanNv12::new(render_node, video_info.clone(), fmt, bt2020, fp16_input)?;
+        Some(GsNv12Buf {
+            rgba,
+            vulkan: Arc::new(Mutex::new(vulkan)),
+            video_info,
+        })
+    }
+}
+
+/// NV12 output as `memory:VulkanImage` on the downstream encoder's shared `GstVulkanDevice`
+/// (the Vulkan-encode/interpipe path). Renders the scene into an RGBA dmabuf like
+/// [`GsNv12Buf`], but the Vulkan converter writes into the encoder's own encode-src image
+/// pool, so `vulkanh264enc` consumes the result zero-copy.
+#[derive(Debug, Clone)]
+pub struct GsVulkanBuf {
+    pub rgba: Dmabuf,
+    vulkan: Arc<Mutex<VulkanNv12>>,
+    video_info: VideoInfo,
+}
+
+impl GsVulkanBuf {
+    /// `profile` is the negotiated H.264 profile (for the encode-src image's video profile).
+    /// Returns `None` if no shared `GstVulkanDevice` has been received yet (caller then
+    /// falls back to the dmabuf path).
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        render_node: DrmNode,
+        video_info: VideoInfo,
+        profile: String,
+        vulkan_share: &crate::utils::vulkan_share::VulkanShare,
+    ) -> Option<Self> {
+        let (w, h) = (video_info.width(), video_info.height());
+
+        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
+        let rgba_fourcc = rgba_render_fourcc();
+        tracing::info!(
+            "GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
+            rgba_fourcc == DrmFourcc::Abgr16161616f
+        );
+        // RGBA render-target modifier (same policy as GsNv12Buf: LINEAR except on Nvidia).
+        let formats =
+            <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
+        let mut mods: Vec<Modifier> = formats
+            .iter()
+            .filter(|f| f.code == rgba_fourcc)
+            .map(|f| f.modifier)
+            .collect();
+        mods.sort_by_key(|m| *m == Modifier::Invalid);
+        let gbm = new_gbm_device(render_node)?;
+        let mut dma = DmabufAllocator(GbmAllocator::new(gbm, GbmBufferFlags::RENDERING));
+        let is_nvidia = matches!(
+            GPUDevice::try_from(render_node).map(|d| *d.pci_vendor() == PCIVendor::NVIDIA),
+            Ok(true)
+        );
+        let order = rgba_modifier_order(&mods, is_nvidia);
+        let rgba = order
+            .iter()
+            .find_map(|m| dma.create_buffer(w, h, rgba_fourcc, &[*m]).ok())?;
+        tracing::debug!(
+            "GsVulkanBuf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
+            rgba.format().modifier
+        );
+
+        // This element's shared device must already have been absorbed from a GstContext
+        // (read THIS element's per-element share, not a process-global slot).
+        let dev = vulkan_share.shared_device()?;
+        let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
+        // NV12 (8-bit, vulkanh264enc) or P010 (10-bit, vulkanh265enc Main-10) per the
+        // negotiated memory:VulkanImage format.
+        let fmt = PixFmt::from_gst(video_info.format());
+        let format_str = match fmt {
+            PixFmt::Nv12 => "NV12",
+            PixFmt::P010 => "P010_10LE",
+        };
+        let out_caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:VulkanImage"])
+            .field("format", format_str)
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("framerate", video_info.fps())
+            .build();
+        // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
+        let bt2020 = is_bt2020_matrix(&video_info.colorimetry());
+        // The converter samples the fp16 (linear) render target when it was allocated as such
+        // (WOLF_HDR_SPIKE / WOLF_HDR_CM); the input format -- not the env -- selects the shader.
+        let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
+        let vulkan = VulkanNv12::new_on_shared(
+            dev, raw, &out_caps, &profile, w, h, fmt, bt2020, fp16_input,
+        )?;
+        Some(GsVulkanBuf {
+            rgba,
+            vulkan: Arc::new(Mutex::new(vulkan)),
+            video_info,
+        })
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct GsCUDABuf {
@@ -202,8 +428,25 @@ impl GsCUDABuf {
 pub enum GsBufferType {
     RAW(GsGlesbuffer),
     DMA(GsDmaBuf),
+    NV12(GsNv12Buf),
+    VULKAN(GsVulkanBuf),
     #[cfg(feature = "cuda")]
     CUDA(GsCUDABuf),
+}
+
+impl GsBufferType {
+    /// The fourcc of the RGBA dmabuf the scene is rendered into for the Vulkan-converter buffer
+    /// types (NV12/VULKAN) -- i.e. the GLES render target that is also the converter's input.
+    /// `None` for buffer types without a separate RGBA render target. The HDR spike uses this to
+    /// confirm the render target is fp16 (`Abgr16161616f`) before reading it back off the GLES
+    /// framebuffer.
+    pub fn render_rgba_fourcc(&self) -> Option<DrmFourcc> {
+        match self {
+            GsBufferType::NV12(b) => Some(b.rgba.format().code),
+            GsBufferType::VULKAN(b) => Some(b.rgba.format().code),
+            _ => None,
+        }
+    }
 }
 
 pub enum VideoInfoTypes {
@@ -218,6 +461,7 @@ pub trait GsBuffer<R: Renderer> {
         &self,
         target: &mut GlesTarget,
         renderer: &mut R,
+        pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>>;
 
     // Returns the underlying VideoInfo or VideoInfoDmaDrm
@@ -229,6 +473,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         match self {
             GsBufferType::RAW(buffer) => renderer.bind(&mut buffer.buffer),
             GsBufferType::DMA(buffer) => renderer.bind(&mut buffer.buffer),
+            // NV12 mode renders the scene into the RGBA dmabuf; Vulkan converts it
+            // to NV12 in to_gs_buffer().
+            GsBufferType::NV12(buffer) => renderer.bind(&mut buffer.rgba),
+            // Vulkan-encode path: render into the RGBA dmabuf; convert in to_gs_buffer().
+            GsBufferType::VULKAN(buffer) => renderer.bind(&mut buffer.rgba),
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => renderer.bind(&mut buffer.buffer),
         }
@@ -239,6 +488,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
+        pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         match self {
             GsBufferType::RAW(buffer) => {
@@ -308,7 +558,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
-                                .alloc_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
+                                .alloc_dmabuf_with_flags(
+                                    fd,
+                                    allocation_size,
+                                    FdMemoryFlags::DONT_CLOSE,
+                                )
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);
@@ -341,6 +595,16 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 }
                 Ok(gst_buffer)
             }
+            GsBufferType::NV12(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.to_gst_buffer()
+            }
+            GsBufferType::VULKAN(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.to_gst_buffer()
+            }
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
                 let cuda_ctx = buffer.cuda_context.lock().unwrap();
@@ -361,6 +625,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
+        pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         match self {
             GsBufferType::RAW(buffer) => {
@@ -427,7 +692,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                         let memory = unsafe {
                             buffer
                                 .gst_allocator
-                                .alloc_with_flags(fd, allocation_size, FdMemoryFlags::DONT_CLOSE)
+                                .alloc_dmabuf_with_flags(
+                                    fd,
+                                    allocation_size,
+                                    FdMemoryFlags::DONT_CLOSE,
+                                )
                                 .expect("Failed to allocate memory")
                         };
                         gst_buffer.append_memory(memory);
@@ -460,6 +729,16 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 }
                 Ok(gst_buffer)
             }
+            GsBufferType::NV12(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.to_gst_buffer()
+            }
+            GsBufferType::VULKAN(buffer) => {
+                let mut v = buffer.vulkan.lock().unwrap();
+                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.to_gst_buffer()
+            }
         }
     }
 
@@ -467,6 +746,10 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         match self {
             GsBufferType::RAW(buffer) => VideoInfoTypes::VideoInfo(buffer.video_info.clone()),
             GsBufferType::DMA(buffer) => VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone()),
+            GsBufferType::NV12(buffer) => {
+                VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())
+            }
+            GsBufferType::VULKAN(buffer) => VideoInfoTypes::VideoInfo(buffer.video_info.clone()),
             #[cfg(feature = "cuda")]
             GsBufferType::CUDA(buffer) => {
                 VideoInfoTypes::VideoInfoDmaDrm(buffer.video_info.clone())
@@ -641,7 +924,7 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.unwrap().buffer, 10, 10);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer)
+            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
             .expect("Failed to convert buffer");
         assert!(gst_buffer.is_writable());
         assert_eq!(gst_buffer.size(), video_info.size());
@@ -717,7 +1000,7 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer)
+            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
             .expect("Failed to convert buffer");
         let gst_buffer_size = gst_buffer.size();
         assert!(gst_buffer_size >= 4096); // There might be padding but it should at least contain our data
@@ -768,14 +1051,18 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "needs an Nvidia GPU + CUDA; run via ci/harness.sh gpu"]
     fn test_cuda_buffer() {
         test_init();
-        cuda::init_cuda().expect("Failed to initialize CUDA");
+        if cuda::init_cuda().is_err() {
+            skip!("CUDA not available");
+        }
         let w = 100;
         let h = 100;
 
-        let render_node =
-            DrmNode::from_path("/dev/dri/renderD129").expect("Failed to create render node");
+        let Some(render_node) = pick_render_node(&["nvidia"]) else {
+            skip!("no Nvidia render node");
+        };
         let mut renderer = setup_renderer(Some(render_node));
         let caps = gst_video::VideoCapsBuilder::new()
             .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
@@ -833,7 +1120,9 @@ mod tests {
             Arc::new(Mutex::new(Some(buffer_pool))),
             &egl_display,
         );
-        assert!(raw_buffer.is_some());
+        if raw_buffer.is_none() {
+            skip!("GsCUDABuf allocation unsupported on this GPU");
+        }
 
         let mut buffer = GsBufferType::CUDA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
@@ -843,7 +1132,7 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer)
+            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
             .expect("Failed to convert buffer");
 
         let gst_buffer_size = gst_buffer.size();

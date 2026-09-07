@@ -101,6 +101,61 @@ In order to support this we leverage `gst-cuda-1.0` which adds a single build de
 At runtime, you'll need to have access to `libcuda.so` but only to access and use `CUDAMemory`; you can still use
 `DMABuf` when running this plugin on a platform that doesn't support it.
 
+## Vulkan encode
+
+Setting `vulkan=true` offers NV12 and P010 as `memory:VulkanImage`. The source harvests the
+downstream encoder's `GstVulkanDevice` through a `gst.vulkan.device` context query and mints its
+output images on that same device, so `vulkanh264enc` (NV12, 8-bit) and `vulkanh265enc` (P010,
+Main-10) can view them with no copy. The RGBA to NV12/P010 conversion runs as a Vulkan compute
+shader on the encoder's device.
+
+```bash
+gst-launch-1.0 waylanddisplaysrc vulkan=true render-node=/dev/dri/renderD128 \
+  ! 'video/x-raw(memory:VulkanImage),format=NV12,width=1920,height=1080' \
+  ! vulkanh264enc ! h264parse ! fakesink
+```
+
+> [!IMPORTANT]
+> `vulkanh265enc` is not an upstream GStreamer element. It ships as `patches/vulkanh265enc.patch`
+> and has to be applied to the GStreamer tree before building; see `patches/README.md`. The
+> `docker/vulkan.Dockerfile` image applies it for you.
+
+Pin `width` and `height` in the caps. Left open, the source fixates to 1x1 and negotiation settles
+on whatever minimum the chosen encoder advertises, which is codec-specific: `vulkanh264enc` accepts
+from 128x128 and `vulkanh265enc` from 130x128 on this driver. Both produce a valid stream, just not
+at the size you probably wanted.
+
+## Environment variables
+
+These are read once at startup. Everything here is off or neutral when unset, so the default
+behaviour is what you get without setting any of them. The diagnostic ones exist for tracking
+driver bugs and are not intended for normal use.
+
+HDR and colour, all inert unless `WOLF_HDR_CM` is set:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `WOLF_HDR_CM` | unset | Advertise `wp_color_manager_v1` and `frog_color_management_v1`, and pick the PQ-passthrough shader per frame when a client submits already-PQ 10-bit content. Gates every other entry in this table. |
+| `WOLF_HDR_PEAK_NITS` | `1000` | Display peak luminance advertised to the client through frog, in nits. Match it to the target TV. Max-full-frame is derived as 40% of it. |
+| `WOLF_SDR_REFERENCE_WHITE` | `203` | SDR diffuse white in nits for the BT.2020/PQ tone-map, bound to specialization constant 0 of the converter pipelines. 203 is BT.2408 graphics white. |
+| `WOLF_HDR_MASTERING` | computed | Override the mastering-display-info string on the output caps. GStreamer format: R:G:B:W chroma coordinates scaled by 50000, then max:min luminance in 0.0001 cd/m². |
+| `WOLF_HDR_CLL` | computed | Override content-light-level as `maxCLL:maxFALL` in cd/m². |
+
+Vulkan encode:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `WOLF_VULKAN_LINEAR_ENCSRC` | unset | Allocate the encode-src image `LINEAR` instead of tiled. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR to tiled `vkCmdCopyImage`. Falls back to tiled if the LINEAR allocation is rejected. |
+| `WOLF_VULKAN_RING` | `4` | Number of encode-src ring slots cycled, 1 to 4. `1` pins a single slot, which isolates whether per-slot image addresses are behind a tiling artifact. **`1` is a diagnostic, not a streaming setting.** The reuse gate waits for a slot's buffer to become writable. At 4 slots the ring rotates past a slot that is still referenced downstream. At 1 slot there is nothing to rotate to, so every frame waits the full 1s timeout, drops, and re-emits the previous output. Ordinary in-flight references are enough on their own: 0.45 fps measured on an RTX 5090 with `enable-last-sample=false` already set on the sink. Leaving `enable-last-sample` on, which is the `GstBaseSink` default, pins the newest buffer too and makes it worse. Use `1` to inspect per-slot image addresses, not to stream. |
+
+Diagnostics:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `WOLF_VULKAN_DUMP` | unset | Path to write one raw NV12 frame of the converter's output, taken before the encode-src copy. Distinguishes conversion corruption from downstream corruption. |
+| `WOLF_VULKAN_DUMP_FRAME` | `20` | Which frame `WOLF_VULKAN_DUMP` captures. Raise it to let a client connect and paint first. |
+| `WOLF_HDR_SPIKE` | unset | Draw synthetic above-1.0 brightness bars across the top of the output and read the framebuffer back once, to check whether GLES preserved or clamped them. Changes what is rendered, so do not leave it set. |
+
 ## Run without a GPU
 
 If you don't have a GPU, you can still run this plugin without it; just use the option `render_node=software` to enable it. Example pipeline:

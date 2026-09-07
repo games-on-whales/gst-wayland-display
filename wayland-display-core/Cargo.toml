@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-cuda = ["dep:libloading"]
+cuda = []
 
 [dependencies]
 gst.workspace = true
@@ -24,11 +24,28 @@ once_cell.workspace = true
 wayland-backend = "0.3.15"
 wayland-server = { version = "0.31.13", features = ["libwayland_1_23"] }
 wayland-scanner = "0.31.10"
-gstreamer-allocators = { version = "0.23.2", package = "gstreamer-allocators", features = ["v1_24", "v1_16"] }
-libloading = { version = "0.8.9", optional = true }
+gstreamer-allocators = { version = "0.25", package = "gstreamer-allocators", features = ["v1_24", "v1_16"] }
+# Safe bindings to libgstvulkan-1.0 for the shared-device (interpipe) encode path:
+# GstVulkanInstance/Device shared via GstContext, a GstVulkanImageBufferPool of
+# encode-src NV12 images, and recovering the VkImage to run our compute shader on the
+# encoder's device. v1_28 for the encode buffer-pool API.
+gstreamer-vulkan = { version = "0.25", package = "gstreamer-vulkan", features = ["v1_28"] }
+# Raw FFI to libgstvulkan-1.0: the vk-typed calls (config_set_allocation_params,
+# select_queue, get_physical_device, gst_is_vulkan_image_memory) are unbound in the safe
+# crate (gir skips Vulkan types), and we read VkDevice/VkImage from the public structs.
+gstreamer-vulkan-sys = { version = "0.25", package = "gstreamer-vulkan-sys" }
+libloading = "0.8.9"
+# Vulkan, for the cross-vendor RGBA->NV12 converter (imports the compositor's RGBA
+# dmabuf, runs a compute shader, exports a LINEAR NV12 dmabuf the encoders import
+# zero-copy). Loaded dynamically so a missing loader is a runtime, not link, error.
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+# For attaching a sync_file to the exported dmabuf (DMA_BUF_IOCTL_IMPORT_SYNC_FILE),
+# so implicit-sync consumers (VA encoders) track our Vulkan write.
+libc = "0.2"
 
 [build-dependencies]
 pkg-config = "0.3"
+cc = "1"
 
 [dev-dependencies]
 tracing-subscriber = "0.3.18"

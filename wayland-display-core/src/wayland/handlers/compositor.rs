@@ -1,4 +1,5 @@
 use smithay::{
+    backend::allocator::{Buffer as _, Fourcc},
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
@@ -25,6 +26,69 @@ use smithay::{
 };
 
 use crate::comp::{ClientState, FocusTarget, State};
+
+/// Whether `WOLF_HDR_CM` is set (read once). Gates the per-surface client-buffer-format
+/// logging below, which would otherwise be hot in the commit path.
+fn hdr_cm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("WOLF_HDR_CM").is_ok())
+}
+
+/// WOLF_HDR_CM diagnostic: log the fourcc (and modifier) of the dmabuf a client just
+/// committed to `surface`, so we can see what pixel format an HDR game actually submits
+/// (e.g. `Abgr16161616f` for scRGB-fp16, `Abgr2101010` for 10-bit). Logged only when the
+/// fourcc changes per surface (avoids per-frame spam); SHM / non-dmabuf buffers are skipped.
+fn log_client_buffer_fourcc(surface: &WlSurface) {
+    use std::cell::Cell;
+    with_states(surface, |states| {
+        // BufferAssignment isn't Clone, so match the committed buffer by reference and pull
+        // out just the (Copy) fourcc + modifier; the cached_state guard stays alive for the
+        // borrow.
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        let (fourcc, modifier) = match &attrs.current().buffer {
+            Some(BufferAssignment::NewBuffer(buffer)) => match get_dmabuf(buffer) {
+                Ok(dmabuf) => (dmabuf.format().code, dmabuf.format().modifier),
+                Err(_) => return, // not a dmabuf (e.g. SHM); nothing to report
+            },
+            _ => return,
+        };
+        let last = states
+            .data_map
+            .get_or_insert::<Cell<Option<Fourcc>>, _>(|| Cell::new(None));
+        if last.get() != Some(fourcc) {
+            last.set(Some(fourcc));
+            tracing::info!(
+                surface = ?surface.id(),
+                "client_buffer fourcc={fourcc:?} modifier={modifier:?}"
+            );
+        }
+    });
+}
+
+/// The fourcc of the dmabuf the client just committed to `surface`, or `None` for an SHM /
+/// non-dmabuf / no buffer commit. Used by the WOLF_HDR_CM per-frame PQ-passthrough decision.
+fn committed_dmabuf_fourcc(surface: &WlSurface) -> Option<Fourcc> {
+    with_states(surface, |states| {
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        match &attrs.current().buffer {
+            Some(BufferAssignment::NewBuffer(buffer)) => {
+                get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.format().code)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// True for the 10-bit packed RGB fourccs gamescope emits for already-PQ BT.2020 HDR output
+/// (XB30/AB30/XR30/AR30). Such a frame is already PQ-encoded, so the converter must take the
+/// matrix-only passthrough path rather than re-applying the PQ tone-map.
+fn is_pq_fourcc(fourcc: Fourcc) -> bool {
+    matches!(
+        fourcc,
+        Fourcc::Xbgr2101010 | Fourcc::Abgr2101010 | Fourcc::Xrgb2101010 | Fourcc::Argb2101010
+    )
+}
 
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
@@ -100,6 +164,26 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // WOLF_HDR_CM: read the just-committed dmabuf fourcc ONCE, here, BEFORE the
+        // window/popup commits below advance the surface's double-buffered state (which would
+        // consume current().buffer and make a later read return None -- that was the bug). One
+        // read drives both the diagnostic log and the per-frame PQ-passthrough decision.
+        // gamescope presents ONE composited output surface whose buffer fourcc flips 8-bit
+        // (Steam UI -> SDR) <-> 10-bit (HDR game -> already-PQ); the converter uses
+        // current_input_is_pq to pick the matrix-only passthrough vs the SDR->PQ tone-map.
+        // Off (no-op) unless WOLF_HDR_CM is set. Cursors here are MemoryRenderBuffers, not
+        // client dmabufs, so they don't perturb this.
+        if hdr_cm_enabled() {
+            log_client_buffer_fourcc(surface);
+            if let Some(fourcc) = committed_dmabuf_fourcc(surface) {
+                let pq = is_pq_fourcc(fourcc);
+                if self.current_input_is_pq != pq {
+                    self.current_input_is_pq = pq;
+                    tracing::info!("pq_passthrough -> {pq} (fourcc={fourcc:?})");
+                }
+            }
+        }
 
         if let Some(window) = self
             .space

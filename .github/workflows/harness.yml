@@ -12,26 +12,27 @@ jobs:
     name: harness (lint · build · unit)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/games-on-whales/gstreamer:1.26.7
+      # The project's own image: patched GStreamer 1.28 at /opt/gst (gstreamer-rs
+      # 0.25 needs >= 1.28; the old gstreamer:1.26.7 base is too old) plus all the
+      # build deps. PKG_CONFIG_PATH/LD_LIBRARY_PATH are baked into the image ENV.
+      image: ghcr.io/games-on-whales/gst-wayland-display:vulkan
     steps:
       - uses: actions/checkout@v4
 
       - name: System dependencies
+        # Image already carries the gst-1.28 + link deps; only ensure the extras
+        # the harness's non-GPU phases need are present (idempotent on Fedora).
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl ca-certificates git libssl-dev libicu76 \
-            libwayland-dev libinput-dev libxkbcommon-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev libudev-dev libclang-dev clang \
-            libgl1-mesa-dri libegl-mesa0 mesa-vulkan-drivers hwdata \
-            librust-gstreamer-allocators-dev
+          dnf install -y \
+            git openssl-devel libicu \
+            wayland-devel libinput-devel libxkbcommon-devel mesa-libgbm-devel \
+            mesa-libEGL-devel mesa-libGLES-devel systemd-devel clang clang-devel
 
       - name: Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal \
-                --default-toolchain "${RUST_VERSION:-1.89.0}" --component rustfmt
+                --default-toolchain "${RUST_VERSION:-1.94.0}" --component rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Harness
