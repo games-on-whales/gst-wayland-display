@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::State;
@@ -12,8 +13,9 @@ use smithay::{
         },
     },
     desktop::space::render_output,
-    input::pointer::CursorImageStatus,
+    input::pointer::{CursorImageAttributes, CursorImageStatus},
     render_elements,
+    wayland::compositor::with_states,
 };
 
 pub const CURSOR_DATA_BYTES: &[u8] = include_bytes!("../../resources/cursor.rgba");
@@ -33,9 +35,10 @@ impl State {
         assert!(self.video_info.is_some());
         assert!(self.output_buffer.is_some());
 
-        let elements =
-            if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
-                match &self.cursor_state {
+        let elements = if Instant::now().duration_since(self.last_pointer_movement)
+            < Duration::from_secs(5)
+        {
+            match &self.cursor_state {
                 CursorImageStatus::Named(_cursor_icon) => vec![CursorElement::Memory(
                     // TODO: icon?
                     MemoryRenderBufferRenderElement::from_buffer(
@@ -50,10 +53,27 @@ impl State {
                     .map_err(OutputDamageTrackerError::Rendering)?,
                 )],
                 CursorImageStatus::Surface(wl_surface) => {
+                    // A client submits its cursor image together with a HOTSPOT:
+                    // the point inside the image that must sit on the pointer
+                    // (an arrow's tip, a crosshair's centre). Render at
+                    // pointer - hotspot, exactly as smithay's own anvil example
+                    // does. Without this, every client whose hotspot is not
+                    // (0,0) has its cursor drawn offset by the hotspot —
+                    // invisible for conventional arrows (hotspot ~0,0), glaring
+                    // for centre-hotspot cursors (Mindustry ships 64x64 cursors
+                    // with a (32,32) hotspot: drawn 32px down-right of the real
+                    // pointer, so clicks land up-left of the visible cursor).
+                    let hotspot = with_states(wl_surface, |states| {
+                        states
+                            .data_map
+                            .get::<Mutex<CursorImageAttributes>>()
+                            .map(|attrs| attrs.lock().unwrap().hotspot)
+                            .unwrap_or_else(|| (0, 0).into())
+                    });
                     smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                         &mut self.renderer,
                         wl_surface,
-                        self.pointer_location.to_physical_precise_round(1),
+                        (self.pointer_location - hotspot.to_f64()).to_physical_precise_round(1),
                         1.,
                         1.,
                         Kind::Cursor,
@@ -61,9 +81,9 @@ impl State {
                 }
                 CursorImageStatus::Hidden => vec![],
             }
-            } else {
-                vec![]
-            };
+        } else {
+            vec![]
+        };
 
         let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
 
