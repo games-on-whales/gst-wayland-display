@@ -45,7 +45,10 @@ use smithay::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
         },
     },
-    utils::{Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
+    utils::{
+        Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, SERIAL_COUNTER, Size,
+        Transform,
+    },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
@@ -304,6 +307,39 @@ impl State {
             viewporter_state,
             single_pixel_buffer_state,
         }
+    }
+
+    /// Release the seat's keyboard before the compositor state is dropped.
+    ///
+    /// smithay mints one sealed `memfd:smithay-keymap` per [`Seat::add_keyboard`]
+    /// (`KeymapFile::new`) and keeps it in the `Arc<KbdRc>` behind the seat's
+    /// `KeyboardHandle`. Dropping `State` is NOT guaranteed to close it, because the
+    /// keyboard's *own* grab slot lives inside that same `KbdRc`
+    /// (`input/keyboard/mod.rs`: `KbdInternal::grab`) while every grab smithay hands us
+    /// carries a clone of the handle it is installed on -- `PopupKeyboardGrab` wraps a
+    /// `PopupGrab`, whose `keyboard_handle` field is exactly that clone
+    /// (`desktop/wayland/popup/grab.rs`), and one is installed for every `xdg_popup.grab`
+    /// (`wayland/handlers/xdg.rs`). A grab still active when the session ends is therefore
+    /// an `Arc` pointing at itself: no drop of ours can reach it, and the keymap memfd
+    /// stays open for the lifetime of the *process*, not the session.
+    ///
+    /// So end the session by hand instead of relying on the object graph unwinding: unset
+    /// any surviving grab (this is what breaks the cycle), clear focus, and drop the seat's
+    /// own handle. Whatever the client left behind, the fd is closed here.
+    ///
+    /// Upstream candidate for smithay itself: unset the grab when the last non-grab
+    /// reference to a `KeyboardHandle` goes away, or hold the grab's handle weakly.
+    pub(crate) fn release_seat(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if keyboard.is_grabbed() {
+            tracing::debug!("Unsetting a keyboard grab still active at shutdown.");
+            keyboard.unset_grab(self);
+        }
+        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        drop(keyboard);
+        self.seat.remove_keyboard();
     }
 }
 
@@ -789,4 +825,9 @@ pub(crate) fn init(
     }) {
         tracing::error!(?err, "Event loop broke.");
     }
+
+    // Close the seat's keymap memfd before `state` drops. A grab left active by the client
+    // makes the keyboard's Arc self-referential, so dropping `state` alone leaks one
+    // `memfd:smithay-keymap` per session -- see [`State::release_seat`].
+    state.release_seat();
 }
