@@ -28,3 +28,6 @@ gen
 *.app
 .snapshots/*
 
+# Nix
+/result
+/result-*

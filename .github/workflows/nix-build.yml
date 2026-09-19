@@ -1,0 +1,26 @@
+name: "Nix flake build"
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Build nix flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v13
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Check flake
+        run: nix flake check
+
+      - name: Build package
+        run: nix build .#gst-wayland-display --print-build-logs
+
+      - name: Build default package
+        run: nix build --print-build-logs
