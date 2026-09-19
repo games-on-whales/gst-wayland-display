@@ -9,6 +9,7 @@ use smithay::reexports::gbm::BufferObjectFlags;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::{
     backend::{
         allocator::{Fourcc, dmabuf::Dmabuf},
@@ -128,6 +129,8 @@ pub struct State {
     cursor_element: MemoryRenderBuffer,
     pub cursor_state: CursorImageStatus,
     surpressed_keys: HashSet<u32>,
+    /// Pointer buttons currently held down on behalf of a pen (clients without tablet-v2 support)
+    pub(crate) tablet_emulated_buttons: HashSet<u32>,
     pub pending_windows: Vec<Window>,
     input_context: Libinput,
 
@@ -145,6 +148,7 @@ pub struct State {
     pub shell_state: XdgShellState,
     pub shm_state: ShmState,
     viewporter_state: ViewporterState,
+    tablet_manager_state: TabletManagerState,
     cursor_event_count: i32,
     pub single_pixel_buffer_state: SinglePixelBufferState,
 }
@@ -167,6 +171,7 @@ impl State {
         let relative_ptr_state = RelativePointerManagerState::new::<State>(&dh);
         let pointer_constraints_state = PointerConstraintsState::new::<State>(&dh);
         let mut seat_state = SeatState::new();
+        let tablet_manager_state = TabletManagerState::new::<State>(dh);
         let shell_state = XdgShellState::new::<State>(&dh);
         let viewporter_state = ViewporterState::new::<State>(&dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
@@ -286,6 +291,7 @@ impl State {
             cursor_state: CursorImageStatus::default_named(),
             cursor_event_count: 0,
             surpressed_keys: HashSet::new(),
+            tablet_emulated_buttons: HashSet::new(),
             pending_windows: Vec::new(),
             input_context: input_context.clone(),
 
@@ -303,6 +309,7 @@ impl State {
             shm_state,
             viewporter_state,
             single_pixel_buffer_state,
+            tablet_manager_state,
         }
     }
 }

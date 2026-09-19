@@ -1,8 +1,9 @@
 use smithay::{
-    delegate_seat,
+    backend::input::TabletToolDescriptor,
+    delegate_seat, delegate_tablet_manager,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::wayland_server::Resource,
-    wayland::selection::data_device::set_data_device_focus,
+    wayland::{selection::data_device::set_data_device_focus, tablet_manager::TabletSeatHandler},
 };
 
 use crate::comp::{FocusTarget, State};
@@ -34,3 +35,12 @@ impl SeatHandler for State {
 }
 
 delegate_seat!(State);
+
+impl TabletSeatHandler for State {
+    fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
+        // The pen drives the same cursor as the pointer
+        self.cursor_state = image;
+    }
+}
+
+delegate_tablet_manager!(State);
