@@ -24,6 +24,13 @@ use wayland_protocols::{
         relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         relative_pointer::zv1::client::zwp_relative_pointer_v1,
         relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        tablet::zv2::client::{
+            zwp_tablet_manager_v2::ZwpTabletManagerV2,
+            zwp_tablet_pad_v2::ZwpTabletPadV2,
+            zwp_tablet_seat_v2::{self, ZwpTabletSeatV2},
+            zwp_tablet_tool_v2::{self, ZwpTabletToolV2},
+            zwp_tablet_v2::ZwpTabletV2,
+        },
         viewporter::client::wp_viewport::WpViewport,
         viewporter::client::wp_viewporter::WpViewporter,
     },
@@ -44,8 +51,18 @@ pub enum MouseEvents {
     Relative(zwp_relative_pointer_v1::Event),
 }
 
+#[derive(Debug)]
+pub enum TabletEvents {
+    Seat(zwp_tablet_seat_v2::Event),
+    Tool(zwp_tablet_tool_v2::Event),
+}
+
 struct State {
     qh: QueueHandle<State>,
+
+    tablet_manager: Option<ZwpTabletManagerV2>,
+    tablet_seat: Option<ZwpTabletSeatV2>,
+    pub tablet_events: Vec<TabletEvents>,
 
     compositor: Option<wl_compositor::WlCompositor>,
     buffer: Option<wl_buffer::WlBuffer>,
@@ -134,6 +151,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.pointer_constraints =
                         Some(registry.bind::<ZwpPointerConstraintsV1, _, _>(name, version, qh, ()))
                 }
+                "zwp_tablet_manager_v2" => {
+                    state.tablet_manager =
+                        Some(registry.bind::<ZwpTabletManagerV2, _, _>(name, version, qh, ()));
+                }
                 "zwp_relative_pointer_manager_v1" => {
                     state.relative_pointer_manager = Some(
                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
@@ -163,6 +184,43 @@ delegate_noop!(State: ignore WpViewport);
 delegate_noop!(State: ignore ZwpPointerConstraintsV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
 delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
+delegate_noop!(State: ignore ZwpTabletManagerV2);
+delegate_noop!(State: ignore ZwpTabletV2);
+delegate_noop!(State: ignore ZwpTabletPadV2);
+
+impl Dispatch<ZwpTabletSeatV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpTabletSeatV2,
+        event: zwp_tablet_seat_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        state.tablet_events.push(TabletEvents::Seat(event));
+    }
+
+    wayland_client::event_created_child!(State, ZwpTabletSeatV2, [
+        zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (ZwpTabletV2, ()),
+        zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (ZwpTabletToolV2, ()),
+        zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (ZwpTabletPadV2, ()),
+    ]);
+}
+
+impl Dispatch<ZwpTabletToolV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        state.tablet_events.push(TabletEvents::Tool(event));
+    }
+}
 
 impl WaylandClient {
     pub fn new(w_socket: UnixStream) -> Self {
@@ -176,6 +234,10 @@ impl WaylandClient {
 
         let state = State {
             qh: qh.clone(),
+
+            tablet_manager: None,
+            tablet_seat: None,
+            tablet_events: Vec::new(),
 
             compositor: None,
             buffer: None,
@@ -231,6 +293,21 @@ impl WaylandClient {
         window.attach_new_buffer(self.state.buffer.as_ref().unwrap());
         window.set_size(width, height);
         window.ack_last_and_commit();
+    }
+
+    /// Makes this client "tablet aware": it'll receive zwp_tablet_v2 events from now on
+    pub fn enable_tablet(&mut self) {
+        let manager = self
+            .state
+            .tablet_manager
+            .as_ref()
+            .expect("compositor doesn't expose zwp_tablet_manager_v2");
+        let seat = self.state.seat.as_ref().expect("no wl_seat");
+        self.state.tablet_seat = Some(manager.get_tablet_seat(seat, &self.qh, ()));
+    }
+
+    pub fn get_tablet_events(&mut self) -> &mut Vec<TabletEvents> {
+        self.state.tablet_events.as_mut()
     }
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
