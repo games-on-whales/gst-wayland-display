@@ -14,6 +14,7 @@ use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicPtr;
 
 mod ffi;
 
@@ -159,6 +160,31 @@ pub fn init_cuda() -> Result<(), String> {
         }
     } else {
         Ok(())
+    }
+}
+
+/// An element's `GstCudaContext **` for the gst_cuda context helpers.
+///
+/// The helpers only ever write a `(transfer full)` reference into an empty slot,
+/// so a set slot owns exactly one reference, released when the slot is dropped
+/// with its element. [`CUDAContext`] wrappers built from it take their own.
+#[derive(Debug, Default)]
+pub struct CudaContextSlot(AtomicPtr<GstCudaContext>);
+
+impl CudaContextSlot {
+    /// The slot for the helpers. It stays valid as long as `self`, and the helpers
+    /// may write it while the caller holds no lock (they re-enter the element).
+    pub fn as_ptr(&self) -> *mut *mut GstCudaContext {
+        self.0.as_ptr()
+    }
+}
+
+impl Drop for CudaContextSlot {
+    fn drop(&mut self) {
+        let ptr = *self.0.get_mut();
+        if !ptr.is_null() {
+            unsafe { gst::ffi::gst_object_unref(ptr as *mut gst::ffi::GstObject) };
+        }
     }
 }
 
@@ -386,96 +412,60 @@ impl CUDAContext {
         })
     }
 
-    /// Make the slot's `GstCudaContext` safe for a [`CUDAContext`] wrapper to OWN.
+    /// Wrap the context `gst_cuda_ensure_element_context()` /
+    /// `gst_cuda_handle_set_context()` left in `slot`, taking a reference of the
+    /// wrapper's own.
     ///
-    /// Both `gst_cuda_ensure_element_context()` and `gst_cuda_handle_set_context()` open
-    /// with the same short-circuit (gst-plugins-bad `gstcudautils.c`):
+    /// The wrapper never takes over the helpers' `(transfer full)` reference: that
+    /// one belongs to the [`CudaContextSlot`]. Whether a call transferred anything
+    /// cannot be told from the slot alone. Both helpers short-circuit to SUCCESS,
+    /// transferring nothing, when the slot is already set, and the call re-enters
+    /// `waylanddisplaysrc::set_context()` synchronously:
+    /// - when the helper CREATES the context, it publishes it with
+    ///   `gst_element_set_context()` while the slot is already set, so the inner
+    ///   call short-circuits;
+    /// - when it posts NEED_CONTEXT and the application answers (Wolf hands every
+    ///   pipeline one cached context), the inner call fills the slot and the outer
+    ///   call then finds the slot newly set although nothing was transferred to it.
     ///
-    /// ```c
-    ///   /* If we had context already, will not replace it */
-    ///   if (*cuda_ctx)
-    ///     return TRUE;
-    /// ```
-    ///
-    /// i.e. they report SUCCESS while transferring NOTHING. Every other SUCCESS path is
-    /// `(transfer full)` into the slot. [`CUDAContext::drop`] unconditionally
-    /// `gst_object_unref()`s `self.ptr`, so a wrapper built off that short-circuit
-    /// destroys a reference it never owned.
-    ///
-    /// That is exactly what happens on the compositor's OWN context.
-    /// `new_from_gstreamer()` calls `gst_cuda_ensure_element_context()`, which creates the
-    /// context (rc=1, into the slot) and publishes it -- and that publish re-enters
-    /// `waylanddisplaysrc::set_context()` SYNCHRONOUSLY, from inside the very call, with the
-    /// context it is still in the middle of creating. Confirmed live by a leaks-tracer
-    /// creation stack showing `gst_cuda_ensure_element_context` sandwiched BETWEEN two
-    /// waylanddisplaysrc frames.
-    ///
-    /// The re-entrancy is what makes the bug stick, because it inverts which wrapper is
-    /// kept: at re-entry `settings.cuda_context` is still `None` (the outer call has not
-    /// returned yet), so it is the INNER, non-owning wrapper -- the one built off the
-    /// short-circuit -- that gets STORED, and the OUTER wrapper, holding the one legitimate
-    /// `(transfer full)` reference, that `imp.rs` drops when the outer call finally returns
-    /// and finds `settings.cuda_context` already `Some`.
-    ///
-    /// So the session runs with the context held only by the published `GstContext` (plus
-    /// any `GstCudaStream`), while `settings.cuda_context` owns nothing but believes it
-    /// does. At teardown it drops => rc hits 0 => the `GstCudaContext` is finalized while
-    /// the pipeline's stored `GstContext` still points at it. Disposing the pipeline then
-    /// walks `element->contexts`, and `_gst_context_free` -> `gst_structure_free` ->
-    /// `g_value_unset` -> `g_object_unref` lands on freed memory: **SIGSEGV in
-    /// `g_type_check_instance_is_fundamentally_a`, at the end of every session teardown**.
-    ///
-    /// It only bites when nothing else outlives the pipeline: with an application-injected
-    /// context (a host that pins one `GstCudaContext` for the process lifetime, e.g.
-    /// Quasar's NVENC path) the extra owner keeps rc >= 1 and the same defect is invisible.
-    ///
-    /// Detecting the short-circuit is unambiguous: it is the only success path that leaves
-    /// the slot pointing at the same non-NULL object it held before the call.
+    /// Inferring ownership from the slot's before/after value got the second case
+    /// wrong: two wrappers owned the one transferred reference and the extra one was
+    /// dropped, so every pipeline released the application's cached context once
+    /// more than it took it, until it was finalized under a live pipeline.
     ///
     /// # Safety
-    /// `cuda_raw_ptr` must be a valid, readable slot, and `pre` must be the value read from
-    /// that same slot immediately before the call being adopted.
-    unsafe fn adopt_slot_ref(pre: *mut GstCudaContext, cuda_raw_ptr: *mut *mut GstCudaContext) {
-        // Edition 2024: `unsafe_op_in_unsafe_fn` warns by default, so an `unsafe fn` body
-        // still needs its own block.
-        unsafe {
-            let post = *cuda_raw_ptr;
-            if !post.is_null() && post == pre {
-                gst::ffi::gst_object_ref(post as *mut gst::ffi::GstObject);
-            }
+    /// `slot` must point at a valid slot holding a live `GstCudaContext`.
+    unsafe fn from_slot(slot: *mut *mut GstCudaContext) -> Self {
+        let ptr = unsafe { *slot };
+        unsafe { gst::ffi::gst_object_ref(ptr as *mut gst::ffi::GstObject) };
+        let stream = unsafe { ffi::gst_cuda_stream_new(ptr) };
+        CUDAContext {
+            ptr,
+            stream: if stream.is_null() {
+                None
+            } else {
+                Some(StreamHandle { stream })
+            },
         }
     }
 
     pub fn new_from_gstreamer(
         element: &Element,
         default_device_id: c_int,
-        cuda_raw_ptr: *mut *mut GstCudaContext,
+        slot: &CudaContextSlot,
     ) -> Result<Self, String> {
-        // The slot value BEFORE the call: `gst_cuda_ensure_element_context()` starts with
-        // `if (*cuda_ctx) return TRUE;` -- it reports success WITHOUT transferring a
-        // reference when the slot is already populated. See `adopt_slot_ref` above.
-        let pre = unsafe { *cuda_raw_ptr };
         let result = unsafe {
             ffi::gst_cuda_ensure_element_context(
                 element.to_glib_none().0,
                 default_device_id,
-                cuda_raw_ptr,
+                slot.as_ptr(),
             )
         };
 
         if result == glib_ffi::GFALSE {
             Err("Failed to create CUDA context".into())
         } else {
-            unsafe { Self::adopt_slot_ref(pre, cuda_raw_ptr) };
-            let stream = unsafe { ffi::gst_cuda_stream_new(*cuda_raw_ptr) };
-            Ok(CUDAContext {
-                ptr: unsafe { *cuda_raw_ptr },
-                stream: if stream.is_null() {
-                    None
-                } else {
-                    Some(StreamHandle { stream })
-                },
-            })
+            Ok(unsafe { Self::from_slot(slot.as_ptr()) })
         }
     }
 
@@ -483,34 +473,21 @@ impl CUDAContext {
         element: &Element,
         context: &Context,
         default_device_id: c_int,
-        cuda_raw_ptr: *mut *mut GstCudaContext,
+        slot: &CudaContextSlot,
     ) -> Result<Self, String> {
-        // Same short-circuit as `new_from_gstreamer` above: `gst_cuda_handle_set_context()`
-        // reports success without transferring a reference when the slot is already
-        // populated. See `adopt_slot_ref`.
-        let pre = unsafe { *cuda_raw_ptr };
         let result = unsafe {
             ffi::gst_cuda_handle_set_context(
                 element.to_glib_none().0,
                 context.to_glib_none().0,
                 default_device_id,
-                cuda_raw_ptr,
+                slot.as_ptr(),
             )
         };
 
         if result == glib_ffi::GFALSE {
             Err("Failed to create CUDA context".into())
         } else {
-            unsafe { Self::adopt_slot_ref(pre, cuda_raw_ptr) };
-            let stream = unsafe { ffi::gst_cuda_stream_new(*cuda_raw_ptr) };
-            Ok(CUDAContext {
-                ptr: unsafe { *cuda_raw_ptr },
-                stream: if stream.is_null() {
-                    None
-                } else {
-                    Some(StreamHandle { stream })
-                },
-            })
+            Ok(unsafe { Self::from_slot(slot.as_ptr()) })
         }
     }
 
@@ -610,4 +587,83 @@ pub fn gst_cuda_handle_context_query_wrapped(
         )
     };
     result == glib_ffi::GTRUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::tests::test_init;
+    use gst::prelude::*;
+    use std::sync::Mutex;
+
+    unsafe extern "C" {
+        fn gst_context_new_cuda_context(cuda_ctx: *mut GstCudaContext)
+        -> *mut gst::ffi::GstContext;
+    }
+
+    fn ref_count(ctx: *mut GstCudaContext) -> u32 {
+        unsafe { (*(ctx as *mut gst::glib::gobject_ffi::GObject)).ref_count }
+    }
+
+    /// An application that answers NEED_CONTEXT with one context it keeps for
+    /// every pipeline (Wolf does) gets it back with its reference count intact.
+    /// The answer re-enters the element while `new_from_gstreamer` is still in
+    /// `gst_cuda_ensure_element_context`, as `waylanddisplaysrc::set_context`
+    /// does: the slot is filled by the inner call and only found set by the outer
+    /// one.
+    #[test]
+    fn test_application_context_survives_pipelines() {
+        test_init();
+        init_cuda().expect("Failed to initialize CUDA");
+        let app_cuda = unsafe { ffi::gst_cuda_context_new(0) };
+        assert!(!app_cuda.is_null(), "Failed to create CUDA context");
+        let app_context: Context =
+            unsafe { gst::glib::translate::from_glib_full(gst_context_new_cuda_context(app_cuda)) };
+        let baseline = ref_count(app_cuda);
+
+        for _ in 0..3 {
+            let pipeline = gst::Pipeline::new();
+            let element = gst::ElementFactory::make("identity").build().unwrap();
+            pipeline.add(&element).unwrap();
+            let slot = CudaContextSlot::default();
+            let stored: Mutex<Option<CUDAContext>> = Mutex::new(None);
+
+            let bus = pipeline.bus().unwrap();
+            let handler_element = element.clone();
+            let handler_context = app_context.clone();
+            let slot_addr = &slot as *const CudaContextSlot as usize;
+            let stored_addr = &stored as *const Mutex<Option<CUDAContext>> as usize;
+            bus.set_sync_handler(move |_, msg| {
+                if let gst::MessageView::NeedContext(_) = msg.view() {
+                    // Both outlive the pipeline run below.
+                    let slot = unsafe { &*(slot_addr as *const CudaContextSlot) };
+                    let stored = unsafe { &*(stored_addr as *const Mutex<Option<CUDAContext>>) };
+                    let ctx = CUDAContext::new_from_set_context(
+                        &handler_element,
+                        &handler_context,
+                        -1,
+                        slot,
+                    )
+                    .unwrap();
+                    stored.lock().unwrap().get_or_insert(ctx);
+                }
+                gst::BusSyncReply::Drop
+            });
+
+            let outer = CUDAContext::new_from_gstreamer(&element, -1, &slot).unwrap();
+            assert_eq!(outer.as_ptr(), app_cuda);
+            assert!(
+                stored.lock().unwrap().is_some(),
+                "NEED_CONTEXT was not answered"
+            );
+            bus.unset_sync_handler();
+            drop(outer);
+            drop(stored);
+            drop(slot);
+            assert_eq!(ref_count(app_cuda), baseline);
+        }
+
+        drop(app_context);
+        unsafe { gst::ffi::gst_object_unref(app_cuda as *mut gst::ffi::GstObject) };
+    }
 }

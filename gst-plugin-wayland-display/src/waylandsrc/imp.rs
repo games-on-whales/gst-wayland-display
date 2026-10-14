@@ -12,7 +12,6 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
@@ -34,6 +33,10 @@ pub struct WaylandDisplaySrc {
     settings: Mutex<Settings>,
     command_tx: Sender<Command>,
     command_rx: Mutex<Option<Channel<Command>>>,
+    /// Outside `settings`: the CUDA context helpers write it while re-entering
+    /// `set_context`, which takes the `settings` lock.
+    #[cfg(feature = "cuda")]
+    cuda_slot: cuda::CudaContextSlot,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -44,6 +47,8 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx,
             command_rx: Mutex::new(Some(command_rx)),
+            #[cfg(feature = "cuda")]
+            cuda_slot: Default::default(),
         }
     }
 }
@@ -55,8 +60,6 @@ pub struct Settings {
     disable_intel_workaround: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
-    #[cfg(feature = "cuda")]
-    cuda_raw_ptr: AtomicPtr<cuda::GstCudaContext>,
 }
 
 pub struct State {
@@ -478,11 +481,7 @@ impl ElementImpl for WaylandDisplaySrc {
     #[cfg(feature = "cuda")]
     fn set_context(&self, context: &Context) {
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-        let cuda_raw_ptr = {
-            let settings = self.settings.lock().unwrap();
-            settings.cuda_raw_ptr.as_ptr()
-        };
-        match CUDAContext::new_from_set_context(&elem, &context, -1, cuda_raw_ptr) {
+        match CUDAContext::new_from_set_context(&elem, &context, -1, &self.cuda_slot) {
             Ok(ctx) => {
                 let mut settings = self.settings.lock().unwrap();
                 if settings.cuda_context.is_none() {
@@ -808,11 +807,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     tracing::info!(
                         "Acquiring a CudaContext from the pipeline, you can manually set the `cuda-device-id` property to override this behavior"
                     );
-                    let cuda_raw_ptr = {
-                        let settings = self.settings.lock().unwrap();
-                        settings.cuda_raw_ptr.as_ptr()
-                    };
-                    match CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) {
+                    match CUDAContext::new_from_gstreamer(&elem, -1, &self.cuda_slot) {
                         Ok(cuda_context) => {
                             let mut settings = self.settings.lock().unwrap();
                             if settings.cuda_context.is_none() {
