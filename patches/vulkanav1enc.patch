@@ -14,7 +14,8 @@
 #     CTB/SPS round-trip failure class is structurally absent). Temporal unit
 #     assembled by concatenation: TD OBU + [seq hdr on key] + OBU_FRAME.
 #     CBR/VBR/CQP via VkVideoEncodeAV1RateControlInfoKHR (+ per-layer), 200 ms
-#     VBV default; colorimetry/chroma-site propagated to output caps.
+#     VBV default; the input colorimetry/chroma-site signalled in both the
+#     sequence header color_config and the output caps.
 #   ext/vulkan/meson.build, gstvulkan.c   registration (rank NONE, like the
 #     vulkanh265enc sibling).
 #   ext/vulkan/gstvkvideocaps.c           av1_encode_caps(): stock 1.28.4
@@ -1848,10 +1849,10 @@ index c01eb11..efeaa7b 100644
    'vkh264dec.c',
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
 new file mode 100644
-index 0000000..35b89cb
+index 0000000..ca92d71
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
-@@ -0,0 +1,2340 @@
+@@ -0,0 +1,2358 @@
 +/* GStreamer
 + * Copyright (C) 2026 Igalia, S.L.
 + *
@@ -2379,23 +2380,37 @@ index 0000000..35b89cb
 +{
 +  guint32 keyframe_period =
 +      gst_av1_encoder_get_keyframe_period (GST_AV1_ENCODER (self));
++  const GstVideoColorimetry *cinfo = &in_info->colorimetry;
++  StdVideoAV1ChromaSamplePosition chroma_pos;
++
++  /* the sequence header signals the same colorimetry and chroma siting as
++   * the output caps (trap 10); AV1 uses the ISO/IEC 23091-2 code points.
++   * AV1 can't signal centered chroma (JPEG siting), so that stays unknown. */
++  if (in_info->chroma_site == GST_VIDEO_CHROMA_SITE_COSITED)
++    chroma_pos = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_COLOCATED;
++  else if (in_info->chroma_site == GST_VIDEO_CHROMA_SITE_MPEG2)
++    chroma_pos = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_VERTICAL;
++  else
++    chroma_pos = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN;
 +
 +  /* *INDENT-OFF* */
 +  self->params.color_config = (StdVideoAV1ColorConfig) {
 +    .flags = (StdVideoAV1ColorConfigFlags) {
 +      .mono_chrome = 0,
-+      .color_range = 0,
++      .color_range = cinfo->range == GST_VIDEO_COLOR_RANGE_0_255,
 +      .separate_uv_delta_q = 0,
-+      .color_description_present_flag = 0,
++      .color_description_present_flag = 1,
 +    },
 +    .BitDepth = 8,
 +    .subsampling_x = 1,
 +    .subsampling_y = 1,
-+    .color_primaries = STD_VIDEO_AV1_COLOR_PRIMARIES_BT_UNSPECIFIED,
-+    .transfer_characteristics =
-+        STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_UNSPECIFIED,
-+    .matrix_coefficients = STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED,
-+    .chroma_sample_position = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
++    .color_primaries = (StdVideoAV1ColorPrimaries)
++        gst_video_color_primaries_to_iso (cinfo->primaries),
++    .transfer_characteristics = (StdVideoAV1TransferCharacteristics)
++        gst_video_transfer_function_to_iso (cinfo->transfer),
++    .matrix_coefficients = (StdVideoAV1MatrixCoefficients)
++        gst_video_color_matrix_to_iso (cinfo->matrix),
++    .chroma_sample_position = chroma_pos,
 +  };
 +
 +  self->params.seq_hdr = (StdVideoAV1SequenceHeader) {
@@ -2709,13 +2724,17 @@ index 0000000..35b89cb
 +  /* *INDENT-ON* */
 +
 +  if (gst_vulkan_encoder_is_started (self->encoder)) {
-+    /* profile is constant (Main, 8-bit 4:2:0), so the input resolution is
-+     * the only thing that can invalidate the running sequence */
++    /* profile is constant (Main, 8-bit 4:2:0), so only the input
++     * resolution, and the color signalling the sequence header carries,
++     * can invalidate the running sequence */
 +    if (self->in_state
 +        && GST_VIDEO_INFO_WIDTH (&self->in_state->info) ==
 +        GST_VIDEO_INFO_WIDTH (in_info)
 +        && GST_VIDEO_INFO_HEIGHT (&self->in_state->info) ==
-+        GST_VIDEO_INFO_HEIGHT (in_info)) {
++        GST_VIDEO_INFO_HEIGHT (in_info)
++        && gst_video_colorimetry_is_equal (&self->in_state->info.colorimetry,
++            &in_info->colorimetry)
++        && self->in_state->info.chroma_site == in_info->chroma_site) {
 +      /* trap 8: same sequence, the session is not restarted, but a
 +       * reconfigure may have changed the rate-control values. Re-apply
 +       * rate control via vkCmdControlVideoCoding with
@@ -2730,8 +2749,8 @@ index 0000000..35b89cb
 +      return GST_FLOW_OK;
 +    } else {
 +      /* trap 6: AV1 session parameters do not support updates; a coded
-+       * resolution change requires a fresh video session and fresh
-+       * session parameters. */
++       * resolution or color change requires a fresh video session and
++       * fresh session parameters. */
 +      GST_DEBUG_OBJECT (self, "Restarting vulkan encoder");
 +      gst_vulkan_encoder_stop (self->encoder);
 +    }
@@ -4228,6 +4247,281 @@ index 0000000..276a5cd
 +                                                                 guint rank);
 +
 +G_END_DECLS
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/vkav1enc.c b/subprojects/gst-plugins-bad/tests/check/elements/vkav1enc.c
+new file mode 100644
+index 0000000..6640aa0
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/tests/check/elements/vkav1enc.c
+@@ -0,0 +1,269 @@
++/* GStreamer
++ *
++ * Copyright (C) 2026 GStreamer developers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/* Bitstream checks for vulkanav1enc: parse what the encoder produces and
++ * check that every sequence header signals the same color as the output
++ * caps it goes out with (color range, primaries, transfer characteristics,
++ * matrix coefficients and chroma sample position), and that both carry the
++ * input's colorimetry. The input switches colorimetry mid-stream at the same
++ * resolution, so a sequence that keeps running with stale color signalling
++ * fails too.
++ *
++ * The element is only registered when a Vulkan device with an AV1 video
++ * encode queue is present; the test skips otherwise. */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <gst/gst.h>
++#include <gst/check/gstcheck.h>
++#include <gst/video/video.h>
++#include <gst/codecparsers/gstav1parser.h>
++
++#define WIDTH 640
++#define HEIGHT 480
++#define FRAMES_PER_CASE 10
++
++typedef struct
++{
++  const gchar *colorimetry;
++  const gchar *chroma_site;
++} ColorCase;
++
++static const ColorCase color_cases[] = {
++  /* full-range BT.709 */
++  {"1:3:5:1", "mpeg2"},
++  {"bt601", "jpeg"},
++  {"bt2020", "cosited"},
++};
++
++static GstAV1ChromaSamplePositions
++expected_chroma_position (GstVideoChromaSite site)
++{
++  if (site == GST_VIDEO_CHROMA_SITE_COSITED)
++    return GST_AV1_CSP_COLOCATED;
++  if (site == GST_VIDEO_CHROMA_SITE_MPEG2)
++    return GST_AV1_CSP_VERTICAL;
++  return GST_AV1_CSP_UNKNOWN;
++}
++
++/* Checks every sequence header in @sample against the sample's caps, and
++ * returns the index of the color case the caps carry. */
++static guint
++check_sample (GstAV1Parser * parser, GstSample * sample, guint * n_seq_hdrs)
++{
++  GstStructure *s = gst_caps_get_structure (gst_sample_get_caps (sample), 0);
++  GstBuffer *buf = gst_sample_get_buffer (sample);
++  const gchar *cstr = gst_structure_get_string (s, "colorimetry");
++  const gchar *site_str = gst_structure_get_string (s, "chroma-site");
++  GstVideoChromaSite site = GST_VIDEO_CHROMA_SITE_UNKNOWN;
++  GstVideoColorimetry caps_color;
++  GstMapInfo map;
++  guint i, off = 0, case_idx = G_N_ELEMENTS (color_cases);
++
++  fail_unless (cstr != NULL, "output caps carry no colorimetry");
++  fail_unless (gst_video_colorimetry_from_string (&caps_color, cstr));
++  if (site_str)
++    site = gst_video_chroma_site_from_string (site_str);
++
++  /* the output caps carry the input's colorimetry */
++  for (i = 0; i < G_N_ELEMENTS (color_cases); i++) {
++    GstVideoColorimetry in_color;
++
++    fail_unless (gst_video_colorimetry_from_string (&in_color,
++            color_cases[i].colorimetry));
++    if (gst_video_colorimetry_is_equal (&in_color, &caps_color)) {
++      fail_unless_equals_int (site,
++          gst_video_chroma_site_from_string (color_cases[i].chroma_site));
++      case_idx = i;
++    }
++  }
++  fail_unless (case_idx < G_N_ELEMENTS (color_cases),
++      "output colorimetry %s is none of the input's", cstr);
++
++  fail_unless (gst_buffer_map (buf, &map, GST_MAP_READ));
++  while (off < map.size) {
++    GstAV1OBU obu;
++    GstAV1SequenceHeaderOBU seq;
++    GstAV1ColorConfig *cc = &seq.color_config;
++    GstAV1ParserResult res;
++    guint32 consumed = 0;
++
++    res = gst_av1_parser_identify_one_obu (parser, map.data + off,
++        map.size - off, &obu, &consumed);
++    fail_unless (res == GST_AV1_PARSER_OK || res == GST_AV1_PARSER_DROP,
++        "OBU parse error %d", res);
++    fail_unless (consumed > 0);
++    off += consumed;
++
++    if (res != GST_AV1_PARSER_OK || obu.obu_type != GST_AV1_OBU_SEQUENCE_HEADER)
++      continue;
++
++    fail_unless_equals_int (gst_av1_parser_parse_sequence_header_obu (parser,
++            &obu, &seq), GST_AV1_PARSER_OK);
++    GST_INFO ("caps %s chroma-site %s: color_range %d primaries %d "
++        "transfer %d matrix %d chroma_sample_position %d", cstr,
++        GST_STR_NULL (site_str), cc->color_range, cc->color_primaries,
++        cc->transfer_characteristics, cc->matrix_coefficients,
++        cc->chroma_sample_position);
++
++    fail_unless (cc->color_description_present_flag);
++    fail_unless_equals_int (cc->color_range,
++        caps_color.range == GST_VIDEO_COLOR_RANGE_0_255);
++    fail_unless_equals_int (cc->color_primaries,
++        gst_video_color_primaries_to_iso (caps_color.primaries));
++    fail_unless_equals_int (cc->transfer_characteristics,
++        gst_video_transfer_function_to_iso (caps_color.transfer));
++    fail_unless_equals_int (cc->matrix_coefficients,
++        gst_video_color_matrix_to_iso (caps_color.matrix));
++    fail_unless_equals_int (cc->chroma_sample_position,
++        expected_chroma_position (site));
++    (*n_seq_hdrs)++;
++  }
++  gst_buffer_unmap (buf, &map);
++
++  return case_idx;
++}
++
++static void
++push_frames (GstElement * src, const ColorCase * cc, guint first)
++{
++  GstVideoInfo info;
++  GstCaps *caps;
++  guint i;
++
++  caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "NV12",
++      "width", G_TYPE_INT, WIDTH, "height", G_TYPE_INT, HEIGHT,
++      "framerate", GST_TYPE_FRACTION, 30, 1,
++      "colorimetry", G_TYPE_STRING, cc->colorimetry,
++      "chroma-site", G_TYPE_STRING, cc->chroma_site, NULL);
++  fail_unless (gst_video_info_from_caps (&info, caps));
++  g_object_set (src, "caps", caps, NULL);
++  gst_caps_unref (caps);
++
++  for (i = first; i < first + FRAMES_PER_CASE; i++) {
++    GstBuffer *buf = gst_buffer_new_allocate (NULL, info.size, NULL);
++    GstFlowReturn ret;
++
++    gst_buffer_memset (buf, 0, (i * 16) & 0xff, info.size);
++    GST_BUFFER_PTS (buf) = gst_util_uint64_scale (i, GST_SECOND, 30);
++    GST_BUFFER_DURATION (buf) = GST_SECOND / 30;
++    g_signal_emit_by_name (src, "push-buffer", buf, &ret);
++    gst_buffer_unref (buf);
++    fail_unless_equals_int (ret, GST_FLOW_OK);
++  }
++}
++
++GST_START_TEST (test_av1_sequence_header_color_matches_caps)
++{
++  GstElementFactory *factory;
++  GstElement *pipeline, *src, *sink;
++  GstAV1Parser *parser;
++  GstSample *sample;
++  GError *err = NULL;
++  guint i, n_seq_hdrs[G_N_ELEMENTS (color_cases)] = { 0, };
++  guint n_samples = 0;
++
++  factory = gst_element_factory_find ("vulkanav1enc");
++  if (!factory) {
++    GST_INFO ("vulkanav1enc not available (no Vulkan encode device), "
++        "skipping");
++    return;
++  }
++  gst_object_unref (factory);
++
++  pipeline = gst_parse_launch ("appsrc name=src format=time ! vulkanupload ! "
++      "vulkanav1enc ! appsink name=sink sync=false", &err);
++  fail_unless (pipeline != NULL, "%s", err ? err->message : "no pipeline");
++  g_clear_error (&err);
++  src = gst_bin_get_by_name (GST_BIN (pipeline), "src");
++  sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
++
++  fail_if (gst_element_set_state (pipeline, GST_STATE_PLAYING) ==
++      GST_STATE_CHANGE_FAILURE);
++
++  for (i = 0; i < G_N_ELEMENTS (color_cases); i++)
++    push_frames (src, &color_cases[i], i * FRAMES_PER_CASE);
++  {
++    GstFlowReturn ret;
++
++    g_signal_emit_by_name (src, "end-of-stream", &ret);
++    fail_unless_equals_int (ret, GST_FLOW_OK);
++  }
++
++  parser = gst_av1_parser_new ();
++  while (TRUE) {
++    guint idx, n = 0;
++
++    g_signal_emit_by_name (sink, "try-pull-sample", 30 * GST_SECOND, &sample);
++    if (!sample)
++      break;
++    idx = check_sample (parser, sample, &n);
++    n_seq_hdrs[idx] += n;
++    n_samples++;
++    gst_sample_unref (sample);
++  }
++  gst_av1_parser_free (parser);
++
++  {
++    GstBus *bus = gst_element_get_bus (pipeline);
++    GstMessage *msg = gst_bus_timed_pop_filtered (bus, 10 * GST_SECOND,
++        GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
++
++    fail_unless (msg != NULL, "timed out waiting for EOS");
++    if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR) {
++      gchar *dbg = NULL;
++
++      gst_message_parse_error (msg, &err, &dbg);
++      fail ("%s (%s)", err->message, GST_STR_NULL (dbg));
++    }
++    gst_message_unref (msg);
++    gst_object_unref (bus);
++  }
++
++  fail_unless_equals_int (n_samples,
++      G_N_ELEMENTS (color_cases) * FRAMES_PER_CASE);
++  for (i = 0; i < G_N_ELEMENTS (color_cases); i++)
++    fail_unless (n_seq_hdrs[i] > 0, "no sequence header for %s",
++        color_cases[i].colorimetry);
++
++  gst_element_set_state (pipeline, GST_STATE_NULL);
++  gst_object_unref (src);
++  gst_object_unref (sink);
++  gst_object_unref (pipeline);
++}
++
++GST_END_TEST;
++
++static Suite *
++vkav1enc_suite (void)
++{
++  Suite *s = suite_create ("vkav1enc");
++  TCase *tc_basic = tcase_create ("general");
++
++  suite_add_tcase (s, tc_basic);
++  tcase_set_timeout (tc_basic, 120);
++  tcase_add_test (tc_basic, test_av1_sequence_header_color_matches_caps);
++
++  return s;
++}
++
++GST_CHECK_MAIN (vkav1enc);
 diff --git a/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c b/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c
 new file mode 100644
 index 0000000..aae733c
@@ -5693,18 +5987,19 @@ index 0000000..4813c37
 +GST_CHECK_MAIN (av1refs);
 +#endif
 diff --git a/subprojects/gst-plugins-bad/tests/check/meson.build b/subprojects/gst-plugins-bad/tests/check/meson.build
-index eddac3c..8621ebc 100644
+index eddac3c..35a0d41 100644
 --- a/subprojects/gst-plugins-bad/tests/check/meson.build
 +++ b/subprojects/gst-plugins-bad/tests/check/meson.build
-@@ -87,6 +87,7 @@ base_tests = [
+@@ -87,6 +87,8 @@ base_tests = [
    [['elements/vkdownload.c'], not gstvulkan_dep.found(), [gstvulkan_dep]],
    [['elements/vkdeviceprovider.c'], not gstvulkan_dep.found(), [gstvulkan_dep]],
    [['elements/vkupload.c'], not gstvulkan_dep.found(), [gstvulkan_dep]],
 +  [['elements/vkencoderetarget.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep]],
++  [['elements/vkav1enc.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstvideo_dep, gstcodecparsers_dep]],
    [['elements/voamrwbenc.c'], not voamrwbenc_dep.found(), [voamrwbenc_dep]],
    [['elements/vp9parse.c'], false, [gstcodecparsers_dep]],
    [['elements/av1parse.c'], false, [gstcodecparsers_dep]],
-@@ -125,6 +126,7 @@ base_tests = [
+@@ -125,6 +127,7 @@ base_tests = [
    [['libs/vkvideoencodeh264.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
    [['libs/vkvideoencodeh265.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
    [['libs/vkvideoencodeav1.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
