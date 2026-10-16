@@ -3,7 +3,7 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -20,7 +20,10 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
 }
 
 pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
-    let mut displays = EGL_DISPLAYS.lock().unwrap();
+    // EGL init below panics on failure while this guard is held. Recover from poisoning so
+    // one failed display doesn't break every later one in the process: the map only holds
+    // Weak refs and an entry is inserted only after its EGLDisplay was created successfully.
+    let mut displays = EGL_DISPLAYS.lock().unwrap_or_else(PoisonError::into_inner);
     let maybe_display = displays
         .get(&render_node)
         .and_then(|weak_display| weak_display.upgrade());
@@ -52,4 +55,23 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
     let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
     renderer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a panic during EGL init (e.g. an unusable render node) used to poison
+    // EGL_DISPLAYS, so every later display in the process panicked at `lock().unwrap()`.
+    #[test]
+    fn setup_renderer_survives_poisoned_display_map() {
+        let _ = std::thread::spawn(|| {
+            let _guard = EGL_DISPLAYS.lock();
+            panic!("simulated EGL init failure while holding EGL_DISPLAYS");
+        })
+        .join();
+        assert!(EGL_DISPLAYS.is_poisoned());
+
+        let _renderer = setup_renderer(None);
+    }
 }
