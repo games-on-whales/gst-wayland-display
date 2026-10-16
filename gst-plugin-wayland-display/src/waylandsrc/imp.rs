@@ -12,7 +12,6 @@ use gst_base::subclass::prelude::*;
 use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::ops::DerefMut;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
@@ -33,8 +32,10 @@ use waylanddisplaycore::{
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
     settings: Mutex<Settings>,
-    command_tx: Sender<Command>,
-    command_rx: Mutex<Option<Channel<Command>>>,
+    // Replaced on every start(); the display owns the receiver and drops it on stop(), so commands
+    // sent while stopped fail instead of queueing stale input for the next run. Send through
+    // send_command(), never a cloned sender.
+    command_tx: Mutex<Sender<Command>>,
     /// Live HDR-colorimetry state (dynamic-hdr only). Mirrors the latest
     /// `poll_hdr_state()` value: `true` => the P010 output caps carry BT.2100 PQ
     /// colorimetry + mastering/CLL, `false` => BT.709 SDR (no static metadata).
@@ -61,12 +62,12 @@ pub struct WaylandDisplaySrc {
 
 impl Default for WaylandDisplaySrc {
     fn default() -> Self {
-        let (command_tx, command_rx) = channel();
+        // No display yet: drop the receiver so commands sent before start() are discarded.
+        let (command_tx, _) = channel();
         WaylandDisplaySrc {
             state: Mutex::new(None),
             settings: Mutex::new(Settings::default()),
-            command_tx,
-            command_rx: Mutex::new(Some(command_rx)),
+            command_tx: Mutex::new(command_tx),
             hdr_active: AtomicBool::new(false),
             hdr_meta: Mutex::new((None, None)),
             va_share: Arc::new(Default::default()),
@@ -75,10 +76,36 @@ impl Default for WaylandDisplaySrc {
     }
 }
 
+impl WaylandDisplaySrc {
+    fn send_command(&self, command: Command) {
+        let _ = self.command_tx.lock().unwrap().send(command);
+    }
+
+    /// Installs a fresh command channel and returns its receiver.
+    fn new_command_channel(&self) -> Channel<Command> {
+        let (command_tx, command_rx) = channel();
+        *self.command_tx.lock().unwrap() = command_tx;
+        command_rx
+    }
+}
+
+impl Settings {
+    /// Devices a new display is given on start(): configured ones, then announced ones.
+    fn startup_input_devices(&self) -> Vec<String> {
+        self.input_devices
+            .iter()
+            .chain(&self.virtual_input_devices)
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
+    // Devices announced with VirtualDevicesReady; re-added on every start().
+    virtual_input_devices: Vec<String>,
     disable_intel_workaround: bool,
     nv12: bool,
     /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
@@ -138,7 +165,14 @@ impl EventHandler for WaylandDisplaySrc {
                     let path = structure
                         .get::<String>("path")
                         .expect("Should contain the path to the device as a String");
-                    let _ = self.command_tx.send(Command::InputDevice(path));
+                    // Held across the send so it can't interleave with start() swapping the
+                    // channel: the path is either in start()'s snapshot or sent to the new display.
+                    let mut settings = self.settings.lock().unwrap();
+                    // Always forward: a reconnected device can reuse its old /dev/input path.
+                    if !settings.virtual_input_devices.contains(&path) {
+                        settings.virtual_input_devices.push(path.clone());
+                    }
+                    self.send_command(Command::InputDevice(path));
                     return true;
                 } else if structure.has_name("MouseMoveAbsolute") {
                     let x = structure
@@ -148,9 +182,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<f64>("pointer_y")
                         .expect("Should contain pointer_y");
 
-                    let _ = self
-                        .command_tx
-                        .send(Command::PointerMotionAbsolute((x, y).into()));
+                    self.send_command(Command::PointerMotionAbsolute((x, y).into()));
 
                     return true;
                 } else if structure.has_name("MouseMoveRelative") {
@@ -161,7 +193,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<f64>("pointer_y")
                         .expect("Should contain pointer_y");
 
-                    let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
+                    self.send_command(Command::PointerMotion((x, y).into()));
 
                     return true;
                 } else if structure.has_name("MouseButton") {
@@ -172,7 +204,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<bool>("pressed")
                         .expect("Should contain pressed");
 
-                    let _ = self.command_tx.send(Command::PointerButton(
+                    self.send_command(Command::PointerButton(
                         button,
                         if pressed {
                             ButtonState::Pressed
@@ -186,7 +218,7 @@ impl EventHandler for WaylandDisplaySrc {
                     let x = structure.get::<f64>("x").expect("Should contain x");
                     let y = structure.get::<f64>("y").expect("Should contain y");
 
-                    let _ = self.command_tx.send(Command::PointerAxis(x, y));
+                    self.send_command(Command::PointerAxis(x, y));
 
                     return true;
                 } else if structure.has_name("KeyboardKey") {
@@ -195,7 +227,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<bool>("pressed")
                         .expect("Should contain pressed");
 
-                    let _ = self.command_tx.send(Command::KeyboardInput(
+                    self.send_command(Command::KeyboardInput(
                         key,
                         if pressed {
                             KeyState::Pressed
@@ -209,25 +241,23 @@ impl EventHandler for WaylandDisplaySrc {
                     let x = structure.get::<f64>("x").expect("Should contain x");
                     let y = structure.get::<f64>("y").expect("Should contain y");
                     let id = structure.get::<u32>("id").expect("Should contain id");
-                    let _ = self.command_tx.send(Command::TouchDown(id, (x, y).into()));
+                    self.send_command(Command::TouchDown(id, (x, y).into()));
                     return true;
                 } else if structure.has_name("TouchUp") {
                     let id = structure.get::<u32>("id").expect("Should contain id");
-                    let _ = self.command_tx.send(Command::TouchUp(id));
+                    self.send_command(Command::TouchUp(id));
                     return true;
                 } else if structure.has_name("TouchMotion") {
                     let x = structure.get::<f64>("x").expect("Should contain x");
                     let y = structure.get::<f64>("y").expect("Should contain y");
                     let id = structure.get::<u32>("id").expect("Should contain id");
-                    let _ = self
-                        .command_tx
-                        .send(Command::TouchMotion(id, (x, y).into()));
+                    self.send_command(Command::TouchMotion(id, (x, y).into()));
                     return true;
                 } else if structure.has_name("TouchFrame") {
-                    let _ = self.command_tx.send(Command::TouchFrame);
+                    self.send_command(Command::TouchFrame);
                     return true;
                 } else if structure.has_name("TouchCancel") {
-                    let _ = self.command_tx.send(Command::TouchCancel);
+                    self.send_command(Command::TouchCancel);
                     return true;
                 }
             }
@@ -236,15 +266,13 @@ impl EventHandler for WaylandDisplaySrc {
 
                 match navigation_event {
                     NavigationEvent::MouseMove { x, y, .. } => {
-                        let _ = self
-                            .command_tx
-                            .send(Command::PointerMotionAbsolute((x, y).into()));
+                        self.send_command(Command::PointerMotionAbsolute((x, y).into()));
 
                         return true;
                     }
                     NavigationEvent::MouseButtonPress { button, .. } => {
                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Pressed) {
-                            let _ = self.command_tx.send(cmd);
+                            self.send_command(cmd);
                         } else {
                             tracing::warn!("Unknown mouse button pressed: {:?}", button);
                         }
@@ -253,7 +281,7 @@ impl EventHandler for WaylandDisplaySrc {
                     }
                     NavigationEvent::MouseButtonRelease { button, .. } => {
                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Released) {
-                            let _ = self.command_tx.send(cmd);
+                            self.send_command(cmd);
                         } else {
                             tracing::warn!("Unknown mouse button released: {:?}", button);
                         }
@@ -262,9 +290,7 @@ impl EventHandler for WaylandDisplaySrc {
                     }
                     NavigationEvent::KeyPress { key, .. } => {
                         if let Some(scancode) = gst_key_to_scancode(&key) {
-                            let _ = self
-                                .command_tx
-                                .send(Command::KeyboardInput(scancode, KeyState::Pressed));
+                            self.send_command(Command::KeyboardInput(scancode, KeyState::Pressed));
                         } else {
                             tracing::warn!("Unknown keyboard key pressed: {:?}", key);
                         }
@@ -273,9 +299,7 @@ impl EventHandler for WaylandDisplaySrc {
                     }
                     NavigationEvent::KeyRelease { key, .. } => {
                         if let Some(scancode) = gst_key_to_scancode(&key) {
-                            let _ = self
-                                .command_tx
-                                .send(Command::KeyboardInput(scancode, KeyState::Released));
+                            self.send_command(Command::KeyboardInput(scancode, KeyState::Released));
                         } else {
                             tracing::warn!("Unknown keyboard key pressed: {:?}", key);
                         }
@@ -1294,11 +1318,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 }
 
                 // Send the pool to the compositor
-                let _ = self
-                    .command_tx
-                    .send(Command::UpdateCUDABufferPool(Arc::new(Mutex::new(Some(
-                        pool,
-                    )))));
+                self.send_command(Command::UpdateCUDABufferPool(Arc::new(Mutex::new(Some(
+                    pool,
+                )))));
             }
             Err(err) => {
                 tracing::warn!("Failed to create CUDA buffer pool: {}", err);
@@ -1371,7 +1393,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     video_info: base_video_info,
                     profile,
                 });
-            let _ = self.command_tx.send(Command::VideoInfo(video_info));
+            self.send_command(Command::VideoInfo(video_info));
             return self.parent_set_caps(caps);
         }
 
@@ -1441,7 +1463,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             ),
         };
 
-        let _ = self.command_tx.send(Command::VideoInfo(video_info));
+        self.send_command(Command::VideoInfo(video_info));
 
         self.parent_set_caps(caps)
     }
@@ -1452,31 +1474,35 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             return Ok(());
         }
 
-        #[cfg(feature = "cuda")]
-        let (render_node, input_devices, have_cuda_context) = {
+        // The channel is swapped under the settings lock so a concurrent VirtualDevicesReady lands
+        // either in this snapshot or on the new channel, never both or neither.
+        let (render_node, input_devices, command_rx, command_tx) = {
             let settings = self.settings.lock().unwrap();
+            let input_devices = settings.startup_input_devices();
+            let command_rx = self.new_command_channel();
+            let command_tx = self.command_tx.lock().unwrap().clone();
             (
                 settings.render_node.clone(),
-                settings.input_devices.clone(),
-                settings.cuda_context.is_some(),
+                input_devices,
+                command_rx,
+                command_tx,
             )
         };
-
-        #[cfg(not(feature = "cuda"))]
-        let (render_node, input_devices) = {
-            let settings = self.settings.lock().unwrap();
-            (settings.render_node.clone(), settings.input_devices.clone())
-        };
+        // A new compositor starts SDR and only reports HDR changes, so a previous run's dynamic-HDR
+        // state must not carry over into this one.
+        self.hdr_active.store(false, Ordering::Relaxed);
+        *self.hdr_meta.lock().unwrap() = (None, None);
+        #[cfg(feature = "cuda")]
+        let have_cuda_context = self.settings.lock().unwrap().cuda_context.is_some();
 
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
         let subscriber = Registry::default().with(GstLayer);
 
         let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
-            let mut command_rx = self.command_rx.lock().unwrap();
             WaylandDisplay::new_with_channel(
                 render_node.clone(),
-                self.command_tx.clone(),
-                command_rx.deref_mut().take().unwrap(),
+                command_tx,
+                command_rx,
                 // Hand this element's compositor thread a clone of OUR share, so producer +
                 // compositor + encoder resolve THIS element's device.
                 Arc::clone(&self.vulkan_share),
@@ -2034,6 +2060,124 @@ mod tests {
                 false
             ),
             Some("RA24:0x0300000000000013".to_string())
+        );
+    }
+
+    // the first start() consumed the command receiver and stop() never replaced it,
+    // so the second start() panicked and the state change failed.
+    #[test]
+    fn restart_reaches_playing_again() {
+        use gst::prelude::*;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build()
+            .upcast::<gst::Element>();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("width", 320)
+                    .field("height", 240)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &caps, &sink]).unwrap();
+        gst::Element::link_many([&src, &caps, &sink]).unwrap();
+
+        for run in 0..2 {
+            pipeline
+                .set_state(gst::State::Playing)
+                .unwrap_or_else(|err| panic!("run {run}: set_state(Playing) failed: {err}"));
+            let (result, current, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+            assert!(result.is_ok(), "run {run}: state change failed");
+            assert_eq!(current, gst::State::Playing, "run {run}");
+            pipeline.set_state(gst::State::Null).unwrap();
+        }
+    }
+
+    // A start() that fails after consuming the receiver must not break the next start().
+    #[test]
+    fn start_after_failed_start_reaches_playing() {
+        use gst::prelude::*;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "/nonexistent/renderD128")
+            .build()
+            .upcast::<gst::Element>();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+
+        assert!(pipeline.set_state(gst::State::Playing).is_err());
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        src.set_property("render-node", "software");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (result, current, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+        assert!(result.is_ok(), "state change failed");
+        assert_eq!(current, gst::State::Playing);
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // Commands sent while no display runs must fail rather than queue and replay into the next
+    // run, and VirtualDevicesReady devices must be kept for the next start().
+    #[test]
+    fn stopped_element_drops_input_and_keeps_virtual_devices() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::sync::atomic::Ordering;
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build();
+        let imp = src.imp();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([src.upcast_ref(), &sink]).unwrap();
+        src.link(&sink).unwrap();
+
+        let stopped_send = |imp: &super::WaylandDisplaySrc| {
+            imp.command_tx.lock().unwrap().send(Command::TouchFrame)
+        };
+        assert!(
+            stopped_send(imp).is_err(),
+            "queued before the first start()"
+        );
+
+        let device = gst::event::CustomUpstream::new(
+            gst::Structure::builder("VirtualDevicesReady")
+                .field("path", "/nonexistent/input/event0")
+                .build(),
+        );
+        for _ in 0..2 {
+            // As if the previous run ended in dynamic HDR.
+            imp.hdr_active.store(true, Ordering::Relaxed);
+            *imp.hdr_meta.lock().unwrap() = (Some("m".into()), Some("c".into()));
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let (result, _, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+            assert!(result.is_ok());
+            assert!(
+                !imp.hdr_active.load(Ordering::Relaxed),
+                "HDR state kept across start()"
+            );
+            assert_eq!(*imp.hdr_meta.lock().unwrap(), (None, None));
+            assert!(src.send_event(device.clone()));
+            pipeline.set_state(gst::State::Null).unwrap();
+            assert!(stopped_send(imp).is_err(), "queued after stop()");
+        }
+        assert_eq!(
+            imp.settings.lock().unwrap().startup_input_devices(),
+            ["/nonexistent/input/event0"]
         );
     }
 }
