@@ -48,7 +48,13 @@ pub extern "C" fn display_finish(dpy: *mut WaylandDisplay) {
 #[no_mangle]
 pub extern "C" fn display_get_devices_len(dpy: *mut WaylandDisplay) -> c_uint {
     let display = unsafe { &mut *dpy };
-    display.devices.get().len() as c_uint
+    match display.devices.get() {
+        Ok(devices) => devices.len() as c_uint,
+        Err(err) => {
+            tracing::error!(?err, "Compositor failed before publishing its devices.");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -59,7 +65,10 @@ pub extern "C" fn display_get_devices(
 ) -> c_uint {
     let display = unsafe { &mut *dpy };
     let client_devices = unsafe { std::slice::from_raw_parts_mut(devices, max_len as usize) };
-    let devices = display.devices.get();
+    let Ok(devices) = display.devices.get() else {
+        tracing::error!("Compositor failed before publishing its devices.");
+        return 0;
+    };
 
     for (i, string) in devices.iter().take(max_len as usize).enumerate() {
         client_devices[i] = string.as_ptr() as *const _;
@@ -71,7 +80,13 @@ pub extern "C" fn display_get_devices(
 #[no_mangle]
 pub extern "C" fn display_get_envvars_len(dpy: *mut WaylandDisplay) -> c_uint {
     let display = unsafe { &mut *dpy };
-    display.envs.get().len() as c_uint
+    match display.envs.get() {
+        Ok(env_vars) => env_vars.len() as c_uint,
+        Err(err) => {
+            tracing::error!(?err, "Compositor failed before publishing its environment.");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -82,7 +97,10 @@ pub extern "C" fn display_get_envvars(
 ) -> c_uint {
     let display = unsafe { &mut *dpy };
     let client_env_vars = unsafe { std::slice::from_raw_parts_mut(env_vars, max_len as usize) };
-    let env_vars = display.envs.get();
+    let Ok(env_vars) = display.envs.get() else {
+        tracing::error!("Compositor failed before publishing its environment.");
+        return 0;
+    };
 
     for (i, string) in env_vars.iter().take(max_len as usize).enumerate() {
         client_env_vars[i] = string.as_ptr() as *const _;
