@@ -1,0 +1,7 @@
+# GStreamer patch chain, in apply order. Read by docker/vulkan.Dockerfile and
+# ci/gst-patches.sh so the image and CI always apply the same set.
+vkh264enc-dpb-pool-in-new-sequence.patch
+vulkanh265enc.patch
+vkh264enc-rc-fix.patch
+gstreamer-vulkan-rc-retarget-no-reset.patch
+vulkanav1enc.patch

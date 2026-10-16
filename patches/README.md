@@ -1,12 +1,22 @@
 # gstreamer patches
 
 Patches to gstreamer (not this plugin) needed by the Vulkan-encode path.
-Apply against a gstreamer monorepo checkout before building:
+Apply them against a gstreamer monorepo checkout, in the order listed in
+[`series`](series), before building:
 
 ```
-git apply patches/vkh264enc-dpb-pool-in-new-sequence.patch
-git apply patches/vulkanh265enc.patch
+for p in $(grep -v -e '^#' -e '^[[:space:]]*$' patches/series); do
+  git -C <gstreamer> apply "$PWD/patches/$p"
+done
 ```
+
+`series` is the single source of the apply order: `docker/vulkan.Dockerfile`
+and [`ci/gst-patches.sh`](../ci/gst-patches.sh) both read it. That script (run
+in CI by `.github/workflows/gst-patches.yml`) builds the patched tree with the
+GStreamer unit tests enabled and runs the Vulkan tests; run it locally on a
+machine with a Vulkan encode GPU to exercise the device-backed tests too.
+After changing a patch, regenerate it with `git diff` from a checkout where the
+chain is committed, rather than editing hunks by hand.
 
 ## vkh264enc-dpb-pool-in-new-sequence.patch
 
@@ -31,6 +41,12 @@ pics_flag` on IDR, CABAC-implicit (no entropy-mode flag, WPP/tiles off), and a
 New files (`subprojects/gst-plugins-bad/ext/vulkan/`): `base/gsth265encoder.{c,h}`,
 `vkh265enc.{c,h}`; plus `meson.build` + `gstvulkan.c` registration. Apply *after*
 the H.264 patch (independent files; no conflict).
+
+The element encodes the 4:2:0 Main and Main 10 profiles, from NV12 and P010
+input. Its pad templates are narrowed to exactly that, whatever else the
+driver's H.265 encode profiles report (NVIDIA also reports `main-444` from
+NV24), so a downstream that leaves `profile` open still negotiates a profile
+the element can start.
 
 Status: compiles + links + loads clean on 1.28.4; HEVC bitstream design
 roundtable-approved. Pending hardware validation on AMD (RADV

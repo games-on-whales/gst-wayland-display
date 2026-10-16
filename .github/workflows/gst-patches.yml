@@ -1,0 +1,58 @@
+name: gstreamer patches
+
+# Builds GStreamer with the patches/ chain applied and the GStreamer unit tests
+# enabled, then runs the Vulkan tests (ci/gst-patches.sh). The vulkan image
+# builds with -Dtests=disabled and the harness runs inside the already-published
+# image, so this is the job that compiles and runs the tests the patches add.
+# Without a GPU the device-backed tests skip; the GPU-free ones run.
+
+on:
+  push:
+    paths:
+      - "patches/**"
+      - "ci/gst-patches.sh"
+      - "docker/vulkan.Dockerfile"
+      - ".github/workflows/gst-patches.yml"
+  pull_request:
+    paths:
+      - "patches/**"
+      - "ci/gst-patches.sh"
+      - "docker/vulkan.Dockerfile"
+      - ".github/workflows/gst-patches.yml"
+
+concurrency:
+  group: gst-patches-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gst-patches:
+    name: patch chain · build · vulkan tests
+    runs-on: ubuntu-latest
+    container:
+      # Same base and build deps as docker/vulkan.Dockerfile, so the toolchain
+      # and Vulkan headers (>= 1.4.317) match what the image ships.
+      image: ghcr.io/games-on-whales/base-app:fedora
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          dnf install -y dnf-plugins-core 'dnf-command(builddep)'
+          dnf builddep -y gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
+          dnf install -y git gcc gcc-c++ meson ninja-build flex bison nasm \
+            pkgconf-pkg-config glib2-devel libdrm-devel vulkan-headers \
+            vulkan-loader-devel wayland-devel wayland-protocols-devel
+
+      - name: Build patched GStreamer and run the Vulkan tests
+        run: bash ci/gst-patches.sh .gst-patches
+
+      - name: Test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gst-patches-testlog
+          path: .gst-patches/build/meson-logs/
+          if-no-files-found: ignore

@@ -1,6 +1,6 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 new file mode 100644
-index 0000000..196d986
+index 0000000..28c1e0a
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 @@ -0,0 +1,3047 @@
@@ -1887,12 +1887,12 @@ index 0000000..196d986
 +
 +    if (candidate->profile < *profile)
 +      continue;
-+    /* Still-picture and intra-only profiles forbid inter (P/B) pictures, so
-+     * they are unsuitable for a general video encoder. */
-+    if (candidate->profile == GST_H265_PROFILE_MAIN_STILL_PICTURE
-+        || candidate->profile == GST_H265_PROFILE_MAIN_INTRA
-+        || candidate->profile == GST_H265_PROFILE_MAIN_10_INTRA) {
-+      GST_INFO_OBJECT (self, "Skipping intra-only profile %s",
++    /* Only the 4:2:0 Main and Main 10 profiles are implemented. This also
++     * skips the still-picture and intra-only profiles, which forbid inter
++     * (P/B) pictures, and the format range extensions (e.g. main-444). */
++    if (candidate->profile != GST_H265_PROFILE_MAIN
++        && candidate->profile != GST_H265_PROFILE_MAIN_10) {
++      GST_INFO_OBJECT (self, "Skipping unsupported profile %s",
 +          candidate->profile_name);
 +      continue;
 +    }
@@ -3441,10 +3441,10 @@ index ee93c9c..c01eb11 100644
    'vkvp9dec.c',
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
 new file mode 100644
-index 0000000..566b622
+index 0000000..6ff60ce
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
-@@ -0,0 +1,2632 @@
+@@ -0,0 +1,2926 @@
 +/* GStreamer
 + * Copyright (C) 2025 Igalia, S.L.
 + *     Author: Stéphane Cerveau <scerveau@igalia.com>
@@ -3555,6 +3555,20 @@ index 0000000..566b622
 +  GstH265PPS pps;
 +  gsize coded_buffer_size;
 +
++  /* The driver's authoritative SPS/PPS
++   * NAL units (Annex B, from vkGetEncodedVideoSessionParametersKHR), emitted
++   * verbatim by _write_headers instead of bit-writing self->sps/pps. Parsing the
++   * driver's SPS and re-bit-writing it round-trips through gst_h265_bit_writer_sps
++   * and malformed the SPS extension (sps_extension_present_flag=1,
++   * sps_extension_4bits=1) - benign to ffmpeg but a strict decoder (macOS
++   * VideoToolbox) reads it as per-frame flicker. Emitting the driver's exact
++   * bytes is round-trip-free (self->sps is retained only for the coded-size
++   * estimate and caps). */
++  guint8 *driver_sps_nal;
++  gsize driver_sps_nal_size;
++  guint8 *driver_pps_nal;
++  gsize driver_pps_nal_size;
++
 +  struct
 +  {
 +    StdVideoH265VideoParameterSet vps;
@@ -3583,6 +3597,10 @@ index 0000000..566b622
 +  } prop;
 +
 +  gboolean update_props;
++  /* PATCH (rc-fix): a live bitrate change recorded by set_property() and
++   * applied by encode_frame() on the streaming thread. Protected by the
++   * object lock. */
++  gboolean update_bitrate;
 +
 +  struct
 +  {
@@ -4340,6 +4358,12 @@ index 0000000..566b622
 +        && self->profile.profile.chromaBitDepth == bit_depth_chroma
 +        && self->profile.profile.lumaBitDepth == bit_depth_luma
 +        && self->profile.codec.h265enc.stdProfileIdc == vk_profile) {
++      /* Same profile: the session is not restarted, but a reconfigure may have
++       * changed the bitrate (or other rate-control values). Without this the
++       * new values are written into the per-frame rate-control layer info and
++       * never handed to the driver, so a live retarget is silently inert.
++       * Update, not reset — a reset would force an IDR on every retarget. */
++      gst_vulkan_encoder_request_rc_update (self->encoder);
 +      return GST_FLOW_OK;
 +    } else {
 +      GST_DEBUG_OBJECT (self, "Restarting vulkan encoder");
@@ -4370,6 +4394,11 @@ index 0000000..566b622
 +    self->rc.quality = gst_vulkan_encoder_quality_level (self->encoder);
 +    update_property_uint (self, &self->prop.quality, self->rc.quality,
 +        PROP_QUALITY);
++    /* PATCH (rc-fix): push the property-selected rate-control mode into the
++     * freshly started encoder BEFORE reading it back — otherwise the
++     * read-back overwrites the user's cbr/vbr choice with the driver
++     * default and the stream is silently constant-QP. */
++    gst_vulkan_encoder_set_rc_mode (self->encoder, self->prop.ratecontrol);
 +    self->rc.ratecontrol = gst_vulkan_encoder_rc_mode (self->encoder);
 +    update_property_uint (self, &self->prop.ratecontrol, self->rc.ratecontrol,
 +        PROP_RATECONTROL);
@@ -4529,7 +4558,10 @@ index 0000000..566b622
 +
 +  gst_h265_parser_free (parser);
 +
-+  return res == GST_H265_PARSER_OK;
++  /* identify_nalu returns NO_NAL_END on the last NAL of the
++   * blob (no trailing start code) - that is a successful full parse,
++   * not a failure. */
++  return res == GST_H265_PARSER_OK || res == GST_H265_PARSER_NO_NAL_END;
 +}
 +
 +static GstFlowReturn
@@ -4664,28 +4696,114 @@ index 0000000..566b622
 +          &overrides, &feedback, &data_size, &data, &err))
 +    return GST_FLOW_ERROR;
 +
-+  /* ignore overrides until we get a use case they are actually needed */
-+  feedback.h265.hasStdPPSOverrides = feedback.h265.hasStdSPSOverrides = 0;
++  /* Honor the driver-returned SPS/PPS for the emitted bitstream.
++   *
++   * NVIDIA (RTX 5090) advertises only VK_VIDEO_ENCODE_H265_CTB_SIZE_32, so the
++   * driver encodes on a 32x32 CTB grid (init_std_sps() derives that from caps).
++   * The *bitstream* SPS is bit-written from the hand-rolled GstH265SPS, whose
++   * gsth265encoder.c sps_init() hardcodes CtbSize=64 (log2_diff_max_min_cb=3),
++   * so the decoder parsed the coding tree / slice data on a 2x-wrong CTB grid ->
++   * garbage cu_qp_delta / alignment bit and a cascading RPS failure
++   * (non-conformant; black on VideoToolbox).
++   *
++   * vkGetEncodedVideoSessionParametersKHR (called above with writeStdSPS/PPS=TRUE)
++   * returns the driver's authoritative SPS/PPS and flags hasStdSPS/PPSOverrides
++   * when they differ from what we uploaded - which they do on NVIDIA (CtbSize 32
++   * vs the hand-rolled 64). The upstream force-zero of those flags discarded the
++   * fix; it is removed so the adopt path runs. (The companion return-value fix in
++   * _h265_parameters_parse() is what actually lets the parse succeed: that helper
++   * was never exercised while the flags were forced to zero, so its
++   * last-NAL-is-NO_NAL_END success case was mis-reported as failure.)
++   *
++   * Gating on the override flags keeps this regression-safe for the driver the
++   * element was tuned on: RADV advertises CTB_SIZE_64, matches the hand-rolled
++   * sets, reports no override, and the bit-written path stays byte-identical. The
++   * VPS is not driver-returned and stays bit-written from self->vps unchanged. */
 +
 +  if (feedback.h265.hasStdSPSOverrides || feedback.h265.hasStdPPSOverrides) {
-+    GstH265SPS new_sps;
-+    GstH265PPS new_pps;
++    GstH265SPS new_sps = *sps;
++    GstH265PPS new_pps = *pps;
 +    GST_LOG_OBJECT (self, "Vulkan driver overrode parameters:%s%s",
 +        feedback.h265.hasStdSPSOverrides ? " SPS" : "",
 +        feedback.h265.hasStdPPSOverrides ? " PPS" : "");
 +
 +    if (_h265_parameters_parse (self, data, data_size, &new_sps, &new_pps)) {
-+      if (feedback.h265.hasStdSPSOverrides)
++      GST_INFO_OBJECT (self, "driver parameter override (%" G_GSIZE_FORMAT
++          " bytes; SPS=%d PPS=%d): CtbSize %u->%u, log2_diff_max_min_cb %u->%u, "
++          "log2_diff_max_min_tb %u->%u, log2_max_poc_lsb_minus4 %u->%u, SAO %u->%u",
++          data_size, feedback.h265.hasStdSPSOverrides,
++          feedback.h265.hasStdPPSOverrides,
++          1u << (sps->log2_min_luma_coding_block_size_minus3 + 3
++              + sps->log2_diff_max_min_luma_coding_block_size),
++          1u << (new_sps.log2_min_luma_coding_block_size_minus3 + 3
++              + new_sps.log2_diff_max_min_luma_coding_block_size),
++          sps->log2_diff_max_min_luma_coding_block_size,
++          new_sps.log2_diff_max_min_luma_coding_block_size,
++          sps->log2_diff_max_min_transform_block_size,
++          new_sps.log2_diff_max_min_transform_block_size,
++          (guint) sps->log2_max_pic_order_cnt_lsb_minus4,
++          (guint) new_sps.log2_max_pic_order_cnt_lsb_minus4,
++          sps->sample_adaptive_offset_enabled_flag,
++          new_sps.sample_adaptive_offset_enabled_flag);
++
++      if (feedback.h265.hasStdSPSOverrides) {
++        /* Consistency audit: _setup_slice() hardcodes slice_sao_luma/chroma=1,
++         * only legal while the now-authoritative SPS keeps SAO enabled. */
++        if (!new_sps.sample_adaptive_offset_enabled_flag)
++          GST_WARNING_OBJECT (self, "driver SPS disables SAO but _setup_slice() "
++              "hardcodes slice_sao_luma/chroma=1 - slice headers may mismatch "
++              "the parameter set; revisit _setup_slice()");
 +        *sps = new_sps;
++      }
 +
 +      if (feedback.h265.hasStdPPSOverrides) {
++        /* _setup_slice() hardcodes cu_chroma_qp_offset_enabled_flag=1 and
++         * deblocking_filter_override_flag=1, each only legal when the PPS
++         * enables the matching tool. Warn (do not fail) on divergence. */
++        if (!new_pps.deblocking_filter_override_enabled_flag)
++          GST_WARNING_OBJECT (self, "driver PPS has deblocking_filter_override_"
++              "enabled_flag=0 but _setup_slice() hardcodes "
++              "deblocking_filter_override_flag=1");
 +        new_pps.sps = sps;
 +        *pps = new_pps;
 +      }
 +
++      /* Re-upload the adopted sets so the driver session parameters and the
++       * emitted bitstream stay in lockstep (init_std_sps re-derives geometry
++       * from caps, so this is grid-idempotent). */
 +      ret = gst_vulkan_h265_encoder_update_parameters (self, vps, sps, pps);
 +      if (ret != GST_FLOW_OK)
 +        return ret;
++    } else {
++      GST_WARNING_OBJECT (self, "failed to parse driver-returned parameter sets "
++          "(%" G_GSIZE_FORMAT " bytes) - keeping hand-rolled SPS/PPS", data_size);
++    }
++  }
++
++  /* Robust form: keep the driver's authoritative SPS/PPS NAL bytes so
++   * _write_headers emits them verbatim. @data is Annex B (SPS NAL then PPS NAL);
++   * split on the second start code (00 00 01, optionally 4-byte). */
++  g_clear_pointer (&self->driver_sps_nal, g_free);
++  g_clear_pointer (&self->driver_pps_nal, g_free);
++  self->driver_sps_nal_size = self->driver_pps_nal_size = 0;
++  if (data && data_size > 4) {
++    const guint8 *d = data;
++    gsize i, split = 0;
++    for (i = 3; i + 3 <= data_size; i++) {
++      if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
++        split = (i > 0 && d[i - 1] == 0) ? i - 1 : i;
++        break;
++      }
++    }
++    if (split > 0 && split < data_size) {
++      self->driver_sps_nal = g_memdup2 (d, split);
++      self->driver_sps_nal_size = split;
++      self->driver_pps_nal = g_memdup2 (d + split, data_size - split);
++      self->driver_pps_nal_size = data_size - split;
++    } else {
++      GST_WARNING_OBJECT (self, "could not split driver SPS/PPS blob (%"
++          G_GSIZE_FORMAT " bytes); _write_headers will bit-write instead",
++          data_size);
 +    }
 +  }
 +
@@ -4716,6 +4834,30 @@ index 0000000..566b622
 +        GST_VIDEO_INFO_WIDTH (info), "height", G_TYPE_INT,
 +        GST_VIDEO_INFO_HEIGHT (info), "alignment", G_TYPE_STRING, "au",
 +        "stream-format", G_TYPE_STRING, "byte-stream", NULL);
++
++    /* Propagate the input colorimetry (and chroma
++     * siting) onto the coded-video caps, exactly as nvh265enc/vah265enc do.
++     * webrtcbin derives the WebRTC color-space signalling from these caps; with
++     * them absent (the upstream element left them off), a receiver has no
++     * out-of-band color-space and Chrome/VideoToolbox falls back to per-frame
++     * guessing - which renders as whole-image light/dark alternation on the
++     * HEVC path even though the in-band VUI is correct. */
++    {
++      gchar *colorimetry = gst_video_colorimetry_to_string (&info->colorimetry);
++      if (colorimetry) {
++        gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, colorimetry,
++            NULL);
++        g_free (colorimetry);
++      }
++      if (info->chroma_site != GST_VIDEO_CHROMA_SITE_UNKNOWN) {
++        gchar *chroma_site = gst_video_chroma_site_to_string (info->chroma_site);
++        if (chroma_site) {
++          gst_caps_set_simple (caps, "chroma-site", G_TYPE_STRING, chroma_site,
++              NULL);
++          g_free (chroma_site);
++        }
++      }
++    }
 +
 +    out_state =
 +        gst_video_encoder_set_output_state (GST_VIDEO_ENCODER_CAST (self),
@@ -4927,23 +5069,33 @@ index 0000000..566b622
 +    nal_size = sizeof (nal_buf);
 +    memset (nal_buf, 0, sizeof (nal_buf));
 +
-+    res = gst_h265_bit_writer_sps (&self->sps, TRUE, nal_buf, &nal_size);
-+    if (res != GST_H265_BIT_WRITER_OK) {
-+      GST_ERROR_OBJECT (self, "Failed to generate the sequence header");
-+      goto bail;
++    /* Emit the driver's authoritative SPS NAL verbatim
++     * (Annex B, start code included). Fall back to the bit-writer only if the
++     * driver returned nothing. */
++    if (self->driver_sps_nal && self->driver_sps_nal_size > 0
++        && offset + self->driver_sps_nal_size <= (guint) orig_size) {
++      memcpy (info.data + offset, self->driver_sps_nal,
++          self->driver_sps_nal_size);
++      offset += self->driver_sps_nal_size;
++    } else {
++      res = gst_h265_bit_writer_sps (&self->sps, TRUE, nal_buf, &nal_size);
++      if (res != GST_H265_BIT_WRITER_OK) {
++        GST_ERROR_OBJECT (self, "Failed to generate the sequence header");
++        goto bail;
++      }
++
++      data = info.data + offset;
++      size = orig_size - offset;
++
++      res = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE, nal_buf,
++          nal_size * 8, data, &size);
++      if (res != GST_H265_BIT_WRITER_OK) {
++        GST_ERROR_OBJECT (self, "Failed to generate the SPS bytes");
++        goto bail;
++      }
++
++      offset += size + 1;
 +    }
-+
-+    data = info.data + offset;
-+    size = orig_size - offset;
-+
-+    res = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE, nal_buf,
-+        nal_size * 8, data, &size);
-+    if (res != GST_H265_BIT_WRITER_OK) {
-+      GST_ERROR_OBJECT (self, "Failed to generate the SPS bytes");
-+      goto bail;
-+    }
-+
-+    offset += size + 1;
 +  }
 +
 +  if (pic_type == STD_VIDEO_H265_PICTURE_TYPE_I
@@ -4951,23 +5103,31 @@ index 0000000..566b622
 +    guint8 nal_buf[4096] = { 0, };
 +    guint nal_size = sizeof (nal_buf);
 +
-+    res = gst_h265_bit_writer_pps (&self->pps, TRUE, nal_buf, &nal_size);
-+    if (res != GST_H265_BIT_WRITER_OK) {
-+      GST_ERROR_OBJECT (self, "Failed to generate the picture header");
-+      goto bail;
++    /* Emit the driver's authoritative PPS NAL verbatim. */
++    if (self->driver_pps_nal && self->driver_pps_nal_size > 0
++        && offset + self->driver_pps_nal_size <= (guint) orig_size) {
++      memcpy (info.data + offset, self->driver_pps_nal,
++          self->driver_pps_nal_size);
++      offset += self->driver_pps_nal_size;
++    } else {
++      res = gst_h265_bit_writer_pps (&self->pps, TRUE, nal_buf, &nal_size);
++      if (res != GST_H265_BIT_WRITER_OK) {
++        GST_ERROR_OBJECT (self, "Failed to generate the picture header");
++        goto bail;
++      }
++
++      data = info.data + offset;
++      size = orig_size - offset;
++
++      res = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE, nal_buf,
++          nal_size * 8, data, &size);
++      if (res != GST_H265_BIT_WRITER_OK) {
++        GST_ERROR_OBJECT (self, "Failed to generate the PPS bytes");
++        goto bail;
++      }
++
++      offset += size + 1;
 +    }
-+
-+    data = info.data + offset;
-+    size = orig_size - offset;
-+
-+    res = gst_h265_bit_writer_convert_to_nal (4, FALSE, TRUE, FALSE, nal_buf,
-+        nal_size * 8, data, &size);
-+    if (res != GST_H265_BIT_WRITER_OK) {
-+      GST_ERROR_OBJECT (self, "Failed to generate the PPS bytes");
-+      goto bail;
-+    }
-+
-+    offset += size + 1;
 +  }
 +
 +  /* HDR10 static-metadata prefix SEI, alongside the parameter sets on each IDR.
@@ -5186,15 +5346,30 @@ index 0000000..566b622
 +      .first_slice_segment_in_pic_flag =
 +          slice_hdr->first_slice_segment_in_pic_flag,
 +      .dependent_slice_segment_flag = slice_hdr->dependent_slice_segment_flag,
-+      /* Slice flags match the upstream MR #5739 encoder exactly. */
-+      .slice_sao_luma_flag = 1,
-+      .slice_sao_chroma_flag = 1,
++      /* Source the slice-level in-loop-filter flags FROM the now-authoritative
++       * SPS/PPS instead of hardcoding them. The upstream MR #5739 values
++       * (cu_chroma_qp_offset_enabled_flag=1, deblocking_filter_override_flag=1)
++       * disagree with the parameter sets the encoder actually signals
++       * (self->pps.pps_extension_params.chroma_qp_offset_list_enabled_flag=0,
++       * deblocking_filter_override_enabled_flag=0): those slice flags are only
++       * legal when the PPS enables the matching tool, so passing 1 tells the
++       * driver to reconstruct with an in-loop-filter state the bitstream cannot
++       * carry. A lenient decoder (ffmpeg) reconciles it; a strict one
++       * (VideoToolbox) reconstructs on the signalled state and the mismatch
++       * reads as per-frame flicker. Sourcing from the authoritative sets keeps
++       * the driver's encode-side filter state in lockstep with the bitstream.
++       * slice_sao_luma/chroma follow the SPS SAO flag (ChromaArrayType!=0 for the
++       * 4:2:0 profiles handled here). */
++      .slice_sao_luma_flag = self->sps.sample_adaptive_offset_enabled_flag,
++      .slice_sao_chroma_flag = self->sps.sample_adaptive_offset_enabled_flag,
 +      .num_ref_idx_active_override_flag =
 +          slice_hdr->num_ref_idx_active_override_flag,
 +      .mvd_l1_zero_flag = 0,
 +      .cabac_init_flag = slice_hdr->cabac_init_flag,
-+      .cu_chroma_qp_offset_enabled_flag = 1,
-+      .deblocking_filter_override_flag = 1,
++      .cu_chroma_qp_offset_enabled_flag =
++          self->pps.pps_extension_params.chroma_qp_offset_list_enabled_flag,
++      .deblocking_filter_override_flag =
++          self->pps.deblocking_filter_override_enabled_flag,
 +      .slice_deblocking_filter_disabled_flag = 0,
 +      .collocated_from_l0_flag = 0,
 +      .slice_loop_filter_across_slices_enabled_flag = 0,
@@ -5304,9 +5479,21 @@ index 0000000..566b622
 +  }
 +}
 +
++static void _update_live_bitrate (GstVulkanH265Encoder * self);
++
 +static void
 +update_properties_unlocked (GstVulkanH265Encoder * self)
 +{
++  /* PATCH (rc-fix): the rate-control state (self->rc) and the encoder's pending
++   * rate-control update are only ever written from the streaming thread,
++   * here, so recording a frame never sees a half-applied retarget. */
++  if (self->update_bitrate) {
++    self->update_bitrate = FALSE;
++    GST_OBJECT_UNLOCK (self);
++    _update_live_bitrate (self);
++    GST_OBJECT_LOCK (self);
++  }
++
 +  if (!self->update_props)
 +    return;
 +
@@ -5504,6 +5691,10 @@ index 0000000..566b622
 +gst_vulkan_h265_encoder_close (GstVideoEncoder * encoder)
 +{
 +  GstVulkanH265Encoder *self = GST_VULKAN_H265_ENCODER (encoder);
++
++  g_clear_pointer (&self->driver_sps_nal, g_free);
++  g_clear_pointer (&self->driver_pps_nal, g_free);
++  self->driver_sps_nal_size = self->driver_pps_nal_size = 0;
 +
 +  gst_clear_object (&self->encoder);
 +  gst_clear_object (&self->encode_queue);
@@ -5737,6 +5928,39 @@ index 0000000..566b622
 +  GST_OBJECT_UNLOCK (self);
 +}
 +
++/* PATCH (rc-fix): apply a bitrate change to an already-STARTED encoder without
++ * a reconfigure. Mirrors the rate half of _configure_rate_control() (clamp to
++ * the driver maximum, then CBR: max == average / VBR: the 66% target
++ * percentage); cpb_size is deliberately left alone, being a ratio of the two and
++ * therefore independent of the setpoint magnitude. Streaming thread only: it
++ * is called from update_properties_unlocked(), never from set_property(). */
++static void
++_update_live_bitrate (GstVulkanH265Encoder * self)
++{
++  GstVulkanVideoCapabilities vk_caps;
++  guint max_kbps;
++
++  if (!gst_vulkan_encoder_caps (self->encoder, &vk_caps))
++    return;
++
++  max_kbps = vk_caps.encoder.caps.maxBitrate / 1024;
++
++  GST_OBJECT_LOCK (self);
++  self->rc.bitrate = MIN (self->prop.bitrate, max_kbps);
++  if (self->rc.ratecontrol == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR) {
++    self->rc.max_bitrate = MIN ((guint)
++        gst_util_uint64_scale_int (self->rc.bitrate, 100, 66), max_kbps);
++  } else {
++    self->rc.max_bitrate = self->rc.bitrate;
++  }
++  GST_OBJECT_UNLOCK (self);
++
++  GST_DEBUG_OBJECT (self, "live bitrate retarget to %u kbps (max %u): no "
++      "session reset, no reconfigure", self->rc.bitrate, self->rc.max_bitrate);
++
++  gst_vulkan_encoder_request_rc_update (self->encoder);
++}
++
 +static void
 +gst_vulkan_h265_encoder_set_property (GObject * object, guint property_id,
 +    const GValue * value, GParamSpec * pspec)
@@ -5744,12 +5968,13 @@ index 0000000..566b622
 +  GstVulkanH265Encoder *self = GST_VULKAN_H265_ENCODER (object);
 +  GstH265Encoder *h264enc = GST_H265_ENCODER (object);
 +  gboolean reconfigure = FALSE;
++  gboolean bitrate_changed = FALSE;
 +
 +  GST_OBJECT_LOCK (self);
 +  switch (property_id) {
 +    case PROP_BITRATE:
 +      self->prop.bitrate = g_value_get_uint (value);
-+      reconfigure = TRUE;
++      bitrate_changed = TRUE;
 +      break;
 +    case PROP_AUD:
 +      self->prop.aud = g_value_get_boolean (value);
@@ -5788,6 +6013,31 @@ index 0000000..566b622
 +  }
 +  GST_OBJECT_UNLOCK (self);
 +
++  /* PATCH (rc-fix): a live bitrate change must NOT go through
++   * gst_h265_encoder_reconfigure(). The base class's configure() drains the
++   * encoder and calls gst_h265_encoder_reset(), which zeroes
++   * gop.cur_frame_index — so the very next frame is an IDR that restarts the
++   * GOP. Measured on an NVIDIA RTX 5090 with a standalone retarget probe:
++   * with the reconfigure, a retarget emits a key frame 0-1 frames later and
++   * realigns idr-period to the retarget point, i.e. under sustained ABR the
++   * keyframe interval collapses to the retarget interval. Removing the
++   * video-session reset alone does not fix that; the reconfigure is the
++   * IDR's actual source. Before start() there is nothing live to update, so
++   * the normal reconfigure path still runs. */
++  if (bitrate_changed) {
++    if (self->encoder && gst_vulkan_encoder_is_started (self->encoder)) {
++      /* only record the request: this is the application thread, while
++       * the rate-control state is read by the streaming thread as it
++       * records each frame. encode_frame() applies it before the next
++       * frame, like the QP properties and the base class reconfigure(). */
++      GST_OBJECT_LOCK (self);
++      self->update_bitrate = TRUE;
++      GST_OBJECT_UNLOCK (self);
++    } else {
++      reconfigure = TRUE;
++    }
++  }
++
 +  if (reconfigure)
 +    gst_h265_encoder_reconfigure (h264enc, FALSE);
 +}
@@ -5825,10 +6075,10 @@ index 0000000..566b622
 +  parent_class = g_type_class_peek_parent (klass);
 +
 +  src_doc_caps = gst_caps_from_string ("video/x-h265, "
-+      "profile = { (string) high, (string) main, (string) constrained-baseline }, "
++      "profile = { (string) main, (string) main-10 }, "
 +      "stream-format = (string) byte-stream, alignment = (string) au");
 +  sink_doc_caps = gst_caps_from_string (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-+      (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE, "NV12"));
++      (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE, "{ NV12, P010_10LE }"));
 +
 +  sink_pad_template =
 +      gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS, cdata->raw);
@@ -6023,6 +6273,44 @@ index 0000000..566b622
 +  g_free (cdata);
 +}
 +
++/* The element encodes the 4:2:0 Main and Main 10 profiles only (see
++ * H265ProfileMap and gst_h265_encoder_negotiate_default()), from NV12 and
++ * P010 input. gst_vulkan_physical_device_codec_caps() reports every profile
++ * the driver can encode, including the format range extensions (e.g.
++ * main-444 with NV24 input), so narrow the pad templates to what the
++ * element implements. Without this, a downstream that leaves the profile
++ * open negotiates one new_sequence() cannot start. */
++static gboolean
++_h265_restrict_to_encodable (GstCaps ** codec, GstCaps ** raw)
++{
++  GstCaps *filter, *tmp;
++
++  filter = gst_caps_from_string ("video/x-h265, "
++      "profile = (string) { main, main-10 }");
++  tmp = gst_caps_intersect (*codec, filter);
++  gst_caps_unref (filter);
++  gst_caps_unref (*codec);
++  *codec = tmp;
++
++  filter = gst_caps_from_string ("video/x-raw("
++      GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE
++      "), format = (string) { NV12, P010_10LE }");
++  tmp = gst_caps_intersect (*raw, filter);
++  gst_caps_unref (filter);
++  gst_caps_unref (*raw);
++  *raw = tmp;
++
++  if (gst_caps_is_empty (*codec) || gst_caps_is_empty (*raw)) {
++    gst_clear_caps (codec);
++    gst_clear_caps (raw);
++    return FALSE;
++  }
++
++  *codec = gst_caps_simplify (*codec);
++  *raw = gst_caps_simplify (*raw);
++  return TRUE;
++}
++
 +gboolean
 +gst_vulkan_h265_encoder_register (GstPlugin * plugin, GstVulkanDevice * device,
 +    guint rank)
@@ -6047,6 +6335,12 @@ index 0000000..566b622
 +          VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR, &codec, &raw)) {
 +    gst_plugin_add_status_warning (plugin,
 +        "Unable to query H.265 encoder properties");
++    return FALSE;
++  }
++
++  if (!_h265_restrict_to_encodable (&codec, &raw)) {
++    gst_plugin_add_status_warning (plugin,
++        "The Vulkan device can't encode H.265 Main or Main 10 4:2:0");
 +    return FALSE;
 +  }
 +

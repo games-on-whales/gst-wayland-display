@@ -56,3 +56,17 @@ wherever `vulkanh264enc` registers (an nvidia render node, or Intel with
 - The `vulkanh265enc`/`vulkanh264enc` Tier-1 path needs a gstreamer `main` build
   with Vulkan-Headers ≥ 1.4.317 and a recent mesa radv; it is not covered by the
   default matrix.
+
+## GStreamer patch chain (`ci/gst-patches.sh`)
+
+The harness runs inside the published `:vulkan` image, which builds GStreamer
+with `-Dtests=disabled`, so it never compiles the tests in `patches/`.
+`ci/gst-patches.sh` clones GStreamer (`GST_VERSION`, default 1.28.4), applies
+`patches/series`, builds with the unit tests enabled and runs the Vulkan video
+tests. CI runs it via `.github/workflows/gst-patches.yml` on any change to
+`patches/`; without a GPU the device-backed tests skip, and the GPU-free AV1
+reference-model test (`libs_vkvideoencodeav1refs`) runs.
+
+```bash
+ci/gst-patches.sh               # work dir defaults to ./.gst-patches
+```
