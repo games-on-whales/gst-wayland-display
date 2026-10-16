@@ -13,7 +13,7 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use utils::RenderTarget;
@@ -125,14 +125,15 @@ pub enum MaybeRecv<T: Clone> {
 }
 
 impl<T: Clone> MaybeRecv<T> {
-    pub fn get(&mut self) -> &T {
+    /// Waits for the compositor to publish the value. Errs if the compositor thread exited
+    /// before sending it (e.g. its renderer failed to initialize).
+    pub fn get(&mut self) -> Result<&T, RecvError> {
+        if let MaybeRecv::Rx(recv) = self {
+            *self = MaybeRecv::Value(recv.recv()?);
+        }
         match self {
-            MaybeRecv::Rx(recv) => {
-                let value = recv.recv().unwrap();
-                *self = MaybeRecv::Value(value.clone());
-                self.get()
-            }
-            MaybeRecv::Value(val) => val,
+            MaybeRecv::Value(val) => Ok(val),
+            MaybeRecv::Rx(_) => unreachable!(),
         }
     }
 }
@@ -228,18 +229,20 @@ impl WaylandDisplay {
         })
     }
 
-    pub fn devices(&mut self) -> impl Iterator<Item = &str> {
-        self.devices
-            .get()
+    pub fn devices(&mut self) -> Result<impl Iterator<Item = &str>, RecvError> {
+        Ok(self
+            .devices
+            .get()?
             .iter()
-            .map(|string| string.to_str().unwrap())
+            .map(|string| string.to_str().unwrap()))
     }
 
-    pub fn env_vars(&mut self) -> impl Iterator<Item = &str> {
-        self.envs
-            .get()
+    pub fn env_vars(&mut self) -> Result<impl Iterator<Item = &str>, RecvError> {
+        Ok(self
+            .envs
+            .get()?
             .iter()
-            .map(|string| string.to_str().unwrap())
+            .map(|string| string.to_str().unwrap()))
     }
 
     pub fn add_input_device(&self, path: impl Into<String>) {
