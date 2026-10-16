@@ -1,9 +1,9 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 new file mode 100644
-index 0000000..28c1e0a
+index 0000000..201afff
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
-@@ -0,0 +1,3047 @@
+@@ -0,0 +1,3120 @@
 +/* GStreamer
 + * Copyright (C) 2021 Intel Corporation
 + *    Author: He Junyan <junyan.he@intel.com>
@@ -51,6 +51,8 @@ index 0000000..28c1e0a
 +#endif
 +
 +#include "gsth265encoder.h"
++
++#include <stdlib.h>
 +
 +/**
 + * GST_FLOW_OUTPUT_NOT_READY:
@@ -1364,7 +1366,6 @@ index 0000000..28c1e0a
 +    GstH265EncoderFrame * frame, GstH265SliceHdr * slice_hdr)
 +{
 +  GstH265EncoderPrivate *priv = _GET_PRIV (self);
-+  gboolean is_irap = (frame->type.slice_type == GST_H265_I_SLICE);
 +
 +  /* HEVC slice segment header (single slice segment per picture for v1). The
 +   * H.264 fields (frame_num, field_pic_flag, dec_ref_pic_marking, MMCO,
@@ -1375,9 +1376,10 @@ index 0000000..28c1e0a
 +  *slice_hdr = (GstH265SliceHdr) {
 +    .pps = &priv->params.pps,
 +    .first_slice_segment_in_pic_flag = 1,
-+    /* IRAP pictures may carry no_output_of_prior_pics_flag; the subclass sets
-+     * the encode std flag for the conformant bit. */
-+    .no_output_of_prior_pics_flag = is_irap ? 1 : 0,
++    /* With B frames, the last pictures of a GOP are still waiting for output
++     * when the next IDR arrives: no_output_of_prior_pics_flag=1 would make
++     * the decoder discard them (one or more lost frames per GOP). */
++    .no_output_of_prior_pics_flag = 0,
 +    .dependent_slice_segment_flag = 0,
 +    .type = frame->type.slice_type,
 +    .pic_output_flag = 1,
@@ -1398,10 +1400,17 @@ index 0000000..28c1e0a
 +  };
 +  /* *INDENT-ON* */
 +
-+  /* A P slice references exactly one short-term picture in list0 (v1). */
-+  if (frame->type.slice_type == GST_H265_P_SLICE && priv->ref_list0->len > 0) {
++  /* Every picture in the reference lists is active, and the RPS flags
++   * exactly those as used by the current picture (_fill_short_term_rps()),
++   * so the decoder's RefPicList0 / RefPicList1 match the encoder's. The PPS
++   * defaults are one active reference per list. */
++  if (frame->type.slice_type != GST_H265_I_SLICE && priv->ref_list0->len > 0) {
 +    slice_hdr->num_ref_idx_active_override_flag = 1;
 +    slice_hdr->num_ref_idx_l0_active_minus1 = priv->ref_list0->len - 1;
++  }
++  if (frame->type.slice_type == GST_H265_B_SLICE && priv->ref_list1->len > 0) {
++    slice_hdr->num_ref_idx_active_override_flag = 1;
++    slice_hdr->num_ref_idx_l1_active_minus1 = priv->ref_list1->len - 1;
 +  }
 +
 +  /* Reorder the ref lists if needed. */
@@ -1503,6 +1512,66 @@ index 0000000..28c1e0a
 +  return (*b)->poc - (*a)->poc;
 +}
 +
++static gboolean
++_ref_list_contains (GArray * list, GstH265EncoderFrame * frame)
++{
++  for (guint i = 0; i < list->len; i++) {
++    if (g_array_index (list, GstH265EncoderFrame *, i) == frame)
++      return TRUE;
++  }
++  return FALSE;
++}
++
++/* Build the short-term reference picture set of @frame (H.265 7.4.8).
++ *
++ * The RPS must list every picture kept for reference, not only the ones
++ * @frame predicts from: a decoder marks any picture missing from it as
++ * unused for reference and evicts it. So it holds the whole reference
++ * queue, nearest first on each side of @frame, and flags as used by the
++ * current picture exactly the pictures in @list0 / @list1, which is what
++ * RefPicList0 / RefPicList1 hand to the subclass. */
++static void
++_fill_short_term_rps (GstH265Encoder * self, GstH265EncoderFrame * frame,
++    GArray * list0, GArray * list1, GstH265ShortTermRefPicSet * rps)
++{
++  GstH265EncoderPrivate *priv = _GET_PRIV (self);
++  GstH265EncoderFrame *neg[16], *pos[16];
++  guint n_neg = 0, n_pos = 0, i;
++
++  memset (rps, 0, sizeof (*rps));
++
++  for (i = 0; i < g_queue_get_length (&priv->ref_list); i++) {
++    GstH265EncoderFrame *ref =
++        _GET_FRAME ((GstVideoCodecFrame *) g_queue_peek_nth (&priv->ref_list,
++            i));
++
++    if (ref->poc < frame->poc && n_neg < G_N_ELEMENTS (neg))
++      neg[n_neg++] = ref;
++    else if (ref->poc > frame->poc && n_pos < G_N_ELEMENTS (pos))
++      pos[n_pos++] = ref;
++  }
++
++  qsort (neg, n_neg, sizeof (neg[0]),
++      (int (*)(const void *, const void *)) _poc_desc_compare);
++  qsort (pos, n_pos, sizeof (pos[0]),
++      (int (*)(const void *, const void *)) _poc_asc_compare);
++
++  rps->NumNegativePics = n_neg;
++  rps->NumPositivePics = n_pos;
++  rps->NumDeltaPocs = n_neg + n_pos;
++
++  for (i = 0; i < n_neg; i++) {
++    rps->DeltaPocS0[i] = neg[i]->poc - frame->poc;
++    rps->UsedByCurrPicS0[i] = _ref_list_contains (list0, neg[i])
++        || _ref_list_contains (list1, neg[i]);
++  }
++  for (i = 0; i < n_pos; i++) {
++    rps->DeltaPocS1[i] = pos[i]->poc - frame->poc;
++    rps->UsedByCurrPicS1[i] = _ref_list_contains (list0, pos[i])
++        || _ref_list_contains (list1, pos[i]);
++  }
++}
++
 +static GstFlowReturn
 +gst_h265_encoder_encode_frame_with_ref_lists (GstH265Encoder * self,
 +    GstVideoCodecFrame * frame)
@@ -1579,6 +1648,10 @@ index 0000000..28c1e0a
 +  g_assert (list0->len + list1->len <= priv->gop.num_ref_frames);
 +
 +  gst_h265_encoder_slicehdr_init (self, h264_frame, &slice_hdr);
++  if (h264_frame->type.slice_type != GST_H265_I_SLICE) {
++    _fill_short_term_rps (self, h264_frame, list0, list1,
++        &slice_hdr.short_term_ref_pic_sets);
++  }
 +
 +  g_assert (klass->encode_frame);
 +  return klass->encode_frame (self, frame, h264_frame, &slice_hdr, list0,
@@ -3441,10 +3514,10 @@ index ee93c9c..c01eb11 100644
    'vkvp9dec.c',
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
 new file mode 100644
-index 0000000..6ff60ce
+index 0000000..f136b01
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
-@@ -0,0 +1,2926 @@
+@@ -0,0 +1,2937 @@
 +/* GStreamer
 + * Copyright (C) 2025 Igalia, S.L.
 + *     Author: Stéphane Cerveau <scerveau@igalia.com>
@@ -5289,6 +5362,42 @@ index 0000000..6ff60ce
 +  return _GET_FRAME (h264_frame)->picture.dpb_slot.slotIndex;
 +}
 +
++/* Convert the RPS the base class built (POC deltas relative to the current
++ * picture, nearest first) into the explicit short-term RPS syntax the driver
++ * writes into the slice header. Each delta_poc_sX_minus1[i] is the step from
++ * the previous entry (H.265 7.4.8, eq. 7-61/7-62), and used_by_curr_pic_sX_flag
++ * is a bitmask with bit i for entry i. Every entry must be written: an entry
++ * left at zero signals a picture one POC step away, which does not exist
++ * when POCs advance by two per frame. */
++static void
++_setup_short_term_rps (GstVulkanH265EncoderFrame * vk_frame,
++    const GstH265ShortTermRefPicSet * rps)
++{
++  StdVideoH265ShortTermRefPicSet *vk_rps = &vk_frame->short_term_ref_pic_set;
++  gint32 prev;
++  guint i;
++
++  memset (vk_rps, 0, sizeof (*vk_rps));
++  vk_rps->num_negative_pics = rps->NumNegativePics;
++  vk_rps->num_positive_pics = rps->NumPositivePics;
++
++  prev = 0;
++  for (i = 0; i < rps->NumNegativePics; i++) {
++    vk_rps->delta_poc_s0_minus1[i] = prev - rps->DeltaPocS0[i] - 1;
++    if (rps->UsedByCurrPicS0[i])
++      vk_rps->used_by_curr_pic_s0_flag |= 1 << i;
++    prev = rps->DeltaPocS0[i];
++  }
++
++  prev = 0;
++  for (i = 0; i < rps->NumPositivePics; i++) {
++    vk_rps->delta_poc_s1_minus1[i] = rps->DeltaPocS1[i] - prev - 1;
++    if (rps->UsedByCurrPicS1[i])
++      vk_rps->used_by_curr_pic_s1_flag |= 1 << i;
++    prev = rps->DeltaPocS1[i];
++  }
++}
++
 +static void
 +_setup_ref_lists (GstH265EncoderFrame * h265_frame, GstH265SliceHdr * slice_hdr,
 +    GArray * list0, GArray * list1)
@@ -5516,7 +5625,6 @@ index 0000000..6ff60ce
 +  StdVideoH265PictureType pic_type =
 +      _gst_slice_type_2_vk_pic_type (&h264_frame->type);
 +  gboolean is_irap = (h264_frame->type.slice_type == GST_H265_I_SLICE);
-+  gint16 delta_poc_s0_minus1 = 0, delta_poc_s1_minus1 = 0;
 +
 +  if (!gst_vulkan_encoder_is_started (self->encoder))
 +    return GST_FLOW_NOT_NEGOTIATED;
@@ -5525,33 +5633,9 @@ index 0000000..6ff60ce
 +  update_properties_unlocked (self);
 +  GST_OBJECT_UNLOCK (self);
 +
-+  if (list0->len > 0) {
-+    GstH265EncoderFrame *ref = g_array_index (list0, GstH265EncoderFrame *, 0);
-+    delta_poc_s0_minus1 = h264_frame->poc - ref->poc - 1;
-+  }
-+  if (list1->len > 0) {
-+    GstH265EncoderFrame *ref = g_array_index (list1, GstH265EncoderFrame *, 0);
-+    delta_poc_s1_minus1 = ref->poc - h264_frame->poc - 1;
-+  }
++  _setup_short_term_rps (vk_frame, &slice_hdr->short_term_ref_pic_sets);
 +
 +  /* *INDENT-OFF* */
-+  vk_frame->short_term_ref_pic_set = (StdVideoH265ShortTermRefPicSet) {
-+    .flags = (StdVideoH265ShortTermRefPicSetFlags) {
-+      .inter_ref_pic_set_prediction_flag = 0u,
-+      .delta_rps_sign = 0u,
-+    },
-+    .delta_idx_minus1 = 0,
-+    .use_delta_flag = 0,
-+    .abs_delta_rps_minus1 = 0,
-+    .used_by_curr_pic_flag = 0,
-+    .used_by_curr_pic_s0_flag = list0->len ? 1 : 0,
-+    .used_by_curr_pic_s1_flag = list1->len ? 1 : 0,
-+    .num_negative_pics = list0->len,
-+    .num_positive_pics = list1->len,
-+    .delta_poc_s0_minus1 = { delta_poc_s0_minus1 },
-+    .delta_poc_s1_minus1 = { delta_poc_s1_minus1 },
-+  };
-+
 +  vk_frame->h265pic_info = (StdVideoEncodeH265PictureInfo) {
 +    .flags = {
 +      .is_reference = h264_frame->type.is_ref,

@@ -79,6 +79,7 @@ TESTS=(
   libs_vkvideoencodeh265
   elements_vkencoderetarget
   elements_vkav1enc
+  elements_vkh265enc
 )
 echo "==> test: ${TESTS[*]}"
 meson test -C "$BUILD" --no-rebuild --print-errorlogs "${TESTS[@]}"

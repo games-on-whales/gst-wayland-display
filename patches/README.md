@@ -33,10 +33,18 @@ Adds a Vulkan **H.265/HEVC** video-encode element (`vulkanh265enc`), ported from
 the upstream `vulkanh264enc` (`GstH264Encoder` → new `GstH265Encoder` base +
 `vkh265enc` element). HEVC specifics: VPS+SPS+PPS (std structs use pointer
 sub-structs: profile-tier-level, DecPicBufMgr, per-slice ShortTermRefPicSet,
-VUI), POC-based picture order, segment-based slice headers, `no_output_of_prior_
-pics_flag` on IDR, CABAC-implicit (no entropy-mode flag, WPP/tiles off), and a
-2-slot DPB for single-reference P frames. Includes the same DPB-pool-in-
-`new_sequence` interpipe fix as the H.264 patch above.
+VUI), POC-based picture order, segment-based slice headers, CABAC-implicit (no
+entropy-mode flag, WPP/tiles off), and an explicit short-term RPS per slice.
+Includes the same DPB-pool-in-`new_sequence` interpipe fix as the H.264 patch
+above.
+
+Each slice's RPS lists every picture held for reference, nearest first, with
+the pictures in RefPicList0 / RefPicList1 flagged as used by the current
+picture and all of them active, so a decoder predicts from the same pictures
+as the encoder. IDR pictures leave `no_output_of_prior_pics_flag` at 0, so a
+GOP that ends on B frames doesn't lose the pictures still waiting for output.
+`elements_vkh265enc` parses the encoder's output and checks both, with P and
+B frames.
 
 New files (`subprojects/gst-plugins-bad/ext/vulkan/`): `base/gsth265encoder.{c,h}`,
 `vkh265enc.{c,h}`; plus `meson.build` + `gstvulkan.c` registration. Apply *after*
