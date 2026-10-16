@@ -831,38 +831,13 @@ pub fn gst_video_format_to_drm_modifier(format: &VideoInfoDmaDrm) -> Option<DrmM
 mod tests {
     use super::*;
     use crate::utils::renderer::setup_renderer;
-    use crate::utils::tests::test_init;
+    use crate::utils::tests::{pick_render_node, test_init};
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
 
     /// Skip the current hardware-gated test (print why, return).
     macro_rules! skip {
         ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
-    }
-
-    /// A render node whose kernel driver is one of `drivers`, for hardware-gated
-    /// tests -- so they target the right GPU on a multi-GPU host instead of a
-    /// hardcoded `renderD12x` that may be a different vendor.
-    fn pick_render_node(drivers: &[&str]) -> Option<DrmNode> {
-        for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("renderD") {
-                continue;
-            }
-            let drv = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/uevent"))
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find_map(|l| l.strip_prefix("DRIVER=").map(str::to_owned))
-                })
-                .unwrap_or_default();
-            if drivers.iter().any(|d| *d == drv) {
-                if let Ok(node) = DrmNode::from_path(format!("/dev/dri/{name}")) {
-                    return Some(node);
-                }
-            }
-        }
-        None
     }
 
     /// Adapted from: https://github.com/games-on-whales/smithay/blob/master/examples/buffer_test.rs#L277

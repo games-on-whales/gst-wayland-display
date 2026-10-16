@@ -86,7 +86,6 @@ use crate::utils::allocator::{
     GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
 };
-use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
 use crate::{
@@ -1075,25 +1074,6 @@ pub(crate) fn init(
                     };
                     debug!("Supported dma formats: {:?}", supported_formats);
                     let _ = sender.send(supported_formats);
-                }
-                Event::Msg(Command::GetRenderDevice(sender)) => {
-                    let render_device: Option<GPUDevice> = match &state.render_node {
-                        Some(node) => {
-                            let result = GPUDevice::try_from(*node);
-                            match result {
-                                Ok(device) => Some(device),
-                                Err(err) => {
-                                    tracing::warn!("Error during GetRenderDevice: {}", err);
-                                    None
-                                }
-                            }
-                        }
-                        None => None,
-                    };
-                    debug!("Render device requested: {:?}", render_device);
-                    if let Err(err) = sender.send(render_device) {
-                        tracing::warn!(?err, "Failed to send render device.");
-                    }
                 }
                 Event::Msg(Command::TouchDown(id, rel_position)) => {
                     let time: Duration = state.clock.now().into();
