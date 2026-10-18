@@ -252,6 +252,22 @@ impl WaylandClient {
             .unwrap_or(0)
     }
 
+    /// Destroy this client's `wl_pointer` and request a fresh one from the seat.
+    ///
+    /// Reproduces a client that calls `wl_seat.get_pointer` LATE -- after the compositor
+    /// has already resolved pointer focus. The new resource has never received a
+    /// `wl_pointer.enter`, which is exactly the state rootful Xwayland is in after a map
+    /// (it creates its pointer once the seat capabilities arrive, which can land after the
+    /// toplevel is mapped and focused).
+    pub fn recreate_pointer(&mut self) {
+        let qh = self.qh.clone();
+        if let Some(old) = self.state.pointer.take() {
+            old.release();
+        }
+        let seat = self.state.seat.as_ref().expect("no wl_seat bound").clone();
+        self.state.pointer = Some(seat.get_pointer(&qh, ()));
+    }
+
     /// Call this to start receiving Relative events in `get_client_events()`
     pub fn get_relative_pointer(&mut self) -> ZwpRelativePointerV1 {
         let qh = self.qh.clone();
