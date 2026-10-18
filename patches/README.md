@@ -56,9 +56,10 @@ driver's H.265 encode profiles report (NVIDIA also reports `main-444` from
 NV24), so a downstream that leaves `profile` open still negotiates a profile
 the element can start.
 
-Status: compiles + links + loads clean on 1.28.4; HEVC bitstream design
-roundtable-approved. Pending hardware validation on AMD (RADV
-`RADV_PERFTEST=video_encode`) before any upstream MR.
+Status: validated on NVIDIA RTX 5090, including Main/Main-10, multiple
+references, B frames, strict decoding, RPS/IDR output and live bitrate changes
+(see the RPS/IDR regression tests in the patch). AMD H.265 encode validation
+is still pending; the successful AMD H.264 tests do not establish H.265 support.
 
 (The Vulkan-encode path also needs the device to enable the external-memory
 extensions that `GstVulkanDevice` does not — `VK_KHR_external_memory_fd` etc. —
@@ -74,8 +75,11 @@ The dev container (`.devcontainer/Dockerfile`) builds this automatically — see
 it does.
 
 Built against the `gstreamer` monorepo at tag **1.28.4** (also tested on
-1.29.1). `gstreamer-rs` 0.25 needs the GStreamer C library **>= 1.28**, which no
-distro (or games-on-whales) image ships yet — so it must be built from source.
+1.29.1). The shared Vulkan encode path enables the bindings' `v1_28` API and requires
+**GStreamer Vulkan >= 1.28**, including at build time for the C bridge. This
+also applies to CUDA-only use of the current unified plugin build. Distributions
+with older GStreamer must build a newer prefix; the Vulkan module is not yet
+an optional Cargo feature.
 
 Build deps:
 
@@ -117,3 +121,15 @@ Two gotchas:
    `if not get_option('doc').allowed() subdir_done() endif` to each
    `subprojects/*/docs/meson.build` (and `docs/meson.build`). (gst-interpipe, if
    built in the same tree, likewise needs `-Denable-gtk-doc=false`.)
+
+### Live bitrate lock scope
+
+In GStreamer 1.28.4, H.264's only `update_properties_unlocked()` caller is
+`gst_vulkan_h264_encoder_encode_frame()`: it takes the object lock immediately
+before the call and releases it immediately after. The rc-fix helper temporarily
+releases that lock to query encoder capabilities, then reacquires it to snapshot
+and apply the latest property value. A concurrent setter only records the next
+request; `self->rc` is updated on the streaming thread. No caller relies on other
+state remaining locked across this helper. Preserve the streaming-thread-only
+contract when rebasing the patch; the live-retarget test exercises concurrent
+property changes.

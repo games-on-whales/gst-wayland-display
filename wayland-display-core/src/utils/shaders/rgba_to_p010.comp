@@ -1,8 +1,8 @@
 #version 450
-// RGBA -> P010 (10-bit 4:2:0, BT.601 limited range). One invocation per 2x2 chroma block:
+// RGBA -> P010 (10-bit 4:2:0, BT.709 limited range). One invocation per 2x2 chroma block:
 // writes 4 luma samples to the Y plane and one interleaved Cb/Cr to the UV plane.
 //
-// Identical math to rgba_to_nv12.comp -- the only difference is the storage images are
+// BT.709 limited-range matrix; the storage images are
 // 16-bit (r16 / rg16) instead of 8-bit. We write the SAME normalized luma/chroma floats:
 // an r16 imageStore of a normalized value f writes round(f * 65535) across all 16 bits, and
 // the P010 (G10X6...) format the encoder reads only looks at the top 10 bits, so the
@@ -22,7 +22,7 @@ layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
 
 layout(push_constant) uniform Push { ivec2 size; } pc;
 
-float luma(vec3 c) { return 0.257 * c.r + 0.504 * c.g + 0.098 * c.b + 0.0625; }
+float luma(vec3 c) { return 0.183 * c.r + 0.614 * c.g + 0.062 * c.b + 0.0625; }
 
 void main() {
     ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
@@ -40,7 +40,7 @@ void main() {
     imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
 
     vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average
-    float cb = -0.148 * a.r - 0.291 * a.g + 0.439 * a.b + 0.5;
-    float cr =  0.439 * a.r - 0.368 * a.g - 0.071 * a.b + 0.5;
+    float cb = -0.101 * a.r - 0.339 * a.g + 0.439 * a.b + 0.5;
+    float cr =  0.439 * a.r - 0.399 * a.g - 0.040 * a.b + 0.5;
     imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
 }

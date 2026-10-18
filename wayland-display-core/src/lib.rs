@@ -162,6 +162,7 @@ impl WaylandDisplay {
                     envs_tx,
                     hdr_state_tx,
                     compositor_vulkan_share,
+                    Arc::new(Default::default()),
                 );
             }) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -184,6 +185,7 @@ impl WaylandDisplay {
         command_tx: Sender<Command>,
         commands_rx: Channel<Command>,
         vulkan_share: Arc<VulkanShare>,
+        va_share: Arc<crate::utils::va_share::VaShare>,
     ) -> Result<WaylandDisplay, CreateDrmNodeError> {
         let (devices_tx, devices_rx) = std::sync::mpsc::channel();
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
@@ -205,6 +207,7 @@ impl WaylandDisplay {
                 envs_tx,
                 hdr_state_tx,
                 compositor_vulkan_share,
+                va_share,
             );
         });
 

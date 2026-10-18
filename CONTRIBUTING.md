@@ -1,14 +1,13 @@
 # Contributing / Building
 
 `gst-plugin-wayland-display` is a GStreamer plugin written in Rust. Its build has
-a few hard version floors that no current distro image satisfies out of the box,
-so the supported way to build it is the provided container.
+several version floors; use a recent distro or the provided container.
 
 ## Version floors
 
 | Dependency        | Minimum   | Why                                                                 |
 | ----------------- | --------- | ------------------------------------------------------------------- |
-| GStreamer (C lib) | **1.28**  | `gstreamer-rs` 0.25 requires it                                     |
+| GStreamer (C lib) | **1.28**  | Shared Vulkan encode API (`v1_28`) and C bridge require it                                     |
 | Vulkan headers    | **1.4.317** | `vulkanh264enc` (Vulkan-encode path) only builds against these    |
 | libwayland        | **1.23**  | `wl_client_set_max_buffer_size` (raised max buffer size)            |
 | rustc             | **1.94**  | `gstreamer-rs` 0.25 (≥1.92) and current `cargo-c` (≥1.94)           |

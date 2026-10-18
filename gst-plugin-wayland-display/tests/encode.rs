@@ -170,22 +170,24 @@ fn supported_nv12_modifiers_nonempty() {
 }
 
 /// The Vulkan-encode happy path: the source hands `vulkanh264enc` a shared-device
-/// NV12 `memory:VulkanImage` and drives it to EOS. Needs an nvidia GPU (the only
-/// `vulkanh264enc`-capable driver in our fleet).
+/// NV12 `memory:VulkanImage` and drives it to EOS on AMD or NVIDIA. Explicit
+/// dimensions also exercise NVENC above its minimum supported frame size.
 #[test]
-#[ignore = "needs an nvidia GPU with vulkanh264enc; run via ci/harness.sh gpu"]
-fn nvidia_vulkan_encode_to_eos() {
+#[ignore = "needs AMD/NVIDIA with vulkanh264enc; run via ci/harness.sh gpu"]
+fn vulkan_encode_to_eos() {
     init();
-    let Some(node) = render_node_for(&["nvidia"]) else {
-        skip!("no nvidia render node")
+    let Some(node) = render_node_for(&["amdgpu", "nvidia"]) else {
+        skip!("no AMD/NVIDIA render node")
     };
     if !have("vulkanh264enc") {
         skip!("no vulkanh264enc (needs Vulkan video-encode)");
     }
     run_to_eos(&format!(
-        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=20 ! vulkanh264enc ! fakesink"
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=60 ! \
+         video/x-raw(memory:VulkanImage),width=1280,height=720,framerate=60/1 \
+         ! vulkanh264enc ! fakesink"
     ))
-    .expect("nvidia Vulkan encode");
+    .expect("Vulkan encode");
 }
 
 /// Regression for the device-sharing race: forcing `memory:VulkanImage` with **no**

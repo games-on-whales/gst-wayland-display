@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 /// highlights) into the Vulkan P010/PQ converter instead of clamping them at 8-bit white.
 /// Both unset = byte-for-byte the current 8-bit path.
 fn rgba_render_fourcc() -> DrmFourcc {
-    if std::env::var("WOLF_HDR_SPIKE").is_ok() || std::env::var("WOLF_HDR_CM").is_ok() {
+    if std::env::var("WOLF_HDR_SPIKE").is_ok() || crate::utils::vulkan_nv12::wolf_hdr_cm() {
         DrmFourcc::Abgr16161616f
     } else {
         DrmFourcc::Abgr8888
@@ -207,6 +207,8 @@ impl GsNv12Buf {
         render_node: DrmNode,
         video_info: VideoInfoDmaDrm,
         fmt: PixFmt,
+        va_share: &crate::utils::va_share::VaShare,
+        options: crate::utils::vulkan_nv12::ConversionOptions,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
         // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
@@ -256,7 +258,15 @@ impl GsNv12Buf {
         // The converter samples the fp16 (linear) render target when it was allocated as such
         // (WOLF_HDR_SPIKE / WOLF_HDR_CM); the input format -- not the env -- selects the shader.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
-        let vulkan = VulkanNv12::new(render_node, video_info.clone(), fmt, bt2020, fp16_input)?;
+        let vulkan = VulkanNv12::new(
+            render_node,
+            video_info.clone(),
+            fmt,
+            bt2020,
+            fp16_input,
+            va_share,
+            options,
+        )?;
         Some(GsNv12Buf {
             rgba,
             vulkan: Arc::new(Mutex::new(vulkan)),
@@ -343,7 +353,16 @@ impl GsVulkanBuf {
         // (WOLF_HDR_SPIKE / WOLF_HDR_CM); the input format -- not the env -- selects the shader.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
-            dev, raw, &out_caps, &profile, w, h, fmt, bt2020, fp16_input,
+            dev,
+            raw,
+            &out_caps,
+            &profile,
+            w,
+            h,
+            fmt,
+            bt2020,
+            fp16_input,
+            vulkan_share.conversion_options(),
         )?;
         Some(GsVulkanBuf {
             rgba,

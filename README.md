@@ -233,3 +233,55 @@ while(true){
 
 display_finish(w_state); // Cleanup
 ```
+### Vulkan conversion configuration
+
+Use explicit dimensions when connecting a Vulkan encoder; NVENC rejects the
+small test dimensions selected by an unconstrained pipeline. For example:
+
+```sh
+gst-launch-1.0 waylanddisplaysrc render-node=/dev/dri/renderD128 vulkan=true \
+  ring-depth=4 ! 'video/x-raw(memory:VulkanImage),width=1280,height=720,framerate=60/1' \
+  ! vulkanh264enc ! fakesink
+```
+
+Set these properties before starting the pipeline. They belong to each source,
+so independent sessions may use different values:
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `ring-depth` | 4 | Allocated conversion slots, 1–4. Keep 4 for streaming unless you have verified a smaller ring with your consumers. A retained previous image can exhaust a 1–2 slot ring. |
+| `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Useful for drivers with tiled copy issues. |
+| `sdr-reference-white` | 203 | SDR white level in nits for SDR → PQ conversion, 1–10000. |
+| `vulkan-profile` | format-dependent | H.264 `high` by default for NV12; set `main` or `constrained-baseline` etc. to match the encoder. P010 requires `main-10` (H.265). |
+
+Legacy `WOLF_VULKAN_RING`, `WOLF_VULKAN_LINEAR_ENCSRC` and
+`WOLF_SDR_REFERENCE_WHITE` variables supply defaults; properties take precedence.
+A directly connected H.264 encoder's fixed output profile is discovered through
+simple filters and queues. Raw caps cannot express an encoder's codec/profile
+across interpipe. Configure `vulkan-profile` consistently with that consumer; an incompatible profile can
+force a copy or be rejected by the driver. The source creates raw frames, and
+encoding remains downstream so lobbies can fan out to multiple consumers.
+
+LINEAR Vulkan images carry their real plane offsets and strides in `VideoMeta`.
+OPTIMAL-tiled Vulkan images have no portable byte layout: their `VideoMeta`
+describes logical planes only and **must not be used for CPU row addressing**.
+Consumers must use the VkImage and a Vulkan-aware conversion/download element.
+The converter waits for GPU completion on the Vulkan encode path before exposing
+an image, paying that synchronization latency per frame; VA dmabuf output uses
+implicit synchronization where the driver supports it.
+
+The plugin does not change process environment variables when loaded. If a host
+hits a lavapipe/Mesa LLVM initialization collision, configure
+`VK_LOADER_DRIVERS_DISABLE='*lvp_icd*'` in the launching process before it starts.
+Software Vulkan remains available to embedding applications by default.
+
+`WOLF_HDR_CM` enables dynamic HDR signaling and is read once per process;
+`WOLF_HDR_MASTERING` and `WOLF_HDR_CLL` override static HDR metadata. Diagnostic
+knobs `WOLF_HDR_SPIKE`, `WOLF_VULKAN_DUMP`, and `WOLF_VULKAN_DUMP_FRAME` remain
+environment variables. Regenerate committed SPIR-V with `bash ci/shaders.sh
+--update`; CI recompiles and compares every shader with its GLSL source.
+
+The current unified build requires **GStreamer Vulkan >= 1.28** and Vulkan loader
+headers, even when only the CUDA/VA path is used. The bindings' Vulkan `v1_28`
+feature and header-compiled bridge enforce this; older distro GStreamer needs a
+newer installation prefix. See [CONTRIBUTING.md](CONTRIBUTING.md).

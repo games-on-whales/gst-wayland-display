@@ -62,3 +62,29 @@ wayland_display_vk_prepare_encode_image (GstMemory *memory)
   image->barrier.parent.semaphore_value = 0;
   image->barrier.image_layout = VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR;
 }
+
+/* Subresource byte layouts exist only for LINEAR images. OPTIMAL images are
+ * opaque: consumers must access the VkImage, never interpret VideoMeta as a map. */
+gboolean
+wayland_display_vk_linear_layout (GstMemory *memory, gsize *offsets, gint *strides)
+{
+  GstVulkanImageMemory *image = (GstVulkanImageMemory *) memory;
+  PFN_vkGetImageSubresourceLayout get_layout;
+  if (image->create_info.tiling != VK_IMAGE_TILING_LINEAR)
+    return FALSE;
+  get_layout = (PFN_vkGetImageSubresourceLayout)
+      gst_vulkan_device_get_proc_address (image->device, "vkGetImageSubresourceLayout");
+  if (!get_layout)
+    return FALSE;
+  for (guint p = 0; p < 2; p++) {
+    VkImageSubresource sub = { p == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT :
+        VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0 };
+    VkSubresourceLayout layout;
+    get_layout (image->device->device, image->image, &sub, &layout);
+    if (layout.rowPitch > G_MAXINT)
+      return FALSE;
+    offsets[p] = layout.offset;
+    strides[p] = layout.rowPitch;
+  }
+  return TRUE;
+}

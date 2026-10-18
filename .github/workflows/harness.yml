@@ -12,21 +12,18 @@ jobs:
     name: harness (lint · build · unit)
     runs-on: ubuntu-latest
     container:
-      # The project's own image: patched GStreamer 1.28 at /opt/gst (gstreamer-rs
-      # 0.25 needs >= 1.28; the old gstreamer:1.26.7 base is too old) plus all the
-      # build deps. PKG_CONFIG_PATH/LD_LIBRARY_PATH are baked into the image ENV.
-      image: ghcr.io/games-on-whales/gst-wayland-display:vulkan
+      # Independent distro base: a fresh fork can run CPU checks before it has
+      # published its own patched Vulkan image. Patched encoder tests run separately.
+      image: archlinux:base
     steps:
       - uses: actions/checkout@v4
 
       - name: System dependencies
-        # Image already carries the gst-1.28 + link deps; only ensure the extras
-        # the harness's non-GPU phases need are present (idempotent on Fedora).
         run: |
-          dnf install -y \
-            git openssl-devel libicu \
-            wayland-devel libinput-devel libxkbcommon-devel mesa-libgbm-devel \
-            mesa-libEGL-devel mesa-libGLES-devel systemd-devel clang clang-devel
+          pacman -Syu --noconfirm --needed base-devel git curl openssl icu \
+            gstreamer gst-plugins-base-libs gst-plugins-bad-libs \
+            wayland libinput libxkbcommon mesa libdrm systemd-libs \
+            clang pkgconf vulkan-headers vulkan-icd-loader
 
       - name: Rust toolchain
         run: |

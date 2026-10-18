@@ -83,8 +83,8 @@ const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt20
 /// render target (1.0 == SDR reference white, may exceed 1.0) instead of 8-bit sRGB, so it skips
 /// the sRGB EOTF and tone-maps the already-linear value straight to PQ -- proving a >1.0 value
 /// can travel render-target -> converter -> P010 PQ as a brighter-than-white highlight. Selected
-/// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is an
-/// empty placeholder; compile `shaders/rgba_to_p010_hdr.comp` with glslc before using the spike.
+/// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is a
+/// compiled shader; regenerate it with `ci/shaders.sh --update` after changing the GLSL.
 // Retained for the WOLF_HDR_SPIKE linear-bars proof; the real SDR path uses the sRGB
 // tone-map and HDR content uses the passthrough pipeline, so this is otherwise unused.
 #[allow(dead_code)]
@@ -94,8 +94,8 @@ const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv
 /// no sRGB EOTF, no 709->2020 gamut, no PQ OETF -- because its input is already PQ-encoded
 /// BT.2020 (gamescope's 10-bit XB30/AB30/XR30/AR30 HDR output, composited into the fp16
 /// target). Selected per frame via `convert(pq_passthrough=true)` so a 10-bit client frame
-/// isn't double-PQ'd (washed out) by the tone-mapping shader. NOTE: the checked-in `.spv` is an
-/// empty placeholder; compile `shaders/rgba_pqpass_to_p010.comp` with glslc before using it.
+/// isn't double-PQ'd (washed out) by the tone-mapping shader. NOTE: the checked-in `.spv` is a
+/// compiled shader; regenerate it with `ci/shaders.sh --update` after changing the GLSL.
 const RGBA_PQPASS_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_pqpass_to_p010.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
@@ -415,13 +415,13 @@ struct Nv12Out {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     desc_set: vk::DescriptorSet,
-    /// Cached RGBA import (keyed by the source dmabuf fd): the VkImage/memory/view over the
+    /// Cached RGBA import (keyed by the source dmabuf device/inode): the VkImage/memory/view over the
     /// compositor's RGBA dmabuf. The compositor renders into a single stable buffer, so
     /// this is created once per slot and reused every frame -- avoiding a per-frame
     /// create_image + dma-buf memory import + view. The import views the dmabuf the
     /// compositor overwrites in place, so a reused import reads the latest content. Rebuilt
-    /// only if the fd ever changes; freed at drop.
-    import: Option<(i32, Import)>,
+    /// only if the backing object changes; freed at drop.
+    import: Option<((u64, u64), Import)>,
     /// Whether `fence` has un-reclaimed GPU work (i.e. `cmd` is still in use).
     in_flight: bool,
 }
@@ -481,6 +481,50 @@ impl std::fmt::Debug for VulkanNv12 {
     }
 }
 
+/// Per-source conversion settings. Legacy environment variables supply defaults;
+/// element properties override them before the pipeline starts.
+#[derive(Clone, Copy, Debug)]
+pub struct ConversionOptions {
+    pub ring_depth: usize,
+    pub linear_encode_src: bool,
+    pub sdr_reference_white: f32,
+}
+
+impl Default for ConversionOptions {
+    fn default() -> Self {
+        Self {
+            ring_depth: ring_used(),
+            linear_encode_src: std::env::var("WOLF_VULKAN_LINEAR_ENCSRC")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            sdr_reference_white: sdr_reference_white(),
+        }
+    }
+}
+
+fn dma_buf_identity(fd: RawFd) -> Result<(u64, u64), std::io::Error> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn recycled_fd_invalidates_import_identity() {
+        let first = tempfile::tempfile().unwrap();
+        let second = tempfile::tempfile().unwrap();
+        let fd = first.as_raw_fd();
+        let original = dma_buf_identity(fd).unwrap();
+        assert_eq!(unsafe { libc::dup2(second.as_raw_fd(), fd) }, fd);
+        assert_ne!(dma_buf_identity(fd).unwrap(), original);
+    }
+}
+
 impl VulkanNv12 {
     /// Bring up Vulkan, build the compute pipeline, and allocate the NV12 export ring for
     /// `video_info`'s resolution, exporting with the negotiated modifier.
@@ -490,6 +534,8 @@ impl VulkanNv12 {
         fmt: PixFmt,
         bt2020: bool,
         fp16_input: bool,
+        va_share: &crate::utils::va_share::VaShare,
+        options: ConversionOptions,
     ) -> Option<Self> {
         let width = video_info.width();
         let height = video_info.height();
@@ -511,6 +557,8 @@ impl VulkanNv12 {
                 fmt,
                 bt2020,
                 fp16_input,
+                va_share,
+                options,
             )
         } {
             Ok(v) => Some(v),
@@ -530,6 +578,8 @@ impl VulkanNv12 {
         fmt: PixFmt,
         bt2020: bool,
         fp16_input: bool,
+        va_share: &crate::utils::va_share::VaShare,
+        options: ConversionOptions,
     ) -> Result<Self, Err> {
         let entry = ash::Entry::load()?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
@@ -611,7 +661,7 @@ impl VulkanNv12 {
         // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
         // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
         // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
-        let sdr_ref_white = sdr_reference_white();
+        let sdr_ref_white = options.sdr_reference_white;
         let pipeline = build_compute_pipeline(
             &device,
             pipeline_layout,
@@ -654,11 +704,12 @@ impl VulkanNv12 {
         let want_direct = export_modifier == DRM_FORMAT_MOD_LINEAR;
         let build = |direct: bool| -> Result<Vec<Nv12Out>, Err> {
             tracing::debug!(
-                "VulkanNv12: creating {RING} export images {width}x{height} \
-                 modifier={export_modifier:#x} direct={direct}"
+                "VulkanNv12: creating {} export images {width}x{height} \
+                 modifier={export_modifier:#x} direct={direct}",
+                options.ring_depth
             );
-            let mut outputs = Vec::with_capacity(RING);
-            for _ in 0..RING {
+            let mut outputs = Vec::with_capacity(options.ring_depth);
+            for _ in 0..options.ring_depth {
                 outputs.push(create_output(
                     &instance,
                     &device,
@@ -672,6 +723,7 @@ impl VulkanNv12 {
                     export_modifier,
                     direct,
                     fmt,
+                    va_share,
                 )?);
             }
             Ok(outputs)
@@ -748,10 +800,12 @@ impl VulkanNv12 {
         fmt: PixFmt,
         bt2020: bool,
         fp16_input: bool,
+        options: ConversionOptions,
     ) -> Option<Self> {
         match unsafe {
             Self::new_on_shared_inner(
                 device_gst, raw, nv12_caps, profile, width, height, fmt, bt2020, fp16_input,
+                options,
             )
         } {
             Ok(v) => Some(v),
@@ -773,6 +827,7 @@ impl VulkanNv12 {
         fmt: PixFmt,
         bt2020: bool,
         fp16_input: bool,
+        options: ConversionOptions,
     ) -> Result<Self, Err> {
         // Drive ash on the encoder's existing instance/device (do NOT create our own).
         let entry = ash::Entry::load()?;
@@ -806,7 +861,7 @@ impl VulkanNv12 {
         // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
         // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
         // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
-        let sdr_ref_white = sdr_reference_white();
+        let sdr_ref_white = options.sdr_reference_white;
         let pipeline = build_compute_pipeline(
             &device,
             pipeline_layout,
@@ -841,8 +896,8 @@ impl VulkanNv12 {
 
         // ---- encode-src output ring: NV12 VIDEO_ENCODE_SRC GstVulkanImageMemory images
         // allocated directly on the shared device (bypasses the pool's generic-format check).
-        let mut outputs = Vec::with_capacity(RING);
-        for _ in 0..RING {
+        let mut outputs = Vec::with_capacity(options.ring_depth);
+        for _ in 0..options.ring_depth {
             outputs.push(create_encode_output(
                 &device,
                 &memp,
@@ -854,6 +909,7 @@ impl VulkanNv12 {
                 width,
                 height,
                 fmt,
+                options.linear_encode_src,
             )?);
         }
 
@@ -896,14 +952,13 @@ impl VulkanNv12 {
     }
 
     unsafe fn convert_inner(&mut self, rgba: &Dmabuf, pq_passthrough: bool) -> Result<(), Err> {
-        // Cache key: the source dmabuf's primary fd. The compositor renders into a single
-        // stable RGBA buffer, so this is constant across frames and each slot's import is
-        // built only once.
-        let key_fd = rgba.handles().next().ok_or("no fd")?.as_fd().as_raw_fd();
+        // fd numbers are recycled. Identify the backing object, not its descriptor.
+        let fd = rgba.handles().next().ok_or("no fd")?.as_fd().as_raw_fd();
+        let key = dma_buf_identity(fd)?;
 
         // pick the next export ring slot and reclaim its previous (RING-frames-old) work
         let idx = self.next;
-        self.next = (self.next + 1) % ring_used().min(self.outputs.len());
+        self.next = (self.next + 1) % self.outputs.len();
         if self.outputs[idx].in_flight {
             // This fence was signalled RING frames ago, so this is a no-op wait in steady
             // state -- it just lets us safely recycle the slot's cmd buffer.
@@ -958,11 +1013,11 @@ impl VulkanNv12 {
         // is safe). Reused every frame since the dmabuf is stable; the import is a distinct
         // VkImage per slot (not shared), so its per-frame layout transition stays
         // serialised by the slot fence and never races another in-flight frame.
-        let stale = !matches!(&self.outputs[idx].import, Some((fd, _)) if *fd == key_fd);
+        let stale = !matches!(&self.outputs[idx].import, Some((identity, _)) if *identity == key);
         if stale {
             self.free_import(idx);
             let import = self.create_import(rgba)?;
-            self.outputs[idx].import = Some((key_fd, import));
+            self.outputs[idx].import = Some((key, import));
         }
         let (import_img, _import_mem, view) = self.outputs[idx].import.as_ref().unwrap().1;
 
@@ -1006,6 +1061,9 @@ impl VulkanNv12 {
         self.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
 
+        // Each import is a distinct image per slot. GLES owns the external writes;
+        // discard this slot's previous Vulkan layout with UNDEFINED on every reuse
+        // rather than assuming a layout shared with another slot or the GLES producer.
         // compute: RGBA(src) -> NV12 compute_target (storage)
         let to_read = img_barrier(
             import_img,
@@ -1589,6 +1647,7 @@ fn sdr_reference_white() -> f32 {
     std::env::var("WOLF_SDR_REFERENCE_WHITE")
         .ok()
         .and_then(|s| s.trim().parse().ok())
+        .filter(|v: &f32| v.is_finite() && (1.0..=10000.0).contains(v))
         .unwrap_or(203.0)
 }
 
@@ -1598,7 +1657,7 @@ fn sdr_reference_white() -> f32 {
 /// colorimetry -- and `convert()` picks per frame by `pq_passthrough`, so a producer's
 /// mid-stream bt709<->bt2100-pq caps flip never rebuilds the converter (which would stall the
 /// compositor thread). Read once; unset == byte-identical prior behavior.
-fn wolf_hdr_cm() -> bool {
+pub fn wolf_hdr_cm() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("WOLF_HDR_CM").is_ok())
 }
@@ -1664,7 +1723,7 @@ unsafe fn build_compute_pipeline(
 /// tone-map. The static HDR path builds it when the caps are `bt2020`; under `WOLF_HDR_CM` it's
 /// built for ANY fp16 P010 negotiation (independent of the caps `bt2020` flag) so it survives a
 /// bt709-tagged negotiation / a mid-stream colorimetry flip. Best-effort: a build failure (e.g.
-/// the placeholder `.spv` hasn't been compiled with glslc yet) leaves it `None` so the normal
+/// the driver rejects the shader) leaves it `None` so the normal
 /// pipeline still runs -- byte-identical to the prior behavior.
 unsafe fn build_pq_passthrough(
     device: &ash::Device,
@@ -1785,6 +1844,7 @@ unsafe fn create_output(
     modifier: u64,
     direct: bool,
     fmt: PixFmt,
+    va_share: &crate::utils::va_share::VaShare,
 ) -> Result<Nv12Out, Err> {
     // The export image: direct (LINEAR, compute-writable) carries STORAGE; tiled is a
     // pure TRANSFER_DST target filled by vkCmdCopyImage.
@@ -1891,7 +1951,7 @@ unsafe fn create_output(
     // VA surface sharing is the AMD/Intel NV12 dmabuf-encode optimisation; the P010 path
     // targets the Vulkan encoder, so only attempt the VA-allocator buffer for NV12.
     let shared = if fmt == PixFmt::Nv12 {
-        crate::utils::va_share::build_shared_buffer(fd, mr.size as usize, &layout)
+        va_share.build_shared_buffer(fd, mr.size as usize, &layout)
     } else {
         None
     };
@@ -1977,9 +2037,15 @@ unsafe fn create_encode_output(
     width: u32,
     height: u32,
     fmt: PixFmt,
+    linear_encode_src: bool,
 ) -> Result<Nv12Out, Err> {
     let buffer = crate::utils::vulkan_share::alloc_encode_src_buffer(
-        gst_device, width, height, profile, fmt,
+        gst_device,
+        width,
+        height,
+        profile,
+        fmt,
+        linear_encode_src,
     )
     .ok_or("encode-src image allocation failed")?;
     let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)

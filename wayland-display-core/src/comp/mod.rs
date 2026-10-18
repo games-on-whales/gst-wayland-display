@@ -186,6 +186,7 @@ pub struct State {
     /// building the `memory:VulkanImage` output ring. Replaced by the real share in [`init`];
     /// the `State::new` default is an empty placeholder.
     pub(crate) vulkan_share: Arc<VulkanShare>,
+    va_share: Arc<crate::utils::va_share::VaShare>,
 }
 
 /// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
@@ -457,6 +458,7 @@ impl State {
             hdr_state_tx: None,
             last_hdr_state: false,
             vulkan_share: VulkanShare::new(),
+            va_share: Arc::new(Default::default()),
             hdr_candidate_since: None,
         }
     }
@@ -664,9 +666,15 @@ pub(crate) fn apply_video_info(
                         _ => None,
                     };
                     if let Some(conv_fmt) = conv_fmt {
-                        let allocator =
-                            GsNv12Buf::new(&mut state.renderer, node, base_info, conv_fmt)
-                                .expect("Failed to create GsNv12Buf");
+                        let allocator = GsNv12Buf::new(
+                            &mut state.renderer,
+                            node,
+                            base_info,
+                            conv_fmt,
+                            &state.va_share,
+                            state.vulkan_share.conversion_options(),
+                        )
+                        .expect("Failed to create GsNv12Buf");
                         state.output_buffer = Some(GsBufferType::NV12(allocator));
                     } else {
                         let allocator =
@@ -778,6 +786,7 @@ pub(crate) fn init(
     envs_tx: Sender<Vec<CString>>,
     hdr_state_tx: Sender<Command>,
     vulkan_share: Arc<VulkanShare>,
+    va_share: Arc<crate::utils::va_share::VaShare>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -795,6 +804,7 @@ pub(crate) fn init(
 
     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
     state.vulkan_share = vulkan_share;
+    state.va_share = va_share;
 
     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.

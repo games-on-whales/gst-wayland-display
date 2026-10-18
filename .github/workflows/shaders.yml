@@ -1,0 +1,14 @@
+name: shader sources
+on:
+  push:
+    paths: ['wayland-display-core/src/utils/shaders/**', 'ci/shaders.sh', '.github/workflows/shaders.yml']
+  pull_request:
+    paths: ['wayland-display-core/src/utils/shaders/**', 'ci/shaders.sh', '.github/workflows/shaders.yml']
+jobs:
+  shaders:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - run: pacman -Syu --noconfirm git shaderc
+      - uses: actions/checkout@v4
+      - run: bash ci/shaders.sh

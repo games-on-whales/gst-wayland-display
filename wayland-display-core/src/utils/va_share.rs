@@ -14,9 +14,9 @@
 
 use gst::Buffer as GstBuffer;
 use gst::ffi::GstMemory;
-use gst::glib::translate::FromGlibPtrFull;
+use gst::glib::translate::{FromGlibPtrFull, IntoGlib};
 use gst::prelude::*;
-use gst_video::ffi::{GstVideoFormat, GstVideoInfoDmaDrm, gst_video_info_set_format};
+use gst_video::ffi::{GstVideoInfoDmaDrm, gst_video_info_set_format};
 use gst_video::{VideoFormat, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use libloading::Library;
@@ -27,7 +27,6 @@ use std::sync::{Mutex, OnceLock};
 
 // VASurfaceAttribUsageHint: encoder input.
 const VA_USAGE_HINT_ENCODER: u32 = 0x0000_0002;
-const GST_VIDEO_FORMAT_NV12: GstVideoFormat = 23; // GST_VIDEO_FORMAT_NV12
 
 type DmabufMemoriesSetup = unsafe extern "C" fn(
     *mut c_void,             // GstVaDisplay *
@@ -91,53 +90,82 @@ unsafe fn load_valib() -> Result<VaLib, Box<dyn std::error::Error>> {
     }
 }
 
-/// Persistent `GstVaDisplay *` slot, shared by `set_context` and `ensure_element_data`
-/// exactly like a gst-va element's `self->display`: gst-va coordinates through this one
-/// storage (set_context fills it with the encoder's display; ensure keeps it if already
-/// set). Surfaces must be attached on the *same* display the encoder uses. Leaked for
-/// process life; a stable `GstVaDisplay **` for the C side.
-fn display_slot() -> *mut *mut c_void {
-    static SLOT: OnceLock<usize> = OnceLock::new();
-    *SLOT.get_or_init(|| {
-        Box::leak(Box::new(std::ptr::null_mut::<c_void>())) as *mut *mut c_void as usize
-    }) as *mut *mut c_void
+/// Per-source VA display owner. The C helpers may synchronously re-enter set_context,
+/// so never hold the lock across a helper call. Each call owns a temporary reference.
+#[derive(Default)]
+pub struct VaShare {
+    display: Mutex<Option<gst::Object>>,
 }
 
-/// The element absorbed a gst-va display context (downstream encoder's display).
-/// Call from `ElementImpl::set_context`. `element`/`context` are the raw GstElement* /
-/// GstContext*.
-pub fn handle_set_context(element: *mut c_void, context: *mut c_void, render_path: &str) {
-    let Some(lib) = valib() else { return };
-    let Ok(cpath) = CString::new(render_path) else {
-        return;
-    };
-    let slot = display_slot();
-    unsafe {
-        (lib.handle_set_context)(element, context, cpath.as_ptr(), slot);
-        tracing::debug!(
-            "va_share: handle_set_context display={:#x}",
-            (*slot) as usize
-        );
+impl VaShare {
+    fn display_ref(&self) -> *mut c_void {
+        self.display
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |d| unsafe {
+                gst::glib::gobject_ffi::g_object_ref(d.as_ptr().cast()) as *mut c_void
+            })
+    }
+
+    unsafe fn adopt(&self, ptr: *mut c_void) {
+        if !ptr.is_null() {
+            let object = unsafe { gst::Object::from_glib_full(ptr.cast()) };
+            let mut slot = self.display.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(object);
+            }
+        }
     }
 }
 
-/// Ensure we have the gst-va display shared with downstream (uses the slot if already
-/// filled by set_context, else queries the encoder's display). Call once the element is
-/// in the pipeline (e.g. `start()`), before buffers are produced.
-pub fn ensure_shared_display(element: *mut c_void, render_path: &str) -> bool {
-    let Some(lib) = valib() else { return false };
-    let Ok(cpath) = CString::new(render_path) else {
-        return false;
-    };
-    let slot = display_slot();
-    let ok = unsafe { (lib.ensure_element_data)(element, cpath.as_ptr(), slot) };
-    unsafe {
-        tracing::debug!(
-            "va_share: ensure_shared_display ok={} display={:#x}",
-            ok,
-            (*slot) as usize
-        );
-        ok != 0 && !(*slot).is_null()
+impl VaShare {
+    /// The element absorbed a gst-va display context (downstream encoder's display).
+    /// Call from `ElementImpl::set_context`. `element`/`context` are the raw GstElement* /
+    /// GstContext*.
+    pub fn handle_set_context(
+        &self,
+        element: *mut c_void,
+        context: *mut c_void,
+        render_path: &str,
+    ) {
+        let Some(lib) = valib() else { return };
+        let Ok(cpath) = CString::new(render_path) else {
+            return;
+        };
+        let mut display = self.display_ref();
+        let slot = &mut display;
+        unsafe {
+            (lib.handle_set_context)(element, context, cpath.as_ptr(), slot);
+            tracing::debug!(
+                "va_share: handle_set_context display={:#x}",
+                (*slot) as usize
+            );
+            self.adopt(display);
+        }
+    }
+
+    /// Ensure we have the gst-va display shared with downstream (uses the slot if already
+    /// filled by set_context, else queries the encoder's display). Call once the element is
+    /// in the pipeline (e.g. `start()`), before buffers are produced.
+    pub fn ensure_shared_display(&self, element: *mut c_void, render_path: &str) -> bool {
+        let Some(lib) = valib() else { return false };
+        let Ok(cpath) = CString::new(render_path) else {
+            return false;
+        };
+        let mut display = self.display_ref();
+        let slot = &mut display;
+        let ok = unsafe { (lib.ensure_element_data)(element, cpath.as_ptr(), slot) };
+        unsafe {
+            tracing::debug!(
+                "va_share: ensure_shared_display ok={} display={:#x}",
+                ok,
+                (*slot) as usize
+            );
+            let ready = ok != 0 && !(*slot).is_null();
+            self.adopt(display);
+            ready
+        }
     }
 }
 
@@ -153,97 +181,111 @@ pub struct Nv12Layout {
     pub uv_stride: i32,
 }
 
-/// The shared (encoder) display, if known. `None` means no VA encoder downstream yet.
-fn shared_display() -> Option<*mut c_void> {
-    let p = unsafe { std::ptr::read_volatile(display_slot()) };
-    (!p.is_null()).then_some(p)
-}
-
-/// A gst-va dmabuf allocator bound to the shared display (cached). Crucially this is a
-/// `GstDmaBufAllocator` subclass, so we can wrap our exported fd with it AND the encoder's
-/// `gst_va_memory_peek_display` then returns the display (it reads the *allocator's*
-/// display, not the surface qdata) -- which is what its reuse check requires.
-fn va_dmabuf_allocator(display: *mut c_void) -> Option<DmaBufAllocator> {
-    static CACHE: OnceLock<Mutex<Option<(usize, DmaBufAllocator)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().ok()?;
-    if let Some((d, a)) = guard.as_ref() {
-        if *d == display as usize {
-            return Some(a.clone());
+impl VaShare {
+    /// Build an NV12 gst buffer over `fd` that the VA encoder can *reuse* (zero per-frame
+    /// imports): the memory is from a gst-va dmabuf allocator (so `peek_display` resolves to
+    /// the shared display) and a VA surface is attached via `gst_va_dmabuf_memories_setup`.
+    /// Returns `None` (caller falls back to a plain dmabuf buffer) if no VA display is shared
+    /// or anything fails.
+    pub fn build_shared_buffer(&self, fd: RawFd, size: usize, l: &Nv12Layout) -> Option<GstBuffer> {
+        let lib = valib()?;
+        let display = self.display.lock().ok()?.clone()?;
+        let disp = display.as_ptr() as *mut c_void;
+        let ptr = unsafe { (lib.dmabuf_allocator_new)(disp) };
+        if ptr.is_null() {
+            return None;
         }
+        let alloc = unsafe { gst::Allocator::from_glib_full(ptr.cast()) };
+        let allocator = alloc.downcast::<DmaBufAllocator>().ok()?;
+
+        let mut buffer = GstBuffer::new();
+        {
+            let b = buffer.get_mut().unwrap();
+            let gmem =
+                unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }
+                    .ok()?;
+            b.append_memory(gmem);
+            VideoMeta::add_full(
+                b,
+                gst_video::VideoFrameFlags::empty(),
+                VideoFormat::Nv12,
+                l.width,
+                l.height,
+                &[l.y_offset, l.uv_offset],
+                &[l.y_stride, l.uv_stride],
+            )
+            .ok()?;
+        }
+
+        let mem = buffer.peek_memory(0).as_ptr() as *mut GstMemory;
+        let mut drm: GstVideoInfoDmaDrm = unsafe { std::mem::zeroed() };
+        unsafe {
+            gst_video_info_set_format(
+                &mut drm.vinfo,
+                VideoFormat::Nv12.into_glib(),
+                l.width,
+                l.height,
+            );
+        }
+        drm.vinfo.stride[0] = l.y_stride;
+        drm.vinfo.stride[1] = l.uv_stride;
+        drm.vinfo.offset[0] = l.y_offset;
+        drm.vinfo.offset[1] = l.uv_offset;
+        drm.drm_fourcc = l.fourcc;
+        drm.drm_modifier = l.modifier;
+
+        let mut mems: [*mut GstMemory; 4] = [mem, mem, std::ptr::null_mut(), std::ptr::null_mut()];
+        let mut fds: [usize; 4] = [fd as usize, fd as usize, 0, 0];
+        let mut offs: [usize; 4] = [l.y_offset, l.uv_offset, 0, 0];
+        let ok = unsafe {
+            (lib.dmabuf_memories_setup)(
+                disp,
+                &mut drm,
+                mems.as_mut_ptr(),
+                fds.as_mut_ptr(),
+                offs.as_mut_ptr(),
+                VA_USAGE_HINT_ENCODER,
+            )
+        };
+        tracing::debug!(
+            "va_share: build_shared_buffer display={:#x} setup_ok={ok}",
+            disp as usize
+        );
+        if ok == 0 {
+            return None;
+        }
+        Some(buffer)
     }
-    let lib = valib()?;
-    let ptr = unsafe { (lib.dmabuf_allocator_new)(display) };
-    if ptr.is_null() {
-        return None;
-    }
-    let alloc: gst::Allocator =
-        unsafe { gst::Allocator::from_glib_full(ptr as *mut gst::ffi::GstAllocator) };
-    let dmabuf = alloc.downcast::<DmaBufAllocator>().ok()?;
-    *guard = Some((display as usize, dmabuf.clone()));
-    Some(dmabuf)
 }
 
-/// Build an NV12 gst buffer over `fd` that the VA encoder can *reuse* (zero per-frame
-/// imports): the memory is from a gst-va dmabuf allocator (so `peek_display` resolves to
-/// the shared display) and a VA surface is attached via `gst_va_dmabuf_memories_setup`.
-/// Returns `None` (caller falls back to a plain dmabuf buffer) if no VA display is shared
-/// or anything fails.
-pub fn build_shared_buffer(fd: RawFd, size: usize, l: &Nv12Layout) -> Option<GstBuffer> {
-    let lib = valib()?;
-    let disp = shared_display()?;
-    let allocator = va_dmabuf_allocator(disp)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gst::glib::translate::IntoGlibPtr;
 
-    let mut buffer = GstBuffer::new();
-    {
-        let b = buffer.get_mut().unwrap();
-        let gmem =
-            unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }
-                .ok()?;
-        b.append_memory(gmem);
-        VideoMeta::add_full(
-            b,
-            gst_video::VideoFrameFlags::empty(),
-            VideoFormat::Nv12,
-            l.width,
-            l.height,
-            &[l.y_offset, l.uv_offset],
-            &[l.y_stride, l.uv_stride],
-        )
-        .ok()?;
+    #[test]
+    fn displays_are_isolated_and_released_with_the_owner() {
+        gst::init().unwrap();
+        let a: gst::Object = gst::Bin::new().upcast();
+        let b: gst::Object = gst::Bin::new().upcast();
+        let weak_a = a.downgrade();
+        let weak_b = b.downgrade();
+        let first = VaShare::default();
+        let second = VaShare::default();
+        unsafe {
+            let a_ptr: *mut gst::ffi::GstObject = a.into_glib_ptr();
+            let b_ptr: *mut gst::ffi::GstObject = b.into_glib_ptr();
+            first.adopt(a_ptr.cast());
+            second.adopt(b_ptr.cast());
+        }
+        assert_ne!(
+            first.display.lock().unwrap().as_ref().unwrap().as_ptr(),
+            second.display.lock().unwrap().as_ref().unwrap().as_ptr()
+        );
+        drop(first);
+        assert!(weak_a.upgrade().is_none());
+        assert!(weak_b.upgrade().is_some());
+        drop(second);
+        assert!(weak_b.upgrade().is_none());
     }
-
-    let mem = buffer.peek_memory(0).as_ptr() as *mut GstMemory;
-    let mut drm: GstVideoInfoDmaDrm = unsafe { std::mem::zeroed() };
-    unsafe {
-        gst_video_info_set_format(&mut drm.vinfo, GST_VIDEO_FORMAT_NV12, l.width, l.height);
-    }
-    drm.vinfo.stride[0] = l.y_stride;
-    drm.vinfo.stride[1] = l.uv_stride;
-    drm.vinfo.offset[0] = l.y_offset;
-    drm.vinfo.offset[1] = l.uv_offset;
-    drm.drm_fourcc = l.fourcc;
-    drm.drm_modifier = l.modifier;
-
-    let mut mems: [*mut GstMemory; 4] = [mem, mem, std::ptr::null_mut(), std::ptr::null_mut()];
-    let mut fds: [usize; 4] = [fd as usize, fd as usize, 0, 0];
-    let mut offs: [usize; 4] = [l.y_offset, l.uv_offset, 0, 0];
-    let ok = unsafe {
-        (lib.dmabuf_memories_setup)(
-            disp,
-            &mut drm,
-            mems.as_mut_ptr(),
-            fds.as_mut_ptr(),
-            offs.as_mut_ptr(),
-            VA_USAGE_HINT_ENCODER,
-        )
-    };
-    tracing::debug!(
-        "va_share: build_shared_buffer display={:#x} setup_ok={ok}",
-        disp as usize
-    );
-    if ok == 0 {
-        return None;
-    }
-    Some(buffer)
 }

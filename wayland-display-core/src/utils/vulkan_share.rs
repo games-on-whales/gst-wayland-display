@@ -30,7 +30,7 @@ use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
 use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
 // values (stable, and avoids depending on the named ash constants existing).
@@ -43,6 +43,11 @@ unsafe extern "C" {
     fn wayland_display_vk_device(device: *mut gstvk::GstVulkanDevice) -> vk::Device;
     fn wayland_display_vk_queue_family(queue: *mut gstvk::GstVulkanQueue) -> u32;
     fn wayland_display_vk_image(memory: *mut gst::ffi::GstMemory) -> vk::Image;
+    fn wayland_display_vk_linear_layout(
+        memory: *mut gst::ffi::GstMemory,
+        offsets: *mut usize,
+        strides: *mut i32,
+    ) -> gst::glib::ffi::gboolean;
     fn wayland_display_vk_prepare_encode_image(memory: *mut gst::ffi::GstMemory);
 }
 
@@ -79,11 +84,13 @@ pub struct VulkanShare {
     /// The `GstVulkanInstance` we own (keeps it alive + lets us answer `gst.vulkan.instance`
     /// context queries). Replaces the process-global `instance_slot()`.
     instance: Mutex<Option<VulkanInstance>>,
+    options: Mutex<crate::utils::vulkan_nv12::ConversionOptions>,
     /// The shared device, filled from `set_context`
     /// ([`handle_set_context`](VulkanShare::handle_set_context)) or minted by
     /// [`ensure_owned_device`](VulkanShare::ensure_owned_device), and read by the converter
     /// when it builds its output ring. Replaces the process-global `device_slot()`.
     device: Mutex<Option<VulkanDevice>>,
+    device_ready: Condvar,
 }
 
 impl VulkanShare {
@@ -93,7 +100,9 @@ impl VulkanShare {
     pub fn new() -> Arc<VulkanShare> {
         Arc::new(VulkanShare {
             instance: Mutex::new(None),
+            options: Mutex::new(Default::default()),
             device: Mutex::new(None),
+            device_ready: Condvar::new(),
         })
     }
 
@@ -123,12 +132,30 @@ impl VulkanShare {
                      element already on {:?}",
                     existing.as_ptr()
                 );
+                if let (Some(ours), Some(offered)) = (
+                    physical_device_uuid(existing),
+                    physical_device_uuid(&device),
+                ) && ours != offered
+                {
+                    tracing::warn!(
+                        "vulkan_share: rejected device belongs to a different physical GPU; bind the encoder to the source device before starting the pipeline"
+                    );
+                }
             }
             return true;
         }
         tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
         *slot = Some(device);
+        self.device_ready.notify_all();
         true
+    }
+
+    pub fn conversion_options(&self) -> crate::utils::vulkan_nv12::ConversionOptions {
+        *self.options.lock().unwrap()
+    }
+
+    pub fn set_conversion_options(&self, options: crate::utils::vulkan_nv12::ConversionOptions) {
+        *self.options.lock().unwrap() = options;
     }
 
     /// This element's shared device, if one has been created (or absorbed).
@@ -142,6 +169,22 @@ impl VulkanShare {
 // chosen physical device has one. Software devices (llvmpipe) do NOT, so a device without this bit
 // is useless for the encode path and makes vulkanh264enc fail to link.
 const VK_QUEUE_VIDEO_ENCODE_BIT_KHR: vk::QueueFlags = vk::QueueFlags::from_raw(0x0000_0040);
+
+// VkPhysicalDevice handles cannot be compared across Vulkan instances. UUIDs can.
+fn physical_device_uuid(device: &VulkanDevice) -> Option<[u8; vk::UUID_SIZE]> {
+    unsafe {
+        let entry = ash::Entry::load().ok()?;
+        let instance = ash::Instance::load(
+            entry.static_fn(),
+            wayland_display_vk_instance(device.as_ptr()),
+        );
+        let physical = gstvk::gst_vulkan_device_get_physical_device(device.as_ptr());
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        instance.get_physical_device_properties2(physical, &mut properties);
+        Some(id.device_uuid)
+    }
+}
 
 /// Whether `dev` exposes a video-encode queue family (i.e. it can host `vulkanh264enc`).
 unsafe fn has_video_encode_queue(ash_inst: &ash::Instance, dev: vk::PhysicalDevice) -> bool {
@@ -276,6 +319,7 @@ impl VulkanShare {
         }
         *self.instance.lock().unwrap() = Some(instance);
         *slot = Some(device.clone());
+        self.device_ready.notify_all();
         tracing::info!(
             "vulkan_share: created per-element shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
         );
@@ -311,20 +355,15 @@ impl VulkanShare {
     ///
     /// The encoder shares its device via a `GstContext` delivered to `set_context` on the
     /// streaming thread, which races the compositor thread that allocates this element's Vulkan
-    /// output buffer. Polling here lets the allocation wait for the device to arrive instead of
-    /// failing when it merely hasn't been shared *yet*. The race is **per element**, so the
-    /// poll is retained, scoped to this share. Returns `None` if it never arrives.
+    /// output buffer. A condition variable lets allocation wait for the device instead of
+    /// failing when it merely has not been shared yet. Returns `None` on timeout.
     pub fn wait_for_shared_device(&self, timeout: std::time::Duration) -> Option<VulkanDevice> {
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(dev) = self.shared_device() {
-                return Some(dev);
-            }
-            if start.elapsed() >= timeout {
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let slot = self.device.lock().unwrap();
+        let (slot, _) = self
+            .device_ready
+            .wait_timeout_while(slot, timeout, |d| d.is_none())
+            .unwrap();
+        slot.clone()
     }
 }
 
@@ -375,13 +414,27 @@ pub fn alloc_encode_src_buffer(
     height: u32,
     profile: &str,
     fmt: PixFmt,
+    linear_encsrc: bool,
 ) -> Option<gst::Buffer> {
+    if fmt == PixFmt::P010 && profile != "main-10" {
+        tracing::error!("P010 encode input requires the H.265 main-10 profile");
+        return None;
+    }
     let std_h264_idc = match profile {
         "high" | "constrained-high" | "progressive-high" => {
             vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
         }
         "main" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
-        _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
+        "baseline" | "constrained-baseline" => {
+            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE
+        }
+        "main-10" if fmt == PixFmt::P010 => {
+            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE
+        }
+        _ => {
+            tracing::error!("Unsupported Vulkan encode profile: {profile}");
+            return None;
+        }
     };
     unsafe {
         // Profile chain (matches what the encoder's pool builds from caps): the codec struct
@@ -418,9 +471,6 @@ pub fn alloc_encode_src_buffer(
         // works on RDNA3 and on a fixed radv); falls back to tiled if the LINEAR *allocation*
         // fails (a driver that accepts the LINEAR image but corrupts or fails at encode time
         // is not covered by the fallback).
-        let linear_encsrc = std::env::var("WOLF_VULKAN_LINEAR_ENCSRC")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         let tiling = if linear_encsrc {
             vk::ImageTiling::LINEAR
         } else {
@@ -501,16 +551,41 @@ pub fn alloc_encode_src_buffer(
         {
             let b = buffer.get_mut().unwrap();
             b.append_memory(mem);
-            let _ = gst_video::VideoMeta::add(
-                b,
-                gst_video::VideoFrameFlags::empty(),
-                match fmt {
-                    PixFmt::Nv12 => gst_video::VideoFormat::Nv12,
-                    PixFmt::P010 => gst_video::VideoFormat::P01010le,
-                },
-                width,
-                height,
-            );
+            let format = match fmt {
+                PixFmt::Nv12 => gst_video::VideoFormat::Nv12,
+                PixFmt::P010 => gst_video::VideoFormat::P01010le,
+            };
+            let mut offsets = [0usize; 2];
+            let mut strides = [0i32; 2];
+            if wayland_display_vk_linear_layout(mem_ptr, offsets.as_mut_ptr(), strides.as_mut_ptr())
+                != 0
+            {
+                gst_video::VideoMeta::add_full(
+                    b,
+                    gst_video::VideoFrameFlags::empty(),
+                    format,
+                    width,
+                    height,
+                    &offsets,
+                    &strides,
+                )
+                .ok()?;
+            } else {
+                if effective_tiling == vk::ImageTiling::LINEAR {
+                    tracing::error!("Unable to query LINEAR encode image plane layout");
+                    return None;
+                }
+                // OPTIMAL tiling has no portable byte layout. This meta describes
+                // logical video planes only; consumers must use the VkImage API.
+                gst_video::VideoMeta::add(
+                    b,
+                    gst_video::VideoFrameFlags::empty(),
+                    format,
+                    width,
+                    height,
+                )
+                .ok()?;
+            }
         }
         Some(buffer)
     }
