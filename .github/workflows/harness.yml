@@ -12,26 +12,24 @@ jobs:
     name: harness (lint · build · unit)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/games-on-whales/gstreamer:1.26.7
+      # Independent distro base: a fresh fork can run CPU checks before it has
+      # published its own patched Vulkan image. Patched encoder tests run separately.
+      image: archlinux:base
     steps:
       - uses: actions/checkout@v4
 
       - name: System dependencies
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl ca-certificates git libssl-dev libicu76 \
-            libwayland-dev libinput-dev libxkbcommon-dev libgbm-dev \
-            libegl1-mesa-dev libgles2-mesa-dev libudev-dev libclang-dev clang \
-            libgl1-mesa-dri libegl-mesa0 mesa-vulkan-drivers hwdata \
-            librust-gstreamer-allocators-dev
+          pacman -Syu --noconfirm --needed base-devel git curl openssl icu \
+            gstreamer gst-plugins-base-libs gst-plugins-bad-libs \
+            wayland libinput libxkbcommon mesa libdrm systemd-libs \
+            clang pkgconf vulkan-headers vulkan-icd-loader
 
       - name: Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal \
-                --default-toolchain "${RUST_VERSION:-1.89.0}" --component rustfmt
+                --default-toolchain "${RUST_VERSION:-1.94.0}" --component rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Harness

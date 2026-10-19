@@ -28,3 +28,4 @@ gen
 *.app
 .snapshots/*
 
+/.gst-patches/

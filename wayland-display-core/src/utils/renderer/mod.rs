@@ -46,6 +46,9 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             display
         }
     };
+    // GLES2 is fine for HDR: fp16/10-bit dmabufs import via EGLImage (bypassing the GLES core
+    // texture-format limits), so they're in the renderer's importable set already. (A GLES3
+    // context fails to configure in this headless/surfaceless EGL setup and isn't needed.)
     let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
     let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
     renderer

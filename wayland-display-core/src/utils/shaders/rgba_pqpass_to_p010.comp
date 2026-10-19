@@ -1,0 +1,61 @@
+#version 450
+// PQ PASSTHROUGH: already-PQ BT.2020 R'G'B' (in [0,1]) -> P010 (10-bit 4:2:0, BT.2020
+// NON-CONSTANT-LUMINANCE, limited "TV" range). NO transfer/gamut conversion.
+//
+// WOLF_HDR_CM per-frame sibling of rgba_to_p010_bt2020.comp / rgba_to_p010_hdr.comp. It is
+// selected for a frame whose composited content originates from a 10-bit client buffer
+// (gamescope's XB30/AB30/XR30/AR30 HDR output). That content is ALREADY PQ-encoded BT.2020 --
+// gamescope ran the PQ OETF itself -- so re-applying the sRGB EOTF + 709->2020 gamut + PQ OETF
+// (as rgba_to_p010_hdr.comp does) would double-encode PQ and wash the image out. Here we treat
+// the sampled RGB as the final PQ-encoded BT.2020 R'G'B' and ONLY apply the Y'CbCr matrix.
+//
+// Per-pixel pipeline (cf. rgba_to_p010_bt2020.comp, minus EVERY transfer/gamut step):
+//   (input is already PQ-encoded BT.2020 R'G'B' in [0,1] -- no EOTF, no gamut, no PQ OETF)
+//   - BT.2020 NCL Y'CbCr matrix (limited range) on the PQ-encoded R'G'B'  (identical consts)
+//
+// Bindings (IDENTICAL to rgba_to_p010_bt2020.comp):
+//   0: src     - RGBA input (sampled; already-PQ BT.2020 R'G'B' code values in [0,1])
+//   1: yPlane  - r16  storage image, full resolution (P010 plane 0, 10 bits in the MSBs)
+//   2: uvPlane - rg16 storage image, half resolution (P010 plane 1, Cb in r, Cr in g)
+// Push constant: full-resolution size in pixels.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r16)  uniform writeonly image2D yPlane;
+layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
+
+layout(push_constant) uniform Push { ivec2 size; } pc;
+
+// Present for spec-constant layout compatibility with the sibling shaders (they declare
+// constant_id 0 and the converter binds a SpecializationInfo entry for it). UNUSED here: the
+// passthrough math touches no reference-white scaling.
+layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
+
+// BT.2020 NCL, limited "TV" range, on PQ-encoded R'G'B' (Kr=0.2627, Kg=0.6780, Kb=0.0593):
+//   Y  = 16/255  + (219/255) * (Kr*R + Kg*G + Kb*B)
+//   Cb = 128/255 + (224/255) * (B - Y') / (2*(1-Kb))
+//   Cr = 128/255 + (224/255) * (R - Y') / (2*(1-Kr))
+float luma(vec3 c) { return 0.2256 * c.r + 0.5823 * c.g + 0.0509 * c.b + 0.0627; }
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
+    ivec2 p  = ch * 2;                            // top-left luma coord
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    // Already-PQ BT.2020 R'G'B' -- sampled straight, no transfer/gamut transform.
+    vec3 c00 = texelFetch(src, p + ivec2(0, 0), 0).rgb;
+    vec3 c10 = texelFetch(src, p + ivec2(1, 0), 0).rgb;
+    vec3 c01 = texelFetch(src, p + ivec2(0, 1), 0).rgb;
+    vec3 c11 = texelFetch(src, p + ivec2(1, 1), 0).rgb;
+
+    imageStore(yPlane, p + ivec2(0, 0), vec4(luma(c00)));
+    imageStore(yPlane, p + ivec2(1, 0), vec4(luma(c10)));
+    imageStore(yPlane, p + ivec2(0, 1), vec4(luma(c01)));
+    imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
+
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average (PQ-encoded R'G'B')
+    float cb = -0.1227 * a.r - 0.3166 * a.g + 0.4392 * a.b + 0.5;
+    float cr =  0.4392 * a.r - 0.4039 * a.g - 0.0353 * a.b + 0.5;
+    imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
+}

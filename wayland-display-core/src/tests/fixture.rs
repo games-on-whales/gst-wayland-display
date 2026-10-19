@@ -39,6 +39,7 @@ impl Fixture {
             &dh,
             &libinput_context,
             event_loop.handle(),
+            false,
         );
 
         let source = ListeningSocketSource::new_auto().unwrap();

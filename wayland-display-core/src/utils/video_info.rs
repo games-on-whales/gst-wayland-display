@@ -10,10 +10,20 @@ pub struct CUDAParams {
     pub cuda_context: Arc<Mutex<cuda::CUDAContext>>,
 }
 
+/// NV12 `memory:VulkanImage` output on the downstream encoder's shared `GstVulkanDevice`
+/// (the Vulkan-encode/interpipe path). Carries the H.264 `profile` so the encode-src image
+/// is created with a byte-matching `VkVideoProfileListInfoKHR`.
+#[derive(Debug, Clone)]
+pub struct VulkanParams {
+    pub video_info: VideoInfo,
+    pub profile: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum GstVideoInfo {
     RAW(VideoInfo),
     DMA(VideoInfoDmaDrm),
+    VULKAN(VulkanParams),
     #[cfg(feature = "cuda")]
     CUDA(CUDAParams),
 }
@@ -34,6 +44,7 @@ impl From<GstVideoInfo> for VideoInfo {
     fn from(info: GstVideoInfo) -> Self {
         match info {
             GstVideoInfo::RAW(info) => info,
+            GstVideoInfo::VULKAN(params) => params.video_info,
             GstVideoInfo::DMA(info) => match info.to_video_info() {
                 Ok(info) => info,
                 Err(_) => VideoInfo::builder(info.format(), info.width(), info.height())

@@ -1,0 +1,18 @@
+name: shader sources
+on:
+  push:
+    paths: ['wayland-display-core/src/utils/shaders/**', 'ci/shaders.sh', '.github/workflows/shaders.yml']
+  pull_request:
+    paths: ['wayland-display-core/src/utils/shaders/**', 'ci/shaders.sh', '.github/workflows/shaders.yml']
+jobs:
+  shaders:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      # diffutils (cmp) is not in the archlinux:base image. shaderc is pinned so
+      # the committed .spv files (byte-compared by ci/shaders.sh) are only ever
+      # checked against the same glslc that generates them; bump the pin together
+      # with running `ci/shaders.sh --update`.
+      - run: pacman -Syu --noconfirm git diffutils shaderc=2026.4-1
+      - uses: actions/checkout@v4
+      - run: bash ci/shaders.sh

@@ -1,0 +1,100 @@
+#version 450
+// RGBA -> P010 (10-bit 4:2:0, BT.2020 NON-CONSTANT-LUMINANCE, limited "TV" range), with a
+// proper SDR -> PQ (SMPTE ST 2084) tone-map.
+//
+// This shader is selected when the producer signals HDR (BT.2100 PQ) output: the bitstream is
+// tagged transfer=smpte2084 (PQ), primaries=bt2020, matrix=bt2020. The compositor content is
+// 8-bit sRGB (R8G8B8A8_UNORM, so texelFetch returns RAW sRGB-gamma code values -- NOT
+// linearised by the sampler), i.e. SDR. We MUST convert that SDR signal into the PQ container
+// or the decoder interprets the sRGB-gamma code values as PQ code values, and PQ 1.0 = 10000
+// nits -> SDR white is blasted to absurd brightness (the "HDR-ified SDR looks wrong" bug).
+//
+// The per-pixel conversion is:
+//   1. sRGB EOTF      : gamma sRGB    -> linear BT.709 light  [0,1]
+//   2. gamut          : linear BT.709 -> linear BT.2020       (709 fits inside 2020)
+//   3. reference white: linear [0,1]  -> nits, SDR diffuse white (1.0) -> REF_WHITE_NITS
+//                       (BT.2408 graphics white = 203 nits), then normalise /10000 for PQ
+//   4. PQ OETF        : linear nits   -> PQ code value        [0,1]
+//   5. BT.2020 NCL Y'CbCr matrix (limited range) on the PQ-encoded R'G'B'  (unchanged)
+//
+// REF_WHITE_NITS is the one knob for "how bright should SDR white be on the HDR display".
+// 203 is the BT.2408 standard; lower it for a dimmer desktop, raise it for a punchier one.
+//
+// Bindings:
+//   0: src     - RGBA input (sampled, imported from the compositor's dmabuf; sRGB-gamma UNORM)
+//   1: yPlane  - r16  storage image, full resolution (P010 plane 0, 10 bits in the MSBs)
+//   2: uvPlane - rg16 storage image, half resolution (P010 plane 1, Cb in r, Cr in g)
+// Push constant: full-resolution size in pixels.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r16)  uniform writeonly image2D yPlane;
+layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
+
+layout(push_constant) uniform Push { ivec2 size; } pc;
+
+// SDR diffuse white on the HDR display (BT.2408 graphics white = 203). Specialization
+// constant: set at pipeline-build time from the producer's sdr-reference-white (Wolf's
+// [gstreamer.video] sdr_reference_white config), so it's tunable without recompiling.
+layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
+
+// linear BT.709 -> linear BT.2020 primaries (D65, same white point). GLSL is column-major,
+// so each argument below is a COLUMN of the standard row-major 709->2020 matrix.
+const mat3 BT709_TO_BT2020 = mat3(
+    0.627404, 0.069097, 0.016391,
+    0.329283, 0.919541, 0.088013,
+    0.043313, 0.011362, 0.895595);
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 hi = greaterThan(c, vec3(0.04045));
+    vec3 lo = c / 12.92;
+    vec3 h  = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, h, hi);
+}
+
+// SMPTE ST 2084 inverse-EOTF ("OETF"): normalised linear light [0,1] (1.0 = 10000 nits)
+// -> PQ code value [0,1].
+float pq_oetf(float L) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float Lm = pow(L, m1);
+    return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
+}
+
+// SDR sRGB code values -> PQ-encoded BT.2020 R'G'B'.
+vec3 sdr_to_pq(vec3 srgb) {
+    vec3 lin2020 = BT709_TO_BT2020 * srgb_to_linear(srgb);
+    vec3 norm = clamp(lin2020, 0.0, 1.0) * (REF_WHITE_NITS / 10000.0);
+    return vec3(pq_oetf(norm.r), pq_oetf(norm.g), pq_oetf(norm.b));
+}
+
+// BT.2020 NCL, limited "TV" range, on PQ-encoded R'G'B' (Kr=0.2627, Kg=0.6780, Kb=0.0593):
+//   Y  = 16/255  + (219/255) * (Kr*R + Kg*G + Kb*B)
+//   Cb = 128/255 + (224/255) * (B - Y') / (2*(1-Kb))
+//   Cr = 128/255 + (224/255) * (R - Y') / (2*(1-Kr))
+float luma(vec3 c) { return 0.2256 * c.r + 0.5823 * c.g + 0.0509 * c.b + 0.0627; }
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
+    ivec2 p  = ch * 2;                            // top-left luma coord
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    vec3 c00 = sdr_to_pq(texelFetch(src, p + ivec2(0, 0), 0).rgb);
+    vec3 c10 = sdr_to_pq(texelFetch(src, p + ivec2(1, 0), 0).rgb);
+    vec3 c01 = sdr_to_pq(texelFetch(src, p + ivec2(0, 1), 0).rgb);
+    vec3 c11 = sdr_to_pq(texelFetch(src, p + ivec2(1, 1), 0).rgb);
+
+    imageStore(yPlane, p + ivec2(0, 0), vec4(luma(c00)));
+    imageStore(yPlane, p + ivec2(1, 0), vec4(luma(c10)));
+    imageStore(yPlane, p + ivec2(0, 1), vec4(luma(c01)));
+    imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
+
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average (PQ-encoded R'G'B')
+    float cb = -0.1227 * a.r - 0.3166 * a.g + 0.4392 * a.b + 0.5;
+    float cr =  0.4392 * a.r - 0.4039 * a.g - 0.0353 * a.b + 0.5;
+    imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
+}
