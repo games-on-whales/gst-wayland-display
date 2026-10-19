@@ -7,7 +7,10 @@ on:
 jobs:
   shaders:
     runs-on: ubuntu-latest
+    container: archlinux:base
     steps:
-      - run: sudo apt-get update && sudo apt-get install -y glslc
+      # diffutils (cmp) is not in the archlinux:base image; Arch's glslc matches
+      # the environment the committed .spv files are regenerated with.
+      - run: pacman -Syu --noconfirm git shaderc diffutils
       - uses: actions/checkout@v4
       - run: bash ci/shaders.sh
