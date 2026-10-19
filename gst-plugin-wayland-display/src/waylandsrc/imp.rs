@@ -13,6 +13,7 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
@@ -1553,11 +1554,24 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         let mut structure = Structure::builder("wayland.src");
-        let Ok(env_vars) = display.env_vars() else {
-            return Err(gst::error_msg!(
-                LibraryError::Init,
-                ("The compositor exited during initialization (its panic message is on stderr); check `render-node`, or set `render-node=software` for software rendering.")
-            ));
+        let reply_timeout = display.reply_timeout();
+        let env_vars = match display.env_vars() {
+            Ok(env_vars) => env_vars,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(gst::error_msg!(
+                    LibraryError::Init,
+                    (
+                        "The compositor did not finish initializing within {:?}.",
+                        reply_timeout
+                    )
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(gst::error_msg!(
+                    LibraryError::Init,
+                    ("The compositor exited during initialization (its panic message is on stderr); check `render-node`, or set `render-node=software` for software rendering.")
+                ));
+            }
         };
         for (key, var) in env_vars.flat_map(|var| var.split_once("=")) {
             structure = structure.field(key, var);
@@ -1593,20 +1607,27 @@ impl PushSrcImpl for WaylandDisplaySrc {
     ) -> Result<CreateSuccess, gst::FlowError> {
         let hdr_cm = self.settings.lock().unwrap().hdr_cm;
         loop {
-            let (buffer, hdr_change) = {
-                let mut state_guard = self.state.lock().unwrap();
-                let Some(state) = state_guard.as_mut() else {
-                    return Err(gst::FlowError::Eos);
+            let subscriber = Registry::default().with(GstLayer);
+            let buffer = tracing::subscriber::with_default(subscriber, || {
+                // Only the request is made under the state lock: waiting for the frame under it
+                // would stall caps queries and stop() for up to the compositor reply timeout.
+                let pending = match self.state.lock().unwrap().as_ref() {
+                    Some(state) => state.display.request_frame()?,
+                    None => return Err(gst::FlowError::Eos),
                 };
-                let subscriber = Registry::default().with(GstLayer);
-                let buffer =
-                    tracing::subscriber::with_default(subscriber, || state.display.frame())?;
-                // dynamic-hdr: drained AFTER the frame. The compositor signals a change right
-                // before it renders the first frame in the new state, so this is exactly the
-                // state `buffer` was converted for.
-                let change = hdr_cm.then(|| state.display.poll_hdr_state()).flatten();
-                (buffer, change)
-            };
+                pending.wait()
+            })?;
+            // dynamic-hdr: drained AFTER the frame. The compositor signals a change right
+            // before it renders the first frame in the new state, so this is exactly the
+            // state `buffer` was converted for.
+            let hdr_change = hdr_cm
+                .then(|| {
+                    let state = self.state.lock().unwrap();
+                    state
+                        .as_ref()
+                        .and_then(|state| state.display.poll_hdr_state())
+                })
+                .flatten();
             match hdr_change {
                 Some((hdr, mastering, cll)) => {
                     if self.apply_hdr_state(hdr, mastering, cll)? {
@@ -2323,6 +2344,101 @@ mod tests {
         assert_eq!(
             imp.settings.lock().unwrap().startup_input_devices(),
             ["/nonexistent/input/event0"]
+        );
+    }
+
+    // A reconnected device can reuse its old /dev/input path, so every announcement must reach
+    // the running display, not only the first one for a path.
+    #[test]
+    fn virtual_devices_ready_forwards_every_announcement() {
+        use super::EventHandler;
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let imp = src.imp();
+        // Stands in for a running display's receiver.
+        let command_rx = imp.new_command_channel();
+        let device = gst::event::CustomUpstream::new(
+            gst::Structure::builder("VirtualDevicesReady")
+                .field("path", "/dev/input/event7")
+                .build(),
+        );
+        for _ in 0..2 {
+            assert!(imp.handle_event(&device));
+        }
+
+        let mut forwarded = Vec::new();
+        while let Ok(command) = command_rx.try_recv() {
+            if let Command::InputDevice(path) = command {
+                forwarded.push(path);
+            }
+        }
+        assert_eq!(forwarded, ["/dev/input/event7", "/dev/input/event7"]);
+        assert_eq!(
+            imp.settings.lock().unwrap().startup_input_devices(),
+            ["/dev/input/event7"]
+        );
+    }
+
+    // create() must not hold the state lock while it waits for the frame, or caps queries
+    // queue behind a slow or wedged compositor for up to the reply timeout.
+    #[test]
+    fn create_releases_state_while_waiting_for_frame() {
+        use gst::subclass::prelude::*;
+        use gst_base::subclass::prelude::*;
+        use std::time::{Duration, Instant};
+        use waylanddisplaycore::{Command, WaylandDisplay, channel};
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        // The display sends to `unserviced`, which only this test reads; the compositor runs on
+        // its own channel, so frame requests stay pending until the test drops them.
+        let (command_tx, unserviced) = channel::<Command>();
+        let (compositor_tx, compositor_rx) = channel::<Command>();
+        let display = WaylandDisplay::new_with_channel(
+            Some("software".into()),
+            command_tx,
+            compositor_rx,
+            std::sync::Arc::clone(&src.imp().vulkan_share),
+            std::sync::Arc::clone(&src.imp().va_share),
+        )
+        .unwrap();
+        *src.imp().state.lock().unwrap() = Some(super::State { display });
+
+        let creating = src.clone();
+        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).is_err());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pending_frame = loop {
+            if let Ok(command @ Command::Buffer(..)) = unserviced.try_recv() {
+                break command;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "create() never requested a frame"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Give a regressed create() time to take the lock back around its wait.
+        std::thread::sleep(Duration::from_millis(100));
+        let state_free = src.imp().state.try_lock().is_ok();
+
+        // Dropping the request ends create()'s wait; then shut the compositor down.
+        drop(pending_frame);
+        assert!(
+            create.join().unwrap(),
+            "an unanswered frame must be an error"
+        );
+        compositor_tx.send(Command::Quit).unwrap();
+        // Drop the display while `unserviced` still exists: its own Quit must send for Drop to
+        // join the compositor thread, or the thread outlives the test and races process exit.
+        src.imp().state.lock().unwrap().take();
+        drop(unserviced);
+        assert!(
+            state_free,
+            "create() held the state lock while waiting for the frame"
         );
     }
 }

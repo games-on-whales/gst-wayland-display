@@ -11,8 +11,10 @@ fn unanswered_display() -> WaylandDisplay {
     // exists) but never answers. Leak the receiver so it outlives the test thread.
     let (command_tx, unserviced_rx) = channel::<Command>();
     std::mem::forget(unserviced_rx);
-    let (_devices_tx, devices_rx) = mpsc::channel();
-    let (_envs_tx, envs_rx) = mpsc::channel();
+    // Senders kept alive but never used: a compositor that never publishes its devices/envs.
+    let (devices_tx, devices_rx) = mpsc::channel::<Vec<std::ffi::CString>>();
+    let (envs_tx, envs_rx) = mpsc::channel::<Vec<std::ffi::CString>>();
+    std::mem::forget((devices_tx, envs_tx));
     let (_hdr_state_tx, hdr_state_rx) = mpsc::channel();
     WaylandDisplay {
         thread_handle: Some(std::thread::spawn(|| {})),
@@ -43,6 +45,19 @@ fn get_supported_dma_formats_errors_on_unanswered_compositor() {
         result,
         "an unanswered query must be an error, not empty formats"
     );
+}
+
+#[test]
+fn env_vars_and_devices_error_on_unanswered_compositor() {
+    // start() reads env_vars() under the state lock; a compositor that never publishes them
+    // must not wedge it.
+    let mut display = unanswered_display();
+    let result = returns_within(move || {
+        let envs_err = display.env_vars().is_err();
+        (envs_err, display.devices().is_err())
+    })
+    .expect("env_vars/devices blocked on an unanswered compositor");
+    assert_eq!(result, (true, true));
 }
 
 #[test]
