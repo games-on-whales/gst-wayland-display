@@ -118,7 +118,7 @@ gst-launch-1.0 waylanddisplaysrc vulkan=true render-node=/dev/dri/renderD128 \
 > [!IMPORTANT]
 > `vulkanh265enc` is not an upstream GStreamer element. It ships as `patches/vulkanh265enc.patch`
 > and has to be applied to the GStreamer tree before building; see `patches/README.md`. The
-> `docker/vulkan.Dockerfile` image applies it for you.
+> devcontainer applies the full patch chain for you.
 
 Pin `width` and `height` in the caps. Left open, the source fixates to 1x1 and negotiation settles
 on whatever minimum the chosen encoder advertises, which is codec-specific: `vulkanh264enc` accepts

@@ -10,8 +10,9 @@ for p in $(grep -v -e '^#' -e '^[[:space:]]*$' patches/series); do
 done
 ```
 
-`series` is the single source of the apply order: `docker/vulkan.Dockerfile`
-and [`ci/gst-patches.sh`](../ci/gst-patches.sh) both read it. That script (run
+`series` is the single source of the apply order:
+[`ci/gst-patches.sh`](../ci/gst-patches.sh) and the devcontainer build both
+read it. That script (run
 in CI by `.github/workflows/gst-patches.yml`) builds the patched tree with the
 GStreamer unit tests enabled and runs the Vulkan tests; run it locally on a
 machine with a Vulkan encode GPU to exercise the device-backed tests too.

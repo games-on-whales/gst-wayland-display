@@ -1,23 +1,19 @@
 name: gstreamer patches
 
 # Builds GStreamer with the patches/ chain applied and the GStreamer unit tests
-# enabled, then runs the Vulkan tests (ci/gst-patches.sh). The vulkan image
-# builds with -Dtests=disabled and the harness runs inside the already-published
-# image, so this is the job that compiles and runs the tests the patches add.
-# Without a GPU the device-backed tests skip; the GPU-free ones run.
+# enabled, then runs the Vulkan tests (ci/gst-patches.sh). Without a GPU the
+# device-backed tests skip; the GPU-free ones run.
 
 on:
   push:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
-      - "docker/vulkan.Dockerfile"
       - ".github/workflows/gst-patches.yml"
   pull_request:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
-      - "docker/vulkan.Dockerfile"
       - ".github/workflows/gst-patches.yml"
 
 concurrency:
@@ -32,8 +28,8 @@ jobs:
     name: patch chain · build · vulkan tests
     runs-on: ubuntu-latest
     container:
-      # Same base and build deps as docker/vulkan.Dockerfile, so the toolchain
-      # and Vulkan headers (>= 1.4.317) match what the image ships.
+      # Fedora: recent enough meson/wayland/vulkan-headers to build the patched
+      # GStreamer 1.28 chain directly.
       image: ghcr.io/games-on-whales/base-app:fedora
     steps:
       - uses: actions/checkout@v4

@@ -59,8 +59,8 @@ wherever `vulkanh264enc` registers (an nvidia render node, or Intel with
 
 ## GStreamer patch chain (`ci/gst-patches.sh`)
 
-The harness runs inside the published `:vulkan` image, which builds GStreamer
-with `-Dtests=disabled`, so it never compiles the tests in `patches/`.
+The harness builds GStreamer without the unit tests, so it never compiles the
+tests in `patches/`.
 `ci/gst-patches.sh` clones GStreamer (`GST_VERSION`, default 1.28.4), applies
 `patches/series`, builds with the unit tests enabled and runs the Vulkan video
 tests. CI runs it via `.github/workflows/gst-patches.yml` on any change to
