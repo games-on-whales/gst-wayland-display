@@ -7,8 +7,7 @@ on:
 jobs:
   shaders:
     runs-on: ubuntu-latest
-    container: archlinux:base
     steps:
-      - run: pacman -Syu --noconfirm git shaderc
+      - run: sudo apt-get update && sudo apt-get install -y glslc
       - uses: actions/checkout@v4
       - run: bash ci/shaders.sh
