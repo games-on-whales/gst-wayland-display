@@ -1,14 +1,21 @@
+//! C API over `WaylandDisplay`.
+//!
+//! Safety contract for every function taking a pointer: `dpy`/`wd` is NULL or a pointer returned
+//! by `display_init` that has not been passed to `display_finish`; string arguments are NULL or
+//! NUL-terminated; output arrays hold at least `max_len` slots. A NULL display is logged and
+//! ignored rather than dereferenced, since NULL is `display_init`'s failure return.
+#![allow(clippy::missing_safety_doc)] // covered by the module-level contract above
+
 use gst::ffi::GstBuffer;
 use gst::glib::translate::FromGlibPtrNone;
 use gst_video::ffi::GstVideoInfo;
 use gst_video::VideoInfo;
 use std::ffi::{c_char, c_uint, c_void, CStr, CString};
 use std::ptr;
-use tracing_subscriber;
 use waylanddisplaycore::{Tracer, WaylandDisplay};
 
 #[no_mangle]
-pub extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDisplay {
+pub unsafe extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDisplay {
     let render_node = if !render_node.is_null() {
         Some(
             unsafe { CStr::from_ptr(render_node) }
@@ -30,19 +37,35 @@ pub extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDispla
     }
 }
 
+/// Borrows the display behind `dpy`, or logs and returns None for NULL.
+unsafe fn display_ref<'a>(
+    dpy: *mut WaylandDisplay,
+    caller: &str,
+) -> Option<&'a mut WaylandDisplay> {
+    let display = unsafe { dpy.as_mut() };
+    if display.is_none() {
+        tracing::error!(caller, "Called with a NULL display.");
+    }
+    display
+}
+
 #[no_mangle]
-pub extern "C" fn display_set_trace_fn(
+pub unsafe extern "C" fn display_set_trace_fn(
     wd: *mut WaylandDisplay,
     trace_start: extern "C" fn(*const c_char) -> *mut c_void,
     trace_end: extern "C" fn(*mut c_void),
 ) {
-    let display = unsafe { &mut *wd };
+    let Some(display) = (unsafe { display_ref(wd, "display_set_trace_fn") }) else {
+        return;
+    };
     display.tracer = Some(Tracer::new(trace_start, trace_end));
 }
 
 #[no_mangle]
-pub extern "C" fn display_finish(dpy: *mut WaylandDisplay) {
-    std::mem::drop(unsafe { Box::from_raw(dpy) })
+pub unsafe extern "C" fn display_finish(dpy: *mut WaylandDisplay) {
+    if !dpy.is_null() {
+        std::mem::drop(unsafe { Box::from_raw(dpy) })
+    }
 }
 
 /// Writes up to `max_len` pointers from `list` into `out` and returns how many it wrote, so a C
@@ -61,9 +84,11 @@ fn write_c_strings(list: &[CString], out: *mut *const c_char, max_len: c_uint) -
 }
 
 #[no_mangle]
-pub extern "C" fn display_get_devices_len(dpy: *mut WaylandDisplay) -> c_uint {
-    let display = unsafe { &mut *dpy };
-    match display.devices.get() {
+pub unsafe extern "C" fn display_get_devices_len(dpy: *mut WaylandDisplay) -> c_uint {
+    let Some(display) = (unsafe { display_ref(dpy, "display_get_devices_len") }) else {
+        return 0;
+    };
+    match display.devices.get(display.reply_timeout()) {
         Ok(devices) => devices.len() as c_uint,
         Err(err) => {
             tracing::error!(?err, "Compositor failed before publishing its devices.");
@@ -74,13 +99,15 @@ pub extern "C" fn display_get_devices_len(dpy: *mut WaylandDisplay) -> c_uint {
 
 /// Fills `devices` with up to `max_len` device paths; returns the number written.
 #[no_mangle]
-pub extern "C" fn display_get_devices(
+pub unsafe extern "C" fn display_get_devices(
     dpy: *mut WaylandDisplay,
     devices: *mut *const c_char,
     max_len: c_uint,
 ) -> c_uint {
-    let display = unsafe { &mut *dpy };
-    let Ok(list) = display.devices.get() else {
+    let Some(display) = (unsafe { display_ref(dpy, "display_get_devices") }) else {
+        return 0;
+    };
+    let Ok(list) = display.devices.get(display.reply_timeout()) else {
         tracing::error!("Compositor failed before publishing its devices.");
         return 0;
     };
@@ -88,9 +115,11 @@ pub extern "C" fn display_get_devices(
 }
 
 #[no_mangle]
-pub extern "C" fn display_get_envvars_len(dpy: *mut WaylandDisplay) -> c_uint {
-    let display = unsafe { &mut *dpy };
-    match display.envs.get() {
+pub unsafe extern "C" fn display_get_envvars_len(dpy: *mut WaylandDisplay) -> c_uint {
+    let Some(display) = (unsafe { display_ref(dpy, "display_get_envvars_len") }) else {
+        return 0;
+    };
+    match display.envs.get(display.reply_timeout()) {
         Ok(env_vars) => env_vars.len() as c_uint,
         Err(err) => {
             tracing::error!(?err, "Compositor failed before publishing its environment.");
@@ -101,13 +130,15 @@ pub extern "C" fn display_get_envvars_len(dpy: *mut WaylandDisplay) -> c_uint {
 
 /// Fills `env_vars` with up to `max_len` `KEY=VALUE` strings; returns the number written.
 #[no_mangle]
-pub extern "C" fn display_get_envvars(
+pub unsafe extern "C" fn display_get_envvars(
     dpy: *mut WaylandDisplay,
     env_vars: *mut *const c_char,
     max_len: c_uint,
 ) -> c_uint {
-    let display = unsafe { &mut *dpy };
-    let Ok(list) = display.envs.get() else {
+    let Some(display) = (unsafe { display_ref(dpy, "display_get_envvars") }) else {
+        return 0;
+    };
+    let Ok(list) = display.envs.get(display.reply_timeout()) else {
         tracing::error!("Compositor failed before publishing its environment.");
         return 0;
     };
@@ -115,8 +146,14 @@ pub extern "C" fn display_get_envvars(
 }
 
 #[no_mangle]
-pub extern "C" fn display_add_input_device(dpy: *mut WaylandDisplay, path: *const c_char) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_add_input_device(dpy: *mut WaylandDisplay, path: *const c_char) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_add_input_device") }) else {
+        return;
+    };
+    if path.is_null() {
+        tracing::error!("Input device path is null");
+        return;
+    }
     let path = unsafe { CStr::from_ptr(path) }
         .to_string_lossy()
         .into_owned();
@@ -125,10 +162,16 @@ pub extern "C" fn display_add_input_device(dpy: *mut WaylandDisplay, path: *cons
 }
 
 #[no_mangle]
-pub extern "C" fn display_set_video_info(dpy: *mut WaylandDisplay, info: *const GstVideoInfo) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_set_video_info(
+    dpy: *mut WaylandDisplay,
+    info: *const GstVideoInfo,
+) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_set_video_info") }) else {
+        return;
+    };
     if info.is_null() {
         tracing::error!("Video Info is null");
+        return;
     }
     let video_info = unsafe { VideoInfo::from_glib_none(info) };
 
@@ -136,77 +179,112 @@ pub extern "C" fn display_set_video_info(dpy: *mut WaylandDisplay, info: *const 
 }
 
 #[no_mangle]
-pub extern "C" fn display_keyboard_input(dpy: *mut WaylandDisplay, key: c_uint, pressed: bool) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_keyboard_input(
+    dpy: *mut WaylandDisplay,
+    key: c_uint,
+    pressed: bool,
+) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_keyboard_input") }) else {
+        return;
+    };
     display.keyboard_input(key, pressed);
 }
 
 #[no_mangle]
-pub extern "C" fn display_pointer_motion(dpy: *mut WaylandDisplay, x: f64, y: f64) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_pointer_motion(dpy: *mut WaylandDisplay, x: f64, y: f64) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_pointer_motion") }) else {
+        return;
+    };
     display.pointer_motion(x, y);
 }
 
 #[no_mangle]
-pub extern "C" fn display_pointer_motion_absolute(dpy: *mut WaylandDisplay, x: f64, y: f64) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_pointer_motion_absolute(dpy: *mut WaylandDisplay, x: f64, y: f64) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_pointer_motion_absolute") }) else {
+        return;
+    };
     display.pointer_motion_absolute(x, y);
 }
 
 #[no_mangle]
-pub extern "C" fn display_pointer_button(dpy: *mut WaylandDisplay, button: c_uint, pressed: bool) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_pointer_button(
+    dpy: *mut WaylandDisplay,
+    button: c_uint,
+    pressed: bool,
+) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_pointer_button") }) else {
+        return;
+    };
     display.pointer_button(button, pressed);
 }
 
 #[no_mangle]
-pub extern "C" fn display_pointer_axis(dpy: *mut WaylandDisplay, x: f64, y: f64) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_pointer_axis(dpy: *mut WaylandDisplay, x: f64, y: f64) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_pointer_axis") }) else {
+        return;
+    };
     display.pointer_axis(x, y);
 }
 
 #[no_mangle]
-pub extern "C" fn display_touch_down(dpy: *mut WaylandDisplay, id: c_uint, rel_x: f64, rel_y: f64) {
-    let display = unsafe { &mut *dpy };
-    display.touch_down(id, rel_x, rel_y);
-}
-
-#[no_mangle]
-pub extern "C" fn display_touch_up(dpy: *mut WaylandDisplay, id: c_uint) {
-    let display = unsafe { &mut *dpy };
-    display.touch_up(id);
-}
-
-#[no_mangle]
-pub extern "C" fn display_touch_motion(
+pub unsafe extern "C" fn display_touch_down(
     dpy: *mut WaylandDisplay,
     id: c_uint,
     rel_x: f64,
     rel_y: f64,
 ) {
-    let display = unsafe { &mut *dpy };
+    let Some(display) = (unsafe { display_ref(dpy, "display_touch_down") }) else {
+        return;
+    };
+    display.touch_down(id, rel_x, rel_y);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn display_touch_up(dpy: *mut WaylandDisplay, id: c_uint) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_touch_up") }) else {
+        return;
+    };
+    display.touch_up(id);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn display_touch_motion(
+    dpy: *mut WaylandDisplay,
+    id: c_uint,
+    rel_x: f64,
+    rel_y: f64,
+) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_touch_motion") }) else {
+        return;
+    };
     display.touch_motion(id, rel_x, rel_y);
 }
 
 #[no_mangle]
-pub extern "C" fn display_touch_cancel(dpy: *mut WaylandDisplay) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_touch_cancel(dpy: *mut WaylandDisplay) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_touch_cancel") }) else {
+        return;
+    };
     display.touch_cancel();
 }
 
 #[no_mangle]
-pub extern "C" fn display_touch_frame(dpy: *mut WaylandDisplay) {
-    let display = unsafe { &mut *dpy };
+pub unsafe extern "C" fn display_touch_frame(dpy: *mut WaylandDisplay) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_touch_frame") }) else {
+        return;
+    };
     display.touch_frame();
 }
 
 #[no_mangle]
-pub extern "C" fn display_get_frame(dpy: *mut WaylandDisplay) -> *mut GstBuffer {
-    let display = unsafe { &mut *dpy };
-    let _span = match display.tracer.as_ref() {
-        Some(tracer) => Some(tracer.trace("display_get_frame")),
-        None => None,
+pub unsafe extern "C" fn display_get_frame(dpy: *mut WaylandDisplay) -> *mut GstBuffer {
+    let Some(display) = (unsafe { display_ref(dpy, "display_get_frame") }) else {
+        return ptr::null_mut();
     };
+    let _span = display
+        .tracer
+        .as_ref()
+        .map(|tracer| tracer.trace("display_get_frame"));
     match display.frame() {
         Ok(mut frame) => {
             let ptr = frame.make_mut().as_mut_ptr();
@@ -250,5 +328,22 @@ mod tests {
     fn null_or_empty_buffer_writes_nothing() {
         assert_eq!(write_c_strings(&list(), ptr::null_mut(), 4), 0);
         assert_eq!(write_c_strings(&list(), ptr::null_mut(), 0), 0);
+    }
+
+    #[test]
+    fn null_display_is_ignored() {
+        let dpy = ptr::null_mut();
+        let mut buf = [ptr::null::<c_char>(); 4];
+        unsafe {
+            assert_eq!(display_get_devices_len(dpy), 0);
+            assert_eq!(display_get_devices(dpy, buf.as_mut_ptr(), 4), 0);
+            assert_eq!(display_get_envvars_len(dpy), 0);
+            assert_eq!(display_get_envvars(dpy, buf.as_mut_ptr(), 4), 0);
+            assert!(display_get_frame(dpy).is_null());
+            display_keyboard_input(dpy, 30, true);
+            display_add_input_device(dpy, c"/dev/input/event0".as_ptr());
+            display_finish(dpy);
+        }
+        assert!(buf.iter().all(|p| p.is_null()));
     }
 }

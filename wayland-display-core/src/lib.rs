@@ -13,7 +13,7 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -134,11 +134,12 @@ pub enum MaybeRecv<T: Clone> {
 }
 
 impl<T: Clone> MaybeRecv<T> {
-    /// Waits for the compositor to publish the value. Errs if the compositor thread exited
-    /// before sending it (e.g. its renderer failed to initialize).
-    pub fn get(&mut self) -> Result<&T, RecvError> {
+    /// Waits up to `timeout` for the compositor to publish the value. Errs if the compositor
+    /// thread exited before sending it (e.g. its renderer failed to initialize) or is wedged and
+    /// never sends it; after a timeout a later call waits again.
+    pub fn get(&mut self, timeout: Duration) -> Result<&T, RecvTimeoutError> {
         if let MaybeRecv::Rx(recv) = self {
-            *self = MaybeRecv::Value(recv.recv()?);
+            *self = MaybeRecv::Value(recv.recv_timeout(timeout)?);
         }
         match self {
             MaybeRecv::Value(val) => Ok(val),
@@ -240,18 +241,18 @@ impl WaylandDisplay {
         })
     }
 
-    pub fn devices(&mut self) -> Result<impl Iterator<Item = &str>, RecvError> {
+    pub fn devices(&mut self) -> Result<impl Iterator<Item = &str>, RecvTimeoutError> {
         Ok(self
             .devices
-            .get()?
+            .get(self.reply_timeout)?
             .iter()
             .map(|string| string.to_str().unwrap()))
     }
 
-    pub fn env_vars(&mut self) -> Result<impl Iterator<Item = &str>, RecvError> {
+    pub fn env_vars(&mut self) -> Result<impl Iterator<Item = &str>, RecvTimeoutError> {
         Ok(self
             .envs
-            .get()?
+            .get(self.reply_timeout)?
             .iter()
             .map(|string| string.to_str().unwrap()))
     }
@@ -321,6 +322,12 @@ impl WaylandDisplay {
     }
 
     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
+        self.request_frame()?.wait()
+    }
+
+    /// Asks the compositor for the next frame without waiting for it, so a caller holding a lock
+    /// around the display can release it before blocking in [`PendingFrame::wait`].
+    pub fn request_frame(&self) -> Result<PendingFrame, gst::FlowError> {
         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
         if let Err(err) = self
             .command_tx
@@ -329,19 +336,10 @@ impl WaylandDisplay {
             tracing::warn!(?err, "Failed to send buffer command.");
             return Err(gst::FlowError::Eos);
         }
-
-        match buffer_rx.recv_timeout(self.reply_timeout) {
-            Ok(Ok(buffer)) => Ok(buffer),
-            Ok(Err(err)) => match err {
-                SwapBuffersError::AlreadySwapped => unreachable!(),
-                SwapBuffersError::ContextLost(_) => Err(gst::FlowError::Eos),
-                SwapBuffersError::TemporaryFailure(_) => Err(gst::FlowError::Error),
-            },
-            Err(err) => {
-                tracing::warn!(?err, "Failed to recv buffer ack.");
-                Err(gst::FlowError::Error)
-            }
-        }
+        Ok(PendingFrame {
+            buffer_rx,
+            timeout: self.reply_timeout,
+        })
     }
 
     /// Fails when the compositor does not answer within the reply timeout, or is gone. Callers
@@ -352,6 +350,11 @@ impl WaylandDisplay {
             .command_tx
             .send(Command::GetSupportedDmaFormats(buffer_tx));
         buffer_rx.recv_timeout(self.reply_timeout)
+    }
+
+    /// How long calls that wait on the compositor give up after.
+    pub fn reply_timeout(&self) -> Duration {
+        self.reply_timeout
     }
 
     pub fn get_render_device(&self) -> Option<GPUDevice> {
@@ -377,6 +380,30 @@ impl WaylandDisplay {
             }
         }
         latest
+    }
+}
+
+/// A frame requested from the compositor. Independent of the display: if the display is dropped
+/// meanwhile, the compositor quits and [`PendingFrame::wait`] fails instead of blocking.
+pub struct PendingFrame {
+    buffer_rx: Receiver<Result<gst::Buffer, SwapBuffersError>>,
+    timeout: Duration,
+}
+
+impl PendingFrame {
+    pub fn wait(self) -> Result<gst::Buffer, gst::FlowError> {
+        match self.buffer_rx.recv_timeout(self.timeout) {
+            Ok(Ok(buffer)) => Ok(buffer),
+            Ok(Err(err)) => match err {
+                SwapBuffersError::AlreadySwapped => unreachable!(),
+                SwapBuffersError::ContextLost(_) => Err(gst::FlowError::Eos),
+                SwapBuffersError::TemporaryFailure(_) => Err(gst::FlowError::Error),
+            },
+            Err(err) => {
+                tracing::warn!(?err, "Failed to recv buffer ack.");
+                Err(gst::FlowError::Error)
+            }
+        }
     }
 }
 
