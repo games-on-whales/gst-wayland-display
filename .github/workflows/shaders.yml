@@ -9,8 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base
     steps:
-      # diffutils (cmp) is not in the archlinux:base image; Arch's glslc matches
-      # the environment the committed .spv files are regenerated with.
-      - run: pacman -Syu --noconfirm git shaderc diffutils
+      # diffutils (cmp) is not in the archlinux:base image. shaderc is pinned so
+      # the committed .spv files (byte-compared by ci/shaders.sh) are only ever
+      # checked against the same glslc that generates them; bump the pin together
+      # with running `ci/shaders.sh --update`.
+      - run: pacman -Syu --noconfirm git diffutils shaderc=2026.4-1
       - uses: actions/checkout@v4
       - run: bash ci/shaders.sh
