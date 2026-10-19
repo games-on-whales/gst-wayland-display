@@ -9,7 +9,7 @@
 //   (b) tracks, per `wl_surface`, the image description (colorspace) a client
 //       sets, so downstream code can ask `surface_is_hdr(&surface)`.
 //
-// Everything here is gated behind the `WOLF_HDR_CM` env var at the global-creation
+// Everything here is gated behind the `dynamic-hdr` element property at the global-creation
 // site in `State::new`; when unset the global is never advertised and none of this
 // code runs, so client behaviour is exactly as before.
 //
@@ -118,7 +118,7 @@ impl MasteringDisplayInfo {
 /// `frog_color_management_v1` handler (used by gamescope, in
 /// `wayland::protocols::frog_color_management`), and read back by the protocol-agnostic
 /// accessors [`surface_is_hdr`] / [`surface_mastering_caps`]. The consumer never cares
-/// which protocol set it. Gated by `WOLF_HDR_CM` at the global-creation sites.
+/// which protocol set it. Gated by dynamic HDR at the global-creation sites.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SurfaceHdrColor {
     /// Transfer function is SMPTE ST 2084 (PQ).

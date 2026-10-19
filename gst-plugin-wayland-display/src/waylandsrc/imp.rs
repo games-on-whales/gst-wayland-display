@@ -35,17 +35,17 @@ pub struct WaylandDisplaySrc {
     settings: Mutex<Settings>,
     command_tx: Sender<Command>,
     command_rx: Mutex<Option<Channel<Command>>>,
-    /// Live HDR-colorimetry state (WOLF_HDR_CM only). Mirrors the latest
+    /// Live HDR-colorimetry state (dynamic-hdr only). Mirrors the latest
     /// `poll_hdr_state()` value: `true` => the P010 output caps carry BT.2100 PQ
     /// colorimetry + mastering/CLL, `false` => BT.709 SDR (no static metadata).
     /// Read in `caps()`, driven per-frame in `create()`. Default `false`. When
-    /// WOLF_HDR_CM is unset this is never consulted (the static `hdr` property governs).
+    /// dynamic-hdr is off this is never consulted (the static `hdr` property governs).
     hdr_active: AtomicBool,
-    /// Live HDR static metadata (WOLF_HDR_CM only): the active surface's REAL
+    /// Live HDR static metadata (dynamic-hdr only): the active surface's REAL
     /// `(mastering-display-info, content-light-level)` gst caps strings, as reported by the
     /// compositor (frog for gamescope, `wp_color_management_v1` for sway). `(None, None)` =>
     /// `caps()` falls back to the hardcoded `HDR_MASTERING` / `HDR_CLL` defaults. Driven in
-    /// `create()`, read in `caps()`. Never consulted when WOLF_HDR_CM is unset.
+    /// `create()`, read in `caps()`. Never consulted when dynamic-hdr is off.
     hdr_meta: Mutex<(Option<String>, Option<String>)>,
     /// This element's OWN Vulkan-encode device share, replacing the process-global
     /// `vulkan_share` slots so N concurrent Vulkan sessions in one process each mint, own and
@@ -89,6 +89,21 @@ pub struct Settings {
     /// content-light-level caps fields, so a downstream `vulkanh265enc` emits the matching
     /// VUI + mastering/CLL SEI. Only affects the P010 path; NV12/SDR is unchanged. Default off.
     hdr: bool,
+    /// Dynamic HDR color management. When true the compositor advertises wp_color_management_v1 +
+    /// frog_color_management_v1, renders into an fp16 target, tracks the active surface's
+    /// HDR state and flips the P010 caps colorimetry mid-stream (bt709 <-> bt2100-pq),
+    /// posting `wolf-hdr-state` bus messages on transitions. Set before starting the
+    /// pipeline (the Wayland globals are created at start). Must be per element -- not an
+    /// env var -- so one process can stream an HDR client and an SDR client side by side.
+    hdr_cm: bool,
+    /// Manual override of the HDR mastering-display-info caps string (gst format:
+    /// "Rx:Ry:Gx:Gy:Bx:By:Wx:Wy:maxLum:minLum"). `None` => the hardcoded BT.2020/1000-nit
+    /// default, or the game's real metadata under dynamic HDR.
+    mastering_display_info: Option<String>,
+    /// Manual override of the HDR content-light-level caps string ("maxCLL:maxFALL" in
+    /// cd/m^2). `None` => the hardcoded 1000:400 default, or the game's real metadata
+    /// under dynamic HDR.
+    content_light_level: Option<String>,
     vulkan_profile: Option<String>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
@@ -345,6 +360,35 @@ impl ObjectImpl for WaylandDisplaySrc {
                 glib::ParamSpecString::builder("vulkan-profile")
                     .blurb("Encode image profile: high/main/baseline/constrained-baseline for NV12, main-10 for P010; match the downstream encoder")
                     .mutable_ready().build(),
+                glib::ParamSpecBoolean::builder("dynamic-hdr")
+                    .blurb(
+                        "Dynamic HDR color management: advertise wp_color_management_v1 + \
+                         frog_color_management_v1, render into an fp16 target, follow the active \
+                         surface's HDR state and flip the P010 caps colorimetry mid-stream \
+                         (bt709 <-> bt2100-pq), posting wolf-hdr-state bus messages on \
+                         transitions. Per element (an HDR and an SDR session can share a \
+                         process). Set before starting the pipeline.",
+                    )
+                    .default_value(false)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("mastering-display-info")
+                    .blurb(
+                        "Override the HDR mastering-display-info caps string \
+                         (Rx:Ry:Gx:Gy:Bx:By:Wx:Wy:maxLum:minLum). Empty = the hardcoded \
+                         BT.2020/1000-nit default or, under dynamic-hdr, the game's real \
+                         metadata.",
+                    )
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("content-light-level")
+                    .blurb(
+                        "Override the HDR content-light-level caps string (maxCLL:maxFALL in \
+                         cd/m^2). Empty = the hardcoded 1000:400 default or, under dynamic-hdr, \
+                         the game's real metadata.",
+                    )
+                    .mutable_ready()
+                    .build(),
                 glib::ParamSpecBoolean::builder("hdr")
                     .nick("Tag P010 output as HDR (BT.2100 PQ)")
                     .blurb(
@@ -374,6 +418,29 @@ impl ObjectImpl for WaylandDisplaySrc {
                 self.vulkan_share.set_conversion_options(options);
             }
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile = value.get().unwrap(),
+            "dynamic-hdr" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.hdr_cm = value.get::<bool>().expect("Type checked upstream");
+                // The compositor thread and converter snapshot this via the shared
+                // conversion options, so keep them in sync with the property.
+                let mut options = self.vulkan_share.conversion_options();
+                options.hdr_cm = settings.hdr_cm;
+                self.vulkan_share.set_conversion_options(options);
+            }
+            "mastering-display-info" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.mastering_display_info = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .filter(|v| !v.trim().is_empty());
+            }
+            "content-light-level" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.content_light_level = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .filter(|v| !v.trim().is_empty());
+            }
 
             "render-node" => {
                 let mut settings = self.settings.lock().unwrap();
@@ -460,6 +527,14 @@ impl ObjectImpl for WaylandDisplaySrc {
                 .sdr_reference_white
                 .to_value(),
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile.to_value(),
+            "dynamic-hdr" => self.settings.lock().unwrap().hdr_cm.to_value(),
+            "mastering-display-info" => self
+                .settings
+                .lock()
+                .unwrap()
+                .mastering_display_info
+                .to_value(),
+            "content-light-level" => self.settings.lock().unwrap().content_light_level.to_value(),
 
             "render-node" => {
                 let settings = self.settings.lock().unwrap();
@@ -980,21 +1055,29 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         //   mastering-display-info: R:G:B:W chromaticity (x,y * 50000) + max:min luminance
         //                (* 10000 cd/m^2) -> BT.2020 primaries, 1000 nit / 0.0001 nit.
         //   content-light-level: MaxCLL:MaxFALL -> 1000 : 400.
-        // WOLF_HDR_CM: TRUE dynamic HDR. The stream stays P010/Main-10 always, but its
+        // dynamic-hdr: TRUE dynamic HDR. The stream stays P010/Main-10 always, but its
         // colorimetry flips mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR
         // content) following the live compositor HDR state (`hdr_active`, driven per-frame
         // by `poll_hdr_state()` in `create()`). When the flag is unset this is byte-identical
         // to the previous behaviour: the static `hdr` property alone governs the P010 caps.
-        let hdr_cm = waylanddisplaycore::utils::vulkan_nv12::wolf_hdr_cm();
+        let (hdr_cm, static_hdr, hdr_mastering_override, hdr_cll_override) = {
+            let settings = self.settings.lock().unwrap();
+            (
+                settings.hdr_cm,
+                settings.hdr,
+                settings.mastering_display_info.clone(),
+                settings.content_light_level.clone(),
+            )
+        };
         let hdr = if hdr_cm {
             self.hdr_active.load(Ordering::Relaxed)
         } else {
-            self.settings.lock().unwrap().hdr
+            static_hdr
         };
         const HDR_COLORIMETRY: &str = "bt2100-pq";
         const HDR_MASTERING: &str = "35400:14600:8500:39850:6550:2300:15635:16450:10000000:1";
         const HDR_CLL: &str = "1000:400";
-        // Effective HDR static metadata. Under WOLF_HDR_CM use the live values the compositor
+        // Effective HDR static metadata. Under dynamic-hdr use the live values the compositor
         // reported from the game's own color-management signal (frog/gamescope or
         // wp_color_management/sway) -- so the "HDR Luminance" slider actually flows through to
         // the encoder's mastering/CLL SEI -- falling back to the hardcoded defaults when the
@@ -1008,22 +1091,17 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         } else {
             (HDR_MASTERING.to_string(), HDR_CLL.to_string())
         };
-        // Diagnostic / manual override of the static HDR metadata via environment, so the
-        // mastering-display peak and content-light-level can be swept at runtime (container
-        // restart, no rebuild). `WOLF_HDR_MASTERING` is a full gst mastering-display-info
-        // string (R:G:B:W chroma *50000, then max:min luminance in 0.0001 cd/m^2);
-        // `WOLF_HDR_CLL` is "maxCLL:maxFALL" in cd/m^2. Empty/unset => leave as computed.
-        if let Ok(v) = std::env::var("WOLF_HDR_MASTERING") {
-            if !v.trim().is_empty() {
-                hdr_mastering = v;
-            }
+        // Manual override of the static HDR metadata via the mastering-display-info /
+        // content-light-level element properties (per element, so an HDR session and an SDR
+        // session in one process can each carry their own metadata). `None`/empty => leave
+        // as computed above.
+        if let Some(v) = hdr_mastering_override {
+            hdr_mastering = v;
         }
-        if let Ok(v) = std::env::var("WOLF_HDR_CLL") {
-            if !v.trim().is_empty() {
-                hdr_cll = v;
-            }
+        if let Some(v) = hdr_cll_override {
+            hdr_cll = v;
         }
-        // SDR colorimetry for the P010 path under WOLF_HDR_CM when the content is not PQ:
+        // SDR colorimetry for the P010 path under dynamic-hdr when the content is not PQ:
         // BT.709 (primaries=bt709, transfer=bt709, matrix=bt709, range=limited) and NO
         // mastering-display-info / content-light-level, so the encoder flips its VUI back to
         // SDR. Format stays P010_10LE (Main-10) either way.
@@ -1485,10 +1563,10 @@ impl PushSrcImpl for WaylandDisplaySrc {
             return Err(gst::FlowError::Eos);
         };
 
-        // WOLF_HDR_CM: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
+        // dynamic-hdr: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
         // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
         // change, so this posts at most one message per transition.
-        if waylanddisplaycore::utils::vulkan_nv12::wolf_hdr_cm() {
+        if self.settings.lock().unwrap().hdr_cm {
             if let Some((hdr, mastering, cll)) = state.display.poll_hdr_state() {
                 // Store the active surface's real mastering / CLL metadata so the next
                 // `caps()` stamps it onto the P010 HDR caps (else the hardcoded defaults).
@@ -1512,7 +1590,7 @@ impl PushSrcImpl for WaylandDisplaySrc {
                 if self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr {
                     gst::info!(
                         CAT,
-                        "WOLF_HDR_CM: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
+                        "dynamic-hdr: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
                         hdr
                     );
                     self.obj()

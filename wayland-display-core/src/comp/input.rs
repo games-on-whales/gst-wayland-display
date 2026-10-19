@@ -634,6 +634,7 @@ mod tests {
                 &dh,
                 &libinput_context,
                 event_loop.handle(),
+                false,
             );
 
             TestState { state }

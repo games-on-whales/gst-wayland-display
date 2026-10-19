@@ -49,7 +49,7 @@ pub enum Command {
     TouchFrame,
     Quit,
     /// Compositor -> element signal (reverse direction): the OUTPUT HDR state of the
-    /// active fullscreen surface changed. Sent only when `WOLF_HDR_CM` is set, over a
+    /// active fullscreen surface changed. Sent only when dynamic HDR is enabled, over a
     /// dedicated reverse channel (never the element -> compositor command channel), and
     /// drained by the element via [`WaylandDisplay::poll_hdr_state`] so it can surface
     /// the change as a `wolf-hdr-state` application message on the GStreamer bus.
@@ -107,7 +107,7 @@ pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
     /// Reverse channel (compositor -> element) carrying `Command::HdrState` whenever the
-    /// OUTPUT HDR state changes. Empty unless `WOLF_HDR_CM` is set; drained by
+    /// OUTPUT HDR state changes. Empty unless dynamic HDR is enabled; drained by
     /// [`WaylandDisplay::poll_hdr_state`].
     hdr_state_rx: Receiver<Command>,
 
@@ -342,7 +342,7 @@ impl WaylandDisplay {
     /// `(hdr, mastering, cll)`: `hdr` is the new output HDR state, and `mastering` / `cll`
     /// are the active surface's real HDR static metadata caps strings (or `None` to fall back
     /// to the producer's hardcoded defaults). The compositor only sends on this channel when
-    /// `WOLF_HDR_CM` is set, so unset = always `None`.
+    /// dynamic HDR is enabled, so off = always `None`.
     pub fn poll_hdr_state(&self) -> Option<(bool, Option<String>, Option<String>)> {
         let mut latest = None;
         while let Ok(cmd) = self.hdr_state_rx.try_recv() {

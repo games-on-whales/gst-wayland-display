@@ -12,7 +12,7 @@
 // so the consumer (`output_hdr_state` + the producer's mastering metadata) is
 // protocol-agnostic -- see `wayland::handlers::color_management`.
 //
-// Everything is gated behind `WOLF_HDR_CM` at the global-creation site in `State::new`;
+// Everything is gated behind dynamic HDR at the global-creation site in `State::new`;
 // when unset the global is never advertised and none of this runs.
 
 // Re-export only the actual code; the `generated` module is boilerplate to isolate the
@@ -138,7 +138,7 @@ where
                 // in-game HDR (and its luminance slider) never engages. Primaries/white
                 // are BT.2020 + D65 in frog's 0.00002 units (== gst ×50000); luminance
                 // is the display peak gamescope tone-maps the game to. Only runs under
-                // WOLF_HDR_CM (the global is gated there).
+                // dynamic HDR (the global is gated there).
                 // Display peak luminance advertised to gamescope (what the game calibrates
                 // its HDR to). Tunable via WOLF_HDR_PEAK_NITS (nits, default 1000) so it can
                 // be matched to the client TV without a rebuild; clamped to frog's u16 range.
@@ -271,7 +271,7 @@ where
 }
 
 /// Create the `frog_color_management_factory_v1` global (version 1). Called only under
-/// `WOLF_HDR_CM`.
+/// dynamic HDR.
 pub fn create_frog_color_management_global<D>(display: &DisplayHandle) -> GlobalId
 where
     D: GlobalDispatch<FrogColorManagementFactoryV1, ()>

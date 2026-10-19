@@ -125,28 +125,91 @@ on whatever minimum the chosen encoder advertises, which is codec-specific: `vul
 from 128x128 and `vulkanh265enc` from 130x128 on this driver. Both produce a valid stream, just not
 at the size you probably wanted.
 
+## HDR output
+
+HDR is delivered as a 10-bit **P010** stream tagged BT.2100 (BT.2020 primaries, SMPTE 2084 PQ
+transfer, limited range) plus static metadata, so a downstream `vulkanh265enc` (Main-10) emits the
+matching VUI and mastering-display / content-light-level SEI. NV12 (8-bit) output is never tagged
+HDR. **HDR requires the Vulkan encode path**: the RGBA → P010 conversion, the SDR→PQ tone-map and
+the PQ passthrough all live in the Vulkan compute converter described above, so there is no HDR
+over the VA/dmabuf or CUDA outputs.
+
+There are two modes:
+
+| Mode | How | What it does |
+| --- | --- | --- |
+| Static | `hdr=true` | Tags the P010 caps as BT.2100 PQ with the default (or overridden) static metadata and converts with the BT.2020 matrix. One-way; no client detection. The compositor content is SDR, so this is signalling plus an SDR→PQ tone-map, not new highlight detail. |
+| Dynamic | `dynamic-hdr=true` | Full dynamic HDR: the compositor detects the client's HDR state and flips the P010 colorimetry mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR content), following the active surface. Set before starting the pipeline — the Wayland globals below are created at start. |
+
+Both are **per-element properties, not environment variables**, which matters when one process
+serves an HDR client and an SDR client at the same time: environment variables are process-global
+and cannot differ per session, properties can.
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `hdr` | false | Static HDR tagging of the P010 caps (see the modes table). |
+| `dynamic-hdr` | false | Dynamic HDR (see the modes table). Read once at start; set before the pipeline starts. |
+| `mastering-display-info` | null | Override the mastering-display caps string; empty = default or, under `dynamic-hdr`, the game's metadata. |
+| `content-light-level` | null | Override the content-light-level caps string; empty = default or, under `dynamic-hdr`, the game's metadata. |
+| `sdr-reference-white` | 203 | SDR diffuse white in nits for the SDR→PQ tone-map (see the Vulkan conversion table). |
+
+### Wayland protocols involved
+
+Under `dynamic-hdr` the compositor advertises two color-management protocols and writes what it
+learns from either into one shared per-surface HDR state:
+
+- **`wp_color_management_v1`** (the standard staging protocol, spoken by sway and other
+  desktop compositors). The full server side is implemented: the output is advertised as
+  BT.2100 PQ so HDR clients enable their HDR path, and clients attach an image description
+  (transfer function, primaries, mastering luminance, MaxCLL/MaxFALL) to their surface.
+- **`frog_color_management_v1`** (gamescope/Steam Deck protocol, vendored XML). gamescope
+  does **not** speak `wp_color_management_v1`; it signals HDR by submitting 10-bit
+  already-PQ BT.2020 buffers and, through frog, the game's real mastering metadata.
+
+HDR detection is dual-source, whichever fires first:
+
+1. the active surface declared PQ through either protocol, or
+2. the surface's last committed buffer is a 10-bit packed RGB fourcc (`XB30`/`AB30`/
+   `XR30`/`AR30`) — gamescope's already-PQ output. This heuristic is what actually detects
+   a gamescope HDR game.
+
+### How it works end to end
+
+1. **Detection**: on every commit the compositor records the surface's HDR state; a candidate
+   HDR↔SDR flip must hold for 600 ms (debounce) before it commits, so a stray 8-bit UI frame
+   between 10-bit game frames cannot blank the TV with a mode switch.
+2. **Signalling**: on a committed flip the compositor sends the new state (plus the game's real
+   mastering/CLL metadata when it provided any) to the source, which (a) posts a
+   `wolf-hdr-state` application message on the GStreamer bus and (b) marks the src pad for
+   renegotiation.
+3. **Renegotiation**: the source re-runs caps negotiation and pushes new CAPS: BT.2100 PQ +
+   mastering-display-info + content-light-level when HDR, plain BT.709 when SDR. The encoder
+   re-emits its VUI and HDR SEI at the next IDR. The converter is *not* rebuilt for a
+   colorimetry-only change — both pipelines are pre-built and picked per frame.
+4. **Conversion**: the Vulkan converter picks the shader per frame. SDR 8-bit content takes
+   the SDR→PQ tone-map (sRGB EOTF → linear BT.709 → BT.2020 gamut → reference white at
+   `sdr-reference-white` nits → PQ OETF → BT.2020 Y'CbCr). A frame that came from an
+   already-PQ 10-bit client buffer takes the PQ-passthrough shader (Y'CbCr matrix only), so
+   it is not double-encoded. Under `dynamic-hdr` the render target itself is fp16
+   (`Abgr16161616f`) and the compositor additionally advertises fp16/10-bit dmabuf formats to
+   clients, so genuine >1.0 highlights can reach the encoder.
+
+The static metadata defaults (BT.2020 primaries, 1000-nit master, 1000:400 CLL) can be overridden
+per element with the `mastering-display-info` and `content-light-level` properties (gst caps
+string format); under `dynamic-hdr` the game's own values take precedence unless overridden.
+
 ## Environment variables
 
 These are read once at startup. Everything here is off or neutral when unset, so the default
 behaviour is what you get without setting any of them. The diagnostic ones exist for tracking
-driver bugs and are not intended for normal use.
+driver bugs and are not intended for normal use. Configuration that affects streaming is
+property-based (see the tables above and the [HDR section](#hdr-output)).
 
-HDR and colour, all inert unless `WOLF_HDR_CM` is set:
+HDR:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `WOLF_HDR_CM` | unset | Advertise `wp_color_manager_v1` and `frog_color_management_v1`, and pick the PQ-passthrough shader per frame when a client submits already-PQ 10-bit content. Gates every other entry in this table. |
 | `WOLF_HDR_PEAK_NITS` | `1000` | Display peak luminance advertised to the client through frog, in nits. Match it to the target TV. Max-full-frame is derived as 40% of it. |
-| `WOLF_SDR_REFERENCE_WHITE` | `203` | SDR diffuse white in nits for the BT.2020/PQ tone-map, bound to specialization constant 0 of the converter pipelines. 203 is BT.2408 graphics white. |
-| `WOLF_HDR_MASTERING` | computed | Override the mastering-display-info string on the output caps. GStreamer format: R:G:B:W chroma coordinates scaled by 50000, then max:min luminance in 0.0001 cd/m². |
-| `WOLF_HDR_CLL` | computed | Override content-light-level as `maxCLL:maxFALL` in cd/m². |
-
-Vulkan encode:
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `WOLF_VULKAN_LINEAR_ENCSRC` | unset | Allocate the encode-src image `LINEAR` instead of tiled. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR to tiled `vkCmdCopyImage`. Falls back to tiled if the LINEAR allocation is rejected. |
-| `WOLF_VULKAN_RING` | `4` | Number of encode-src ring slots cycled, 1 to 4. `1` pins a single slot, which isolates whether per-slot image addresses are behind a tiling artifact. **`1` is a diagnostic, not a streaming setting.** The reuse gate waits for a slot's buffer to become writable. At 4 slots the ring rotates past a slot that is still referenced downstream. At 1 slot there is nothing to rotate to, so every frame waits the full 1s timeout, drops, and re-emits the previous output. Ordinary in-flight references are enough on their own: 0.45 fps measured on an RTX 5090 with `enable-last-sample=false` already set on the sink. Leaving `enable-last-sample` on, which is the `GstBaseSink` default, pins the newest buffer too and makes it worse. Use `1` to inspect per-slot image addresses, not to stream. |
 
 Diagnostics:
 
@@ -249,13 +312,11 @@ so independent sessions may use different values:
 
 | Property | Default | Purpose |
 | --- | --- | --- |
-| `ring-depth` | 4 | Allocated conversion slots, 1–4. Keep 4 for streaming unless you have verified a smaller ring with your consumers. A retained previous image can exhaust a 1–2 slot ring. |
-| `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Useful for drivers with tiled copy issues. |
+| `ring-depth` | 4 | Allocated conversion slots, 1–4. Keep 4 for streaming unless you have verified a smaller ring with your consumers. At 1 slot the ring cannot rotate past a slot that is still referenced downstream, so every frame waits the reuse gate's full 1s timeout, drops, and re-emits the previous output (0.45 fps measured on an RTX 5090 with `enable-last-sample=false` on the sink; leaving `enable-last-sample` on pins the newest buffer too and makes it worse). Use `1` only to inspect per-slot image addresses, not to stream. |
+| `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR-to-tiled `vkCmdCopyImage`. |
 | `sdr-reference-white` | 203 | SDR white level in nits for SDR → PQ conversion, 1–10000. |
 | `vulkan-profile` | format-dependent | H.264 `high` by default for NV12; set `main` or `constrained-baseline` etc. to match the encoder. P010 requires `main-10` (H.265). |
 
-Legacy `WOLF_VULKAN_RING`, `WOLF_VULKAN_LINEAR_ENCSRC` and
-`WOLF_SDR_REFERENCE_WHITE` variables supply defaults; properties take precedence.
 A directly connected H.264 encoder's fixed output profile is discovered through
 simple filters and queues. Raw caps cannot express an encoder's codec/profile
 across interpipe. Configure `vulkan-profile` consistently with that consumer; an incompatible profile can
@@ -275,11 +336,12 @@ hits a lavapipe/Mesa LLVM initialization collision, configure
 `VK_LOADER_DRIVERS_DISABLE='*lvp_icd*'` in the launching process before it starts.
 Software Vulkan remains available to embedding applications by default.
 
-`WOLF_HDR_CM` enables dynamic HDR signaling and is read once per process;
-`WOLF_HDR_MASTERING` and `WOLF_HDR_CLL` override static HDR metadata. Diagnostic
-knobs `WOLF_HDR_SPIKE`, `WOLF_VULKAN_DUMP`, and `WOLF_VULKAN_DUMP_FRAME` remain
-environment variables. Regenerate committed SPIR-V with `bash ci/shaders.sh
---update`; CI recompiles and compares every shader with its GLSL source.
+HDR — including the `dynamic-hdr`, `mastering-display-info` and `content-light-level`
+properties and the Wayland protocols behind them — has its own section above; see
+[HDR output](#hdr-output). Diagnostic knobs `WOLF_HDR_SPIKE`, `WOLF_VULKAN_DUMP`, and
+`WOLF_VULKAN_DUMP_FRAME` remain environment variables (documented below). Regenerate
+committed SPIR-V with `bash ci/shaders.sh --update`; CI recompiles and compares every
+shader with its GLSL source.
 
 The current unified build requires **GStreamer Vulkan >= 1.28** and Vulkan loader
 headers, even when only the CUDA/VA path is used. The bindings' Vulkan `v1_28`

@@ -89,7 +89,7 @@ const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt20
 // tone-map and HDR content uses the passthrough pipeline, so this is otherwise unused.
 #[allow(dead_code)]
 const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv");
-/// PQ-passthrough variant of the P010 converter (`WOLF_HDR_CM`). Same topology/bindings as
+/// PQ-passthrough variant of the P010 converter (dynamic HDR). Same topology/bindings as
 /// [`RGBA_TO_P010_BT2020_SPV`], but it applies ONLY the BT.2020 limited-range Y'CbCr matrix --
 /// no sRGB EOTF, no 709->2020 gamut, no PQ OETF -- because its input is already PQ-encoded
 /// BT.2020 (gamescope's 10-bit XB30/AB30/XR30/AR30 HDR output, composited into the fp16
@@ -102,8 +102,8 @@ const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
 // Ring depth: slots cycled to pipeline convert+encode (array sizing + default active depth).
 // 4 is enough fan-out for the downstream encoder's buffer references (1 starves; 4 and 8 are
-// indistinguishable in practice). Override the active depth at runtime with WOLF_VULKAN_RING
-// (1..=RING) via ring_used().
+// indistinguishable in practice). The per-element `ring-depth` property (1..=RING) overrides
+// this default before the converter is created.
 const RING: usize = 4;
 
 /// Optional path for a one-shot debug dump of the converter's NV12 output (the LINEAR
@@ -137,25 +137,6 @@ fn dump_frame_target() -> u64 {
     })
 }
 
-/// Number of ring slots actually cycled (`<= RING`; the per-slot arrays stay sized at
-/// `RING`). Override with `WOLF_VULKAN_RING` for diagnosis -- e.g. `WOLF_VULKAN_RING=1` pins
-/// a single encode-src slot, isolating whether per-slot encode-src images (address-dependent
-/// tiling/swizzle) cause the RX 9070 / GFX12 "jumping" image. The compositor renders into one
-/// stable RGBA buffer, so every slot converts identical content -- if a single slot is stable
-/// but 8 jump, the encode-src pool images differ per slot. Read once.
-fn ring_used() -> usize {
-    use std::sync::OnceLock;
-    static R: OnceLock<usize> = OnceLock::new();
-    *R.get_or_init(|| {
-        let n = std::env::var("WOLF_VULKAN_RING")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| (1..=RING).contains(&n))
-            .unwrap_or(RING);
-        tracing::debug!("VulkanNv12: ring_used={n} (RING={RING})");
-        n
-    })
-}
 /// PCI vendor id for Nvidia -- its CUDA consumer ignores implicit dma-buf fences.
 const VENDOR_NVIDIA: u32 = 0x10de;
 /// `VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR` -- the layout `vulkanh264enc` expects its input.
@@ -488,15 +469,20 @@ pub struct ConversionOptions {
     pub ring_depth: usize,
     pub linear_encode_src: bool,
     pub sdr_reference_white: f32,
+    /// Dynamic HDR color management (the element's `dynamic-hdr` property):
+    /// builds the fp16 render target, both SDR and PQ-passthrough converter pipelines,
+    /// and gates the compositor's HDR-state signalling. Read once at converter creation
+    /// and at compositor start; the element property is the source of truth.
+    pub hdr_cm: bool,
 }
 
 impl Default for ConversionOptions {
     fn default() -> Self {
         Self {
-            ring_depth: ring_used(),
-            linear_encode_src: std::env::var("WOLF_VULKAN_LINEAR_ENCSRC")
-                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            sdr_reference_white: sdr_reference_white(),
+            ring_depth: RING,
+            linear_encode_src: false,
+            sdr_reference_white: 203.0,
+            hdr_cm: false,
         }
     }
 }
@@ -658,14 +644,14 @@ impl VulkanNv12 {
             None,
         )?;
         // SDR reference white (nits) -> specialization constant 0 of the BT.2020/PQ shader,
-        // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
-        // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
-        // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
+        // tunable per element via the `sdr-reference-white` property without recompiling. The
+        // other shaders don't declare constant_id 0, and Vulkan ignores a spec entry an
+        // unused shader doesn't reference.
         let sdr_ref_white = options.sdr_reference_white;
         let pipeline = build_compute_pipeline(
             &device,
             pipeline_layout,
-            normal_shader(fmt, bt2020, fp16_input),
+            normal_shader(fmt, bt2020, fp16_input, options.hdr_cm),
             sdr_ref_white,
         )?;
         let pipeline_pq = build_pq_passthrough(
@@ -674,6 +660,7 @@ impl VulkanNv12 {
             fmt,
             bt2020,
             fp16_input,
+            options.hdr_cm,
             sdr_ref_white,
         );
 
@@ -858,14 +845,14 @@ impl VulkanNv12 {
             None,
         )?;
         // SDR reference white (nits) -> specialization constant 0 of the BT.2020/PQ shader,
-        // so it's tunable via Wolf's [gstreamer.video] sdr_reference_white (passed as the
-        // WOLF_SDR_REFERENCE_WHITE env) without recompiling. The other shaders don't declare
-        // constant_id 0, and Vulkan ignores a spec entry an unused shader doesn't reference.
+        // tunable per element via the `sdr-reference-white` property without recompiling. The
+        // other shaders don't declare constant_id 0, and Vulkan ignores a spec entry an
+        // unused shader doesn't reference.
         let sdr_ref_white = options.sdr_reference_white;
         let pipeline = build_compute_pipeline(
             &device,
             pipeline_layout,
-            normal_shader(fmt, bt2020, fp16_input),
+            normal_shader(fmt, bt2020, fp16_input, options.hdr_cm),
             sdr_ref_white,
         )?;
         let pipeline_pq = build_pq_passthrough(
@@ -874,6 +861,7 @@ impl VulkanNv12 {
             fmt,
             bt2020,
             fp16_input,
+            options.hdr_cm,
             sdr_ref_white,
         );
         let psizes = [
@@ -1639,36 +1627,13 @@ impl Drop for VulkanNv12 {
 
 // --- helpers ---
 
-/// SDR diffuse white (nits) for the BT.2020/PQ tone-map: Wolf's `[gstreamer.video]
-/// sdr_reference_white` passed as `WOLF_SDR_REFERENCE_WHITE`, default 203 (BT.2408 graphics
-/// white). Bound to specialization constant 0 of every converter pipeline (ignored by shaders
-/// that don't declare it).
-fn sdr_reference_white() -> f32 {
-    std::env::var("WOLF_SDR_REFERENCE_WHITE")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|v: &f32| v.is_finite() && (1.0..=10000.0).contains(v))
-        .unwrap_or(203.0)
-}
-
-/// `WOLF_HDR_CM`: dynamic-colorimetry HDR mode. When set, the fp16 P010 converter builds BOTH
-/// the SDR (`RGBA_TO_P010_SPV`, BT.709 matrix, no PQ) and PQ-passthrough
-/// (`RGBA_PQPASS_TO_P010_SPV`) pipelines up front -- independent of the negotiated caps
-/// colorimetry -- and `convert()` picks per frame by `pq_passthrough`, so a producer's
-/// mid-stream bt709<->bt2100-pq caps flip never rebuilds the converter (which would stall the
-/// compositor thread). Read once; unset == byte-identical prior behavior.
-pub fn wolf_hdr_cm() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("WOLF_HDR_CM").is_ok())
-}
-
-/// The "normal" (`pq_passthrough = false`) converter shader. Under `WOLF_HDR_CM` on the fp16
+/// The "normal" (`pq_passthrough = false`) converter shader. Under dynamic HDR on the fp16
 /// P010 path this is the BT.709-matrix `RGBA_TO_P010_SPV` (true SDR, no PQ) regardless of the
 /// negotiated caps `bt2020` flag, so the pipeline survives a mid-stream bt709<->bt2100-pq
 /// colorimetry flip without a rebuild; the per-frame PQ-passthrough pipeline handles already-PQ
-/// HDR content. With `WOLF_HDR_CM` unset this is exactly `PixFmt::shader` (caps-driven).
-fn normal_shader(fmt: PixFmt, bt2020: bool, fp16_input: bool) -> &'static [u8] {
-    if wolf_hdr_cm() && fmt == PixFmt::P010 && fp16_input {
+/// HDR content. With dynamic HDR off this is exactly `PixFmt::shader` (caps-driven).
+fn normal_shader(fmt: PixFmt, bt2020: bool, fp16_input: bool, hdr_cm: bool) -> &'static [u8] {
+    if hdr_cm && fmt == PixFmt::P010 && fp16_input {
         RGBA_TO_P010_SPV
     } else {
         fmt.shader(bt2020, fp16_input)
@@ -1720,7 +1685,7 @@ unsafe fn build_compute_pipeline(
 
 /// Build the per-frame PQ-passthrough pipeline, or `None` when it isn't applicable. Needed on the
 /// HDR fp16 P010 path, where a frame from a 10-bit already-PQ client buffer must skip the
-/// tone-map. The static HDR path builds it when the caps are `bt2020`; under `WOLF_HDR_CM` it's
+/// tone-map. The static HDR path builds it when the caps are `bt2020`; under dynamic HDR it's
 /// built for ANY fp16 P010 negotiation (independent of the caps `bt2020` flag) so it survives a
 /// bt709-tagged negotiation / a mid-stream colorimetry flip. Best-effort: a build failure (e.g.
 /// the driver rejects the shader) leaves it `None` so the normal
@@ -1731,9 +1696,10 @@ unsafe fn build_pq_passthrough(
     fmt: PixFmt,
     bt2020: bool,
     fp16_input: bool,
+    hdr_cm: bool,
     sdr_ref_white: f32,
 ) -> Option<vk::Pipeline> {
-    let want = fmt == PixFmt::P010 && fp16_input && (bt2020 || wolf_hdr_cm());
+    let want = fmt == PixFmt::P010 && fp16_input && (bt2020 || hdr_cm);
     if !want {
         return None;
     }

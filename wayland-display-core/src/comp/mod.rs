@@ -119,11 +119,11 @@ pub struct State {
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
-    /// WOLF_HDR_CM per-frame PQ-passthrough selector: true when the active fullscreen surface's
+    /// Dynamic-HDR per-frame PQ-passthrough selector: true when the active fullscreen surface's
     /// most-recent committed buffer is a 10-bit fourcc (gamescope's already-PQ BT.2020 HDR
     /// output, XB30/AB30/XR30/AR30). Threaded into the Vulkan converter's `convert()` so a
     /// 10-bit frame uses the matrix-only passthrough shader instead of re-applying PQ. Always
-    /// false unless WOLF_HDR_CM is set (set only in the compositor commit handler).
+    /// false unless dynamic HDR is enabled (set only in the compositor commit handler).
     pub(crate) current_input_is_pq: bool,
 
     // management
@@ -161,16 +161,16 @@ pub struct State {
     viewporter_state: ViewporterState,
     cursor_event_count: i32,
     pub single_pixel_buffer_state: SinglePixelBufferState,
-    /// `wp_color_manager_v1` global id, present only when `WOLF_HDR_CM` is set. Gated so
+    /// `wp_color_manager_v1` global id, present only when dynamic HDR is enabled. Gated so
     /// that advertising color-management (which changes HDR clients' behaviour) stays
     /// opt-in until the buffer-import side is ready.
     color_mgmt_global: Option<GlobalId>,
-    /// `frog_color_management_v1` factory global id, present only when `WOLF_HDR_CM` is set.
+    /// `frog_color_management_v1` factory global id, present only when dynamic HDR is enabled.
     /// gamescope's HDR path uses frog instead of `wp_color_management_v1`; both feed the same
     /// shared per-surface `SurfaceHdrColor`.
     frog_color_mgmt_global: Option<GlobalId>,
     /// Reverse channel (compositor -> element) used to signal OUTPUT HDR-state changes.
-    /// `Some` only when `WOLF_HDR_CM` is set; `None` keeps the per-frame check a no-op so
+    /// `Some` only when dynamic HDR is enabled; `None` keeps the per-frame check a no-op so
     /// behaviour is exactly as before. See [`State::update_hdr_state`].
     hdr_state_tx: Option<Sender<Command>>,
     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
@@ -187,9 +187,16 @@ pub struct State {
     /// the `State::new` default is an empty placeholder.
     pub(crate) vulkan_share: Arc<VulkanShare>,
     va_share: Arc<crate::utils::va_share::VaShare>,
+    /// Per-instance dynamic HDR color management (the `dynamic-hdr` property, so one
+    /// process can run an HDR session and an SDR session side by side).
+    /// Snapshot of the element's `dynamic-hdr` property at compositor start: it gates the
+    /// color-management/frog globals, the HDR dmabuf format advertisement, the per-commit
+    /// PQ-passthrough detection, the reverse-channel wiring and the converter-keep logic.
+    /// Set by [`init`] from this element's `VulkanShare` conversion options.
+    pub(crate) hdr_cm: bool,
 }
 
-/// HDR-capable dmabuf fourccs advertised to clients under WOLF_HDR_CM (when the GLES
+/// HDR-capable dmabuf fourccs advertised to clients under dynamic HDR (when the GLES
 /// renderer can import them): fp16 scRGB-linear (`Abgr16161616f`) and 10-bit (`Abgr2101010`
 /// / `Argb2101010`). These let HDR clients submit real HDR buffers instead of 8-bit sRGB.
 /// How long a candidate HDR<->SDR output-state change must hold before it's committed
@@ -211,7 +218,7 @@ const HDR_IMPORT_FOURCCS: [Fourcc; 6] = [
 /// *import* (queried from `ImportDma::dmabuf_formats`, i.e. the EGL texture-import set) to
 /// `formats`, so HDR clients submit HDR buffers. Only the HDR fourccs the renderer supports
 /// are added (never widening the SDR advertisement), skipping any already present. Logs the
-/// formats advertised. Called only when WOLF_HDR_CM is set.
+/// formats advertised. Called only when dynamic HDR is enabled.
 fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFormat>) {
     use smithay::backend::renderer::ImportDma;
     let importable = renderer.dmabuf_formats();
@@ -221,7 +228,7 @@ fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFo
     codes.sort_by_key(|c| *c as u32);
     codes.dedup();
     tracing::info!(
-        "WOLF_HDR_CM: renderer importable dmabuf fourccs ({}): {:?}",
+        "dynamic-hdr: renderer importable dmabuf fourccs ({}): {:?}",
         codes.len(),
         codes
     );
@@ -234,7 +241,7 @@ fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFo
         .collect();
     if hdr_importable.is_empty() {
         tracing::warn!(
-            "WOLF_HDR_CM: GLES renderer imports no fp16/10-bit dmabuf formats; HDR clients \
+            "dynamic-hdr: GLES renderer imports no fp16/10-bit dmabuf formats; HDR clients \
              will fall back to 8-bit"
         );
         return;
@@ -250,7 +257,7 @@ fn advertise_hdr_dmabuf_formats(renderer: &GlesRenderer, formats: &mut Vec<DrmFo
     hdr_codes.sort_by_key(|c| *c as u32);
     hdr_codes.dedup();
     tracing::info!(
-        "WOLF_HDR_CM: {} HDR-capable dmabuf format(s) importable ({} newly advertised): {:?}",
+        "dynamic-hdr: {} HDR-capable dmabuf format(s) importable ({} newly advertised): {:?}",
         hdr_importable.len(),
         newly,
         hdr_codes
@@ -263,6 +270,7 @@ impl State {
         dh: &DisplayHandle,
         input_context: &Libinput,
         event_loop_handle: LoopHandle<'static, State>,
+        hdr_cm: bool,
     ) -> Self {
         let clock = Clock::new();
 
@@ -279,25 +287,25 @@ impl State {
         let viewporter_state = ViewporterState::new::<State>(&dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
 
-        // Color management (staging wp_color_manager_v1). Gated behind WOLF_HDR_CM:
+        // Color management (staging wp_color_manager_v1). Gated behind dynamic HDR:
         // advertising it makes HDR clients enable their HDR path and tags HDR surfaces,
-        // but the buffer-import side isn't ready yet, so it must be opt-in. When unset the
+        // but the buffer-import side isn't ready yet, so it must be opt-in. When off the
         // global is never created and behaviour is exactly as before.
-        let color_mgmt_global = if std::env::var("WOLF_HDR_CM").is_ok() {
+        let color_mgmt_global = if hdr_cm {
             tracing::info!(
-                "WOLF_HDR_CM set: advertising wp_color_manager_v1 (HDR-capable PQ/BT2020 output)"
+                "dynamic HDR: advertising wp_color_manager_v1 (HDR-capable PQ/BT2020 output)"
             );
             Some(dh.create_global::<State, WpColorManagerV1, _>(1, ()))
         } else {
             None
         };
 
-        // frog_color_management_v1 (gamescope's HDR path). Same WOLF_HDR_CM gate; gamescope
+        // frog_color_management_v1 (gamescope's HDR path). Same dynamic-HDR gate; gamescope
         // does NOT speak wp_color_management_v1, so without this its real PQ signal + mastering
         // metadata never reach us. Writes the same shared SurfaceHdrColor as wp above.
-        let frog_color_mgmt_global = if std::env::var("WOLF_HDR_CM").is_ok() {
+        let frog_color_mgmt_global = if hdr_cm {
             tracing::info!(
-                "WOLF_HDR_CM set: advertising frog_color_management_v1 (gamescope HDR path)"
+                "dynamic HDR: advertising frog_color_management_v1 (gamescope HDR path)"
             );
             Some(create_frog_color_management_global::<State>(&dh))
         } else {
@@ -317,11 +325,11 @@ impl State {
                 .into_iter()
                 .collect::<Vec<_>>();
 
-            // WOLF_HDR_CM: additionally advertise the fp16 / 10-bit dmabuf formats the GLES
+            // Dynamic HDR: additionally advertise the fp16 / 10-bit dmabuf formats the GLES
             // renderer can *import*, so HDR clients submit HDR (scRGB-fp16 / 10-bit PQ)
             // buffers instead of 8-bit sRGB. Only HDR-capable fourccs the renderer actually
-            // imports are added; unset = exactly the render-target format set as before.
-            if std::env::var("WOLF_HDR_CM").is_ok() {
+            // imports are added; off = exactly the render-target format set as before.
+            if hdr_cm {
                 advertise_hdr_dmabuf_formats(&renderer, &mut formats);
             }
 
@@ -460,6 +468,7 @@ impl State {
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
             hdr_candidate_since: None,
+            hdr_cm,
         }
     }
 
@@ -502,7 +511,7 @@ impl State {
     /// Recompute the OUTPUT HDR state and, on an actual change, log it and signal the
     /// element over the reverse channel (so it can post a `wolf-hdr-state` application
     /// message on the GStreamer bus). The stored-bool compare debounces repeats. No-op
-    /// unless `WOLF_HDR_CM` wired `hdr_state_tx`, so unset = behaviour as before. Does NOT
+    /// unless dynamic HDR wired `hdr_state_tx`, so off = behaviour as before. Does NOT
     /// touch the producer caps/shader -- this only derives + signals the trigger.
     pub(crate) fn update_hdr_state(&mut self) {
         if self.hdr_state_tx.is_none() {
@@ -557,7 +566,7 @@ impl State {
 
 /// True when `new` differs from `prev` ONLY in colorimetry -- same pixel format, width, height,
 /// and frame rate, but a different colorimetry (matrix/transfer/primaries/range, e.g. a dynamic
-/// HDR bt709<->bt2100-pq flip). Used under `WOLF_HDR_CM` to skip the Vulkan converter rebuild
+/// HDR bt709<->bt2100-pq flip). Used under dynamic HDR to skip the Vulkan converter rebuild
 /// for such a re-negotiation: the converter produces correct pixels per frame regardless of the
 /// caps colorimetry, so only the downstream caps tag needs to change.
 fn colorimetry_only_change(prev: &VideoInfo, new: &VideoInfo) -> bool {
@@ -628,14 +637,14 @@ pub(crate) fn apply_video_info(
     let prev_video_info = state.video_info.clone();
     state.video_info = Some(video_info.clone().into());
 
-    // WOLF_HDR_CM (dynamic HDR): the producer flips its output caps colorimetry mid-stream
+    // Dynamic HDR: the producer flips its output caps colorimetry mid-stream
     // (bt709 SDR <-> bt2100-pq HDR) on the SAME format/resolution/fps. Tearing down and
     // rebuilding the Vulkan converter (GsNv12Buf / VulkanNv12) on the compositor thread for
     // that starves frame production and crashes the live stream. The converter produces correct
     // pixels per frame from current_input_is_pq regardless of the caps colorimetry, so a
     // colorimetry-only re-negotiation can keep the existing converter. The caps tag still
     // propagates to the encoder via the producer's caps event independently of this.
-    let keep_converter = std::env::var("WOLF_HDR_CM").is_ok()
+    let keep_converter = state.hdr_cm
         && state.output_buffer.is_some()
         && prev_video_info
             .as_ref()
@@ -802,13 +811,25 @@ pub(crate) fn init(
     let input_context = libinput_context.clone();
     let libinput_backend = LibinputInputBackend::new(libinput_context);
 
-    let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
+    // This element's dynamic-HDR flag (from its `dynamic-hdr` property, snapshotted in the
+    // conversion options at start): gates the color-management globals, the HDR dmabuf
+    // advertisement, the per-commit PQ detection and the reverse channel below. Per
+    // element, not per process, so an HDR session and an SDR session can share a process.
+    let hdr_cm = vulkan_share.conversion_options().hdr_cm;
+    let mut state = State::new(
+        &render_target,
+        &dh,
+        &input_context,
+        event_loop.handle(),
+        hdr_cm,
+    );
     state.vulkan_share = vulkan_share;
     state.va_share = va_share;
+    state.hdr_cm = hdr_cm;
 
-    // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
-    // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
-    if std::env::var("WOLF_HDR_CM").is_ok() {
+    // Wire the compositor -> element HDR-state reverse channel only under dynamic HDR;
+    // off leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
+    if hdr_cm {
         state.hdr_state_tx = Some(hdr_state_tx);
     }
 
@@ -854,7 +875,7 @@ pub(crate) fn init(
                             None => None,
                         };
                         // Derive + signal the OUTPUT HDR state every frame (no-op unless
-                        // WOLF_HDR_CM is set). Runs before the buffer check so transitions
+                        // it is enabled). Runs before the buffer check so transitions
                         // are observed even on frames that fail to produce a buffer.
                         state.update_hdr_state();
                         // apply_video_info may have been unable to set up the output buffer

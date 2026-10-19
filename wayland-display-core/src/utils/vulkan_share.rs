@@ -510,7 +510,7 @@ pub fn alloc_encode_src_buffer(
             // reject a LINEAR encode-src image outright, so a failed LINEAR alloc must
             // not kill the whole vulkan output -- retry with the tiled default.
             tracing::warn!(
-                "vulkan_share: LINEAR encode-src alloc failed (WOLF_VULKAN_LINEAR_ENCSRC) -- \
+                "vulkan_share: LINEAR encode-src alloc failed (linear-encode-src) -- \
                  falling back to tiled (OPTIMAL)"
             );
             let image_info = image_info.tiling(vk::ImageTiling::OPTIMAL);
@@ -527,7 +527,7 @@ pub fn alloc_encode_src_buffer(
         }
         if linear_encsrc {
             tracing::info!(
-                "vulkan_share: encode-src allocated with tiling={:?} (WOLF_VULKAN_LINEAR_ENCSRC)",
+                "vulkan_share: encode-src allocated with tiling={:?} (linear-encode-src)",
                 effective_tiling
             );
         }

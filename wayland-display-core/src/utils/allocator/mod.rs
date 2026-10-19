@@ -27,13 +27,13 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 /// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
-/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either `WOLF_HDR_SPIKE`
-/// (synthetic-bars spike) or `WOLF_HDR_CM` (real HDR client content) is set this becomes the
-/// 64bpp fp16 `Abgr16161616f` so the render target can carry linear values > 1.0 (HDR
-/// highlights) into the Vulkan P010/PQ converter instead of clamping them at 8-bit white.
-/// Both unset = byte-for-byte the current 8-bit path.
-fn rgba_render_fourcc() -> DrmFourcc {
-    if std::env::var("WOLF_HDR_SPIKE").is_ok() || crate::utils::vulkan_nv12::wolf_hdr_cm() {
+/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either the debug
+/// spike (`WOLF_HDR_SPIKE`, synthetic bars) or dynamic HDR (`hdr_cm`, real HDR client
+/// content) is enabled this becomes the 64bpp fp16 `Abgr16161616f` so the render target can
+/// carry linear values > 1.0 (HDR highlights) into the Vulkan P010/PQ converter instead of
+/// clamping them at 8-bit white. Both off = byte-for-byte the current 8-bit path.
+fn rgba_render_fourcc(hdr_cm: bool) -> DrmFourcc {
+    if std::env::var("WOLF_HDR_SPIKE").is_ok() || hdr_cm {
         DrmFourcc::Abgr16161616f
     } else {
         DrmFourcc::Abgr8888
@@ -50,7 +50,10 @@ pub struct GsGlesbuffer {
 impl GsGlesbuffer {
     pub fn new(renderer: &mut GlesRenderer, video_info: VideoInfo) -> Option<Self> {
         let format = Fourcc::try_from(video_info.format().to_fourcc())
-            .unwrap_or_else(|_| rgba_render_fourcc());
+            // The RAW (video/x-raw RGBx) path has no Vulkan converter downstream, so its
+            // fallback stays the 8-bit default regardless of HDR modes (which only select
+            // the fp16 target for the NV12/Vulkan converter paths).
+            .unwrap_or_else(|_| rgba_render_fourcc(false));
 
         let result = renderer.create_buffer(
             format,
@@ -211,8 +214,8 @@ impl GsNv12Buf {
         options: crate::utils::vulkan_nv12::ConversionOptions,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
-        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
-        let rgba_fourcc = rgba_render_fourcc();
+        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under HDR modes.
+        let rgba_fourcc = rgba_render_fourcc(options.hdr_cm);
         tracing::info!(
             "GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
             rgba_fourcc == DrmFourcc::Abgr16161616f
@@ -256,7 +259,7 @@ impl GsNv12Buf {
             .ok()
             .is_some_and(|vi| is_bt2020_matrix(&vi.colorimetry()));
         // The converter samples the fp16 (linear) render target when it was allocated as such
-        // (WOLF_HDR_SPIKE / WOLF_HDR_CM); the input format -- not the env -- selects the shader.
+        // (the spike / dynamic HDR); the input format -- not any flag -- selects the shader.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new(
             render_node,
@@ -298,9 +301,10 @@ impl GsVulkanBuf {
         vulkan_share: &crate::utils::vulkan_share::VulkanShare,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
+        let options = vulkan_share.conversion_options();
 
-        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under WOLF_HDR_SPIKE.
-        let rgba_fourcc = rgba_render_fourcc();
+        // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under HDR modes.
+        let rgba_fourcc = rgba_render_fourcc(options.hdr_cm);
         tracing::info!(
             "GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
             rgba_fourcc == DrmFourcc::Abgr16161616f
@@ -350,19 +354,10 @@ impl GsVulkanBuf {
         // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
         let bt2020 = is_bt2020_matrix(&video_info.colorimetry());
         // The converter samples the fp16 (linear) render target when it was allocated as such
-        // (WOLF_HDR_SPIKE / WOLF_HDR_CM); the input format -- not the env -- selects the shader.
+        // (the spike / dynamic HDR); the input format -- not any flag -- selects the shader.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
-            dev,
-            raw,
-            &out_caps,
-            &profile,
-            w,
-            h,
-            fmt,
-            bt2020,
-            fp16_input,
-            vulkan_share.conversion_options(),
+            dev, raw, &out_caps, &profile, w, h, fmt, bt2020, fp16_input, options,
         )?;
         Some(GsVulkanBuf {
             rgba,

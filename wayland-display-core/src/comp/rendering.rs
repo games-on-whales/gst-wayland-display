@@ -267,9 +267,9 @@ impl State {
             }
         }
 
-        // WOLF_HDR_CM: per-frame PQ-passthrough flag (true when the active surface's last
+        // Dynamic HDR: per-frame PQ-passthrough flag (true when the active surface's last
         // committed buffer was a 10-bit, already-PQ BT.2020 client buffer). Always false unless
-        // WOLF_HDR_CM is set, so the converter behaves identically to before by default.
+        // it is enabled, so the converter behaves identically to before by default.
         let pq_passthrough = self.current_input_is_pq;
         match self.output_buffer.clone().unwrap().to_gs_buffer(
             &mut target,
