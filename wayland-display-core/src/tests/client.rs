@@ -238,7 +238,13 @@ impl WaylandClient {
     }
 
     pub fn create_window(&mut self) {
-        self.state.create_window();
+        self.state.create_window_uncommitted();
+        self.state.windows.last().unwrap().commit();
+    }
+
+    /// Create a toplevel but hold back its initial commit (see `commit_window`).
+    pub fn create_window_uncommitted(&mut self) {
+        self.state.create_window_uncommitted();
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
@@ -247,6 +253,23 @@ impl WaylandClient {
         window.attach_new_buffer(self.state.buffer.as_ref().unwrap());
         window.set_size(width, height);
         window.ack_last_and_commit();
+    }
+
+    /// The most recent toplevel `configure` received on the first window.
+    pub fn last_configure(&self) -> Option<&Configure> {
+        self.state
+            .windows
+            .first()
+            .and_then(|w| w.configures_received.last())
+            .map(|(_, c)| c)
+    }
+
+    /// Destroy the most recently created window (toplevel, xdg_surface, then surface).
+    pub fn destroy_window(&mut self) {
+        let window = self.state.windows.pop().unwrap();
+        window.xdg_toplevel.destroy();
+        window.xdg_surface.destroy();
+        window.surface.destroy();
     }
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
@@ -390,7 +413,8 @@ impl WaylandClient {
 }
 
 impl State {
-    pub fn create_window(&mut self) {
+    /// Create a toplevel without its initial commit.
+    pub fn create_window_uncommitted(&mut self) {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.wm_base.as_ref().unwrap();
         let viewporter = self.viewporter.as_ref().unwrap();
@@ -400,7 +424,7 @@ impl State {
         let xdg_toplevel = xdg_surface.get_toplevel(&self.qh, ());
         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
 
-        let window = Window {
+        self.windows.push(Window {
             surface,
             xdg_surface,
             xdg_toplevel,
@@ -408,11 +432,7 @@ impl State {
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
-        };
-
-        window.commit();
-
-        self.windows.push(window);
+        });
     }
 }
 

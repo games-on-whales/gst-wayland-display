@@ -206,9 +206,9 @@ impl CompositorHandler for State {
             });
 
             if self.output.is_none() {
-                // No output to size it against yet: keep it pending. The first
-                // apply_video_info sends its initial configure.
-                self.pending_windows.push(window);
+                // No output to size it against yet: hold it apart from the toplevels that
+                // haven't committed. apply_video_info sends its initial configure.
+                self.windows_awaiting_output.push(window);
                 return;
             }
 
