@@ -52,7 +52,8 @@ pub enum Command {
     /// active fullscreen surface changed. Sent only when dynamic HDR is enabled, over a
     /// dedicated reverse channel (never the element -> compositor command channel), and
     /// drained by the element via [`WaylandDisplay::poll_hdr_state`] so it can surface
-    /// the change as a `wolf-hdr-state` application message on the GStreamer bus.
+    /// the change as a `wayland-display-hdr-state` application message on the GStreamer bus
+    /// and retag its caps. Also sent while HDR when the active surface's metadata changes.
     ///
     /// `mastering` / `cll` carry the active surface's REAL HDR static metadata (the gst
     /// `mastering-display-info` / `content-light-level` caps strings) when `hdr` is true and
@@ -63,6 +64,8 @@ pub enum Command {
         mastering: Option<String>,
         cll: Option<String>,
     },
+    /// Downstream refused the HDR caps: keep the output SDR for the rest of the stream.
+    RefuseHdr,
 }
 
 #[derive(Clone)]
@@ -321,6 +324,12 @@ impl WaylandDisplay {
                 Err(gst::FlowError::Error)
             }
         }
+    }
+
+    /// Downstream refused the HDR colorimetry: make the compositor stay SDR, starting with
+    /// the next frame.
+    pub fn refuse_hdr(&self) {
+        let _ = self.command_tx.send(Command::RefuseHdr);
     }
 
     pub fn get_supported_dma_formats(&self) -> FormatSet {

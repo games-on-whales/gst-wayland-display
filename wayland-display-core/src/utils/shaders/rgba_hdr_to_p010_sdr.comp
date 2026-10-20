@@ -1,0 +1,105 @@
+#version 450
+// HDR content -> SDR P010 (10-bit 4:2:0, BT.709 limited "TV" range).
+//
+// Under dynamic HDR the output stays tagged BT.709 until an HDR state has held for the
+// debounce period (and for good once downstream refuses HDR), but the active surface may
+// already declare HDR content. Passing that content through the BT.709 shader would show
+// PQ code values (or linear light) as gamma: washed out or dark. This shader brings it
+// into the SDR signal the stream is tagged with instead. Sibling of rgba_to_p010.comp
+// (identical output matrix) for HDR input.
+//
+// Per-pixel pipeline:
+//   1. decode         : PQ code value -> linear nits (BT.2020), or
+//                       linear scRGB -> nits (BT.709, 1.0 == 80 cd/m²)   [INPUT_SCRGB]
+//   2. gamut          : linear BT.2020 -> linear BT.709 (PQ input only)
+//   3. tone-map       : nits / REF_WHITE_NITS (SDR white == 1.0), luminance roll-off of
+//                       everything above 0.8 into [0.8, 1.0), so highlights compress
+//                       instead of clipping and hue is kept
+//   4. sRGB OETF      : linear [0,1] -> sRGB-gamma code values (what the SDR path encodes)
+//   5. BT.709 Y'CbCr matrix (limited range), identical to rgba_to_p010.comp
+//
+// Bindings (IDENTICAL to rgba_to_p010.comp):
+//   0: src     - RGBA input (sampled; fp16 render target holding the client's HDR values)
+//   1: yPlane  - r16  storage image, full resolution (P010 plane 0, 10 bits in the MSBs)
+//   2: uvPlane - rg16 storage image, half resolution (P010 plane 1, Cb in r, Cr in g)
+// Push constant: full-resolution size in pixels.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r16)  uniform writeonly image2D yPlane;
+layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
+
+layout(push_constant) uniform Push { ivec2 size; } pc;
+
+// The luminance SDR white maps to (the element's sdr-reference-white).
+layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
+// 0: the input is PQ-encoded BT.2020; 1: the input is linear scRGB.
+layout(constant_id = 1) const int INPUT_SCRGB = 0;
+
+// linear BT.2020 -> linear BT.709 primaries (D65). Column-major: each argument below is a
+// COLUMN of the standard row-major 2020->709 matrix.
+const mat3 BT2020_TO_BT709 = mat3(
+     1.660491, -0.124550, -0.018151,
+    -0.587641,  1.132900, -0.100579,
+    -0.072850, -0.008349,  1.118730);
+
+// SMPTE ST 2084 EOTF: PQ code value [0,1] -> normalised linear light (1.0 = 10000 nits).
+float pq_eotf(float e) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float ep = pow(clamp(e, 0.0, 1.0), 1.0 / m2);
+    return pow(max(ep - c1, 0.0) / (c2 - c3 * ep), 1.0 / m1);
+}
+
+float roll_off(float x) {
+    return x <= 0.8 ? x : 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2));
+}
+
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 hi = greaterThan(c, vec3(0.0031308));
+    vec3 lo = c * 12.92;
+    vec3 h  = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(lo, h, hi);
+}
+
+// HDR input -> sRGB-gamma BT.709 R'G'B' in [0,1].
+vec3 hdr_to_sdr(vec3 c) {
+    vec3 nits709;
+    if (INPUT_SCRGB != 0) {
+        nits709 = c * 80.0;
+    } else {
+        vec3 nits2020 = vec3(pq_eotf(c.r), pq_eotf(c.g), pq_eotf(c.b)) * 10000.0;
+        nits709 = BT2020_TO_BT709 * nits2020;
+    }
+    vec3 rel = max(nits709 / REF_WHITE_NITS, vec3(0.0));
+    float y = dot(rel, vec3(0.2126, 0.7152, 0.0722));
+    rel *= y > 0.0 ? roll_off(y) / y : 0.0;
+    return linear_to_srgb(clamp(rel, 0.0, 1.0));
+}
+
+float luma(vec3 c) { return 0.183 * c.r + 0.614 * c.g + 0.062 * c.b + 0.0625; }
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
+    ivec2 p  = ch * 2;                            // top-left luma coord
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    vec3 c00 = hdr_to_sdr(texelFetch(src, p + ivec2(0, 0), 0).rgb);
+    vec3 c10 = hdr_to_sdr(texelFetch(src, p + ivec2(1, 0), 0).rgb);
+    vec3 c01 = hdr_to_sdr(texelFetch(src, p + ivec2(0, 1), 0).rgb);
+    vec3 c11 = hdr_to_sdr(texelFetch(src, p + ivec2(1, 1), 0).rgb);
+
+    imageStore(yPlane, p + ivec2(0, 0), vec4(luma(c00)));
+    imageStore(yPlane, p + ivec2(1, 0), vec4(luma(c10)));
+    imageStore(yPlane, p + ivec2(0, 1), vec4(luma(c01)));
+    imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
+
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average
+    float cb = -0.101 * a.r - 0.339 * a.g + 0.439 * a.b + 0.5;
+    float cr =  0.439 * a.r - 0.399 * a.g - 0.040 * a.b + 0.5;
+    imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
+}

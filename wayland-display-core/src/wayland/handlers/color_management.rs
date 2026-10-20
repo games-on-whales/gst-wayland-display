@@ -7,7 +7,7 @@
 //       Wolf already stamps onto its P010 caps) so HDR clients enable their HDR
 //       path, and
 //   (b) tracks, per `wl_surface`, the image description (colorspace) a client
-//       sets, so downstream code can ask `surface_is_hdr(&surface)`.
+//       sets, so downstream code can ask `surface_tree_hdr_color(&surface)`.
 //
 // Everything here is gated behind the `dynamic-hdr` element property at the global-creation
 // site in `State::new`; when unset the global is never advertised and none of this
@@ -40,6 +40,7 @@ use smithay::reexports::wayland_server::{
 use smithay::wayland::compositor::with_states;
 
 use crate::comp::State;
+pub use crate::utils::color::ContentTransfer;
 
 /// CIE 1931 xy chromaticities of the BT.2020 / BT.2100 primaries and the D65 white
 /// point, each coordinate multiplied by 1,000,000 (the protocol's fixed-point unit).
@@ -117,12 +118,12 @@ impl MasteringDisplayInfo {
 /// `wp_color_management_v1` handler (used by sway) via [`set_surface_hdr_color`] and the
 /// `frog_color_management_v1` handler (used by gamescope, in
 /// `wayland::protocols::frog_color_management`), and read back by the protocol-agnostic
-/// accessors [`surface_is_hdr`] / [`surface_mastering_caps`]. The consumer never cares
-/// which protocol set it. Gated by dynamic HDR at the global-creation sites.
+/// [`surface_tree_hdr_color`]. The consumer never cares which protocol set it. Gated by
+/// dynamic HDR at the global-creation sites.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SurfaceHdrColor {
-    /// Transfer function is SMPTE ST 2084 (PQ).
-    pub is_pq: bool,
+    /// Declared transfer function of the surface's buffers.
+    pub transfer: ContentTransfer,
     /// Container primaries are BT.2020 / Rec.2020.
     pub is_bt2020: bool,
     /// Mastering-display metadata (already in gst-caps units), if the client provided it.
@@ -134,10 +135,10 @@ pub struct SurfaceHdrColor {
 }
 
 impl SurfaceHdrColor {
-    /// A surface is HDR when its declared transfer function is PQ (ST 2084) — the defining
-    /// HDR signal both protocols set (gamescope/sway always pair it with BT.2020).
+    /// A surface is HDR when it declares PQ (ST 2084) or linear scRGB content. The buffer
+    /// fourcc is deliberately not consulted: a 10-bit buffer can just as well carry SDR.
     pub fn is_hdr(&self) -> bool {
-        self.is_pq
+        self.transfer != ContentTransfer::Sdr
     }
 
     /// The `(mastering-display-info, content-light-level)` gst caps strings, iff the client
@@ -167,8 +168,12 @@ impl SurfaceHdrColor {
                 min_luminance: m.min_lum,
             }
         });
+        let transfer = match desc.transfer {
+            Some(TransferFunction::St2084Pq) => ContentTransfer::Pq,
+            _ => ContentTransfer::Sdr,
+        };
         SurfaceHdrColor {
-            is_pq: desc.transfer == Some(TransferFunction::St2084Pq),
+            transfer,
             is_bt2020: desc.primaries == Some(Primaries::Bt2020),
             mastering,
             max_cll: desc.max_cll,
@@ -177,26 +182,65 @@ impl SurfaceHdrColor {
     }
 }
 
-/// The HDR image description handed back for the (single) output: BT.2100 PQ /
-/// BT.2020 with the same mastering-display + content-light-level constants Wolf uses
-/// (`HDR_MASTERING` / `HDR_CLL` in the gst plugin): BT.2020 primaries, 1000-nit max /
-/// 0.0001-nit min, MaxCLL 1000, MaxFALL 400.
-fn hdr_output_description() -> ImageDescription {
+/// The HDR image description handed back for the (single) output: BT.2100 PQ / BT.2020,
+/// targeting a display of `peak_nits` (the element's `hdr-peak-luminance`, the same value
+/// frog advertises), with SDR white at `reference_nits` (`sdr-reference-white`).
+/// MaxFALL is ~40% of peak, a typical full-frame ceiling.
+fn hdr_output_description(peak_nits: u32, reference_nits: u32) -> ImageDescription {
     ImageDescription {
         transfer: Some(TransferFunction::St2084Pq),
         primaries: Some(Primaries::Bt2020),
         primaries_chromaticity: Some(BT2020_PRIMARIES),
-        // PQ default luminances per the protocol: min 0.005, max 10000, reference 203.
-        luminances: Some((50, 10000, 203)),
+        // PQ primary volume per the protocol: min 0.005, max 10000.
+        luminances: Some((50, 10000, reference_nits)),
         mastering: Some(MasteringDisplay {
             primaries: BT2020_PRIMARIES,
             min_lum: 1, // 0.0001 cd/m² * 10000
-            max_lum: 1000,
+            max_lum: peak_nits,
         }),
-        max_cll: Some(1000),
-        max_fall: Some(400),
+        max_cll: Some(peak_nits),
+        max_fall: Some((peak_nits * 2 / 5).max(1)),
     }
 }
+
+/// [`hdr_output_description`] for this element's configured HDR display.
+fn state_output_description(state: &State) -> ImageDescription {
+    let options = state.vulkan_share.conversion_options();
+    hdr_output_description(
+        options.hdr_peak_nits,
+        options.sdr_reference_white.round().max(1.0) as u32,
+    )
+}
+
+/// Default primary-volume luminances (min ×10000, max, reference) of a named transfer
+/// function, per the `set_luminances` description.
+fn default_luminances(tf: TransferFunction) -> (u32, u32, u32) {
+    match tf {
+        TransferFunction::St2084Pq => (50, 10000, 203),
+        _ => (2000, 80, 80),
+    }
+}
+
+/// CIE xy chromaticities (×1,000,000) of the named primaries we advertise.
+fn named_primaries_chromaticity(primaries: Primaries) -> Option<[i32; 8]> {
+    match primaries {
+        Primaries::Bt2020 => Some(BT2020_PRIMARIES),
+        Primaries::Srgb => Some([
+            640000, 330000, 300000, 600000, 150000, 60000, 312700, 329000,
+        ]),
+        _ => None,
+    }
+}
+
+/// Transfer functions the converter has a path for. Gamma 2.2 is rendered as sRGB.
+const SUPPORTED_TFS: [TransferFunction; 3] = [
+    TransferFunction::Srgb,
+    TransferFunction::Gamma22,
+    TransferFunction::St2084Pq,
+];
+
+/// Named primaries the converter has a path for.
+const SUPPORTED_PRIMARIES: [Primaries; 2] = [Primaries::Srgb, Primaries::Bt2020];
 
 // --- per-resource user data --------------------------------------------------------
 
@@ -234,7 +278,7 @@ pub struct ParamsBuilder {
     mastering_luminance: Option<(u32, u32)>,
     max_cll: Option<u32>,
     max_fall: Option<u32>,
-    luminances_set: bool,
+    luminances: Option<(u32, u32, u32)>,
 }
 
 /// User data of a `wp_image_description_creator_params_v1`.
@@ -248,50 +292,83 @@ pub struct ParamsData(Mutex<ParamsBuilder>);
 #[derive(Default)]
 struct ColorSurfaceAttached(Cell<bool>);
 
-/// Read the HDR flag a client set on `surface` (false if none / not color-managed).
-///
-/// Protocol-agnostic detection entry point: `true` means EITHER protocol declared the
-/// surface PQ (`wp_color_management_v1`'s image description OR frog's transfer function).
-pub fn surface_is_hdr(surface: &WlSurface) -> bool {
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RefCell<Option<SurfaceHdrColor>>>()
-            .map(|cell| cell.borrow().as_ref().is_some_and(|s| s.is_hdr()))
-            .unwrap_or(false)
-    })
+/// The colour state of one surface, double-buffered like the rest of `wl_surface` state:
+/// protocol requests write `pending`, and [`commit_surface_hdr_color`] latches it into
+/// `current` on `wl_surface.commit`, so it takes effect together with the buffer it
+/// describes.
+#[derive(Debug, Default)]
+struct HdrColorSlots {
+    pending: Option<SurfaceHdrColor>,
+    current: Option<SurfaceHdrColor>,
+    dirty: bool,
 }
 
-/// Read the `(mastering-display-info, content-light-level)` gst caps strings a client set
-/// on `surface`, from whichever protocol provided them. `None` when the surface carries no
-/// (or no mastering) colour state — the producer then keeps its hardcoded HDR defaults.
-pub fn surface_mastering_caps(surface: &WlSurface) -> Option<(String, String)> {
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RefCell<Option<SurfaceHdrColor>>>()
-            .and_then(|cell| cell.borrow().as_ref().and_then(|s| s.mastering_caps()))
-    })
+/// The committed colour state of the surface in `root`'s tree (the surface itself and its
+/// subsurfaces) that best describes the frame: PQ wins over scRGB, which wins over SDR, so
+/// an HDR game surface under an SDR overlay subsurface still reads as HDR. `None` when no
+/// surface in the tree declared any colour state.
+pub fn surface_tree_hdr_color(root: &WlSurface) -> Option<SurfaceHdrColor> {
+    use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
+    fn rank(color: &SurfaceHdrColor) -> u8 {
+        match color.transfer {
+            ContentTransfer::Pq => 2,
+            ContentTransfer::ScrgbLinear => 1,
+            ContentTransfer::Sdr => 0,
+        }
+    }
+    let mut best: Option<SurfaceHdrColor> = None;
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |_, states, _| {
+            let Some(slots) = states.data_map.get::<RefCell<HdrColorSlots>>() else {
+                return;
+            };
+            if let Some(color) = slots.borrow().current.as_ref() {
+                if best.as_ref().is_none_or(|b| rank(color) > rank(b)) {
+                    best = Some(color.clone());
+                }
+            }
+        },
+        |_, _, _| true,
+    );
+    best
 }
 
-/// Apply (`Some`) or clear (`None`) the shared [`SurfaceHdrColor`] stored in a surface's
-/// `data_map`, logging the HDR transition so it can be observed on the target device. Public
-/// so the frog handler writes the same shared state the `wp_color_management_v1` path does.
+/// Stage (`Some`) or clear (`None`) the shared [`SurfaceHdrColor`] for `surface`; it takes
+/// effect on the surface's next commit. Public so the frog handler writes the same shared
+/// state the `wp_color_management_v1` path does.
 pub fn set_surface_hdr_color(surface: &WlSurface, new: Option<SurfaceHdrColor>) {
     with_states(surface, |states| {
-        let cell = states
+        let slots = states
             .data_map
-            .get_or_insert::<RefCell<Option<SurfaceHdrColor>>, _>(|| RefCell::new(None));
-        let was_hdr = cell.borrow().as_ref().is_some_and(|s| s.is_hdr());
-        let now_hdr = new.as_ref().is_some_and(|s| s.is_hdr());
-        *cell.borrow_mut() = new;
-        if now_hdr && !was_hdr {
-            tracing::info!(surface = ?surface.id(), "color_mgmt: surface -> HDR (PQ)");
-        } else if was_hdr && !now_hdr {
-            tracing::info!(
-                surface = ?surface.id(),
-                "color_mgmt: surface -> SDR (HDR colour state cleared)"
-            );
+            .get_or_insert::<RefCell<HdrColorSlots>, _>(Default::default);
+        let mut slots = slots.borrow_mut();
+        slots.pending = new;
+        slots.dirty = true;
+    });
+}
+
+/// Latch the pending colour state of `surface` on `wl_surface.commit`, logging HDR
+/// transitions so they can be observed on the target device.
+pub fn commit_surface_hdr_color(surface: &WlSurface) {
+    with_states(surface, |states| {
+        let Some(slots) = states.data_map.get::<RefCell<HdrColorSlots>>() else {
+            return;
+        };
+        let mut slots = slots.borrow_mut();
+        if !slots.dirty {
+            return;
+        }
+        slots.dirty = false;
+        let was_hdr = slots.current.as_ref().is_some_and(|s| s.is_hdr());
+        slots.current = slots.pending.clone();
+        let now = slots.current.as_ref().map(|s| s.transfer);
+        if now.is_some_and(|t| t != ContentTransfer::Sdr) && !was_hdr {
+            tracing::info!(surface = ?surface.id(), transfer = ?now, "color_mgmt: surface -> HDR");
+        } else if was_hdr && !now.is_some_and(|t| t != ContentTransfer::Sdr) {
+            tracing::info!(surface = ?surface.id(), "color_mgmt: surface -> SDR");
         }
     });
 }
@@ -366,17 +443,12 @@ impl GlobalDispatch<WpColorManagerV1, ()> for State {
         manager.supported_feature(Feature::SetMasteringDisplayPrimaries);
         manager.supported_feature(Feature::SetLuminances);
 
-        for tf in [
-            TransferFunction::Srgb,
-            TransferFunction::Gamma22,
-            TransferFunction::Bt1886,
-            TransferFunction::St2084Pq,
-            TransferFunction::Hlg,
-        ] {
+        // Only what the converter can render: anything else is refused at
+        // set_tf_named / set_primaries_named instead of being silently drawn as SDR.
+        for tf in SUPPORTED_TFS {
             manager.supported_tf_named(tf);
         }
-
-        for primaries in [Primaries::Srgb, Primaries::DisplayP3, Primaries::Bt2020] {
+        for primaries in SUPPORTED_PRIMARIES {
             manager.supported_primaries_named(primaries);
         }
 
@@ -445,7 +517,7 @@ impl Dispatch<WpColorManagerV1, ()> for State {
 
 impl Dispatch<WpColorManagementOutputV1, ()> for State {
     fn request(
-        _state: &mut State,
+        state: &mut State,
         _client: &Client,
         _output: &WpColorManagementOutputV1,
         request: wp_color_management_output_v1::Request,
@@ -458,7 +530,7 @@ impl Dispatch<WpColorManagementOutputV1, ()> for State {
             Request::GetImageDescription { image_description } => {
                 // The output is HDR-capable; hand back the PQ / BT.2020 description.
                 init_ready_image_description(
-                    hdr_output_description(),
+                    state_output_description(state),
                     true,
                     image_description,
                     data_init,
@@ -543,7 +615,7 @@ impl Dispatch<WpColorManagementSurfaceV1, ColorSurfaceData> for State {
 
 impl Dispatch<WpColorManagementSurfaceFeedbackV1, ColorSurfaceData> for State {
     fn request(
-        _state: &mut State,
+        state: &mut State,
         _client: &Client,
         _obj: &WpColorManagementSurfaceFeedbackV1,
         request: wp_color_management_surface_feedback_v1::Request,
@@ -557,7 +629,7 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, ColorSurfaceData> for State {
             Request::GetPreferred { image_description }
             | Request::GetPreferredParametric { image_description } => {
                 init_ready_image_description(
-                    hdr_output_description(),
+                    state_output_description(state),
                     true,
                     image_description,
                     data_init,
@@ -595,18 +667,24 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsData> for State {
 
         match request {
             Request::SetTfNamed { tf } => {
-                let WEnum::Value(tf) = tf else {
-                    obj.post_error(Error::InvalidTf, "unknown transfer function");
-                    return;
+                let tf = match tf {
+                    WEnum::Value(tf) if SUPPORTED_TFS.contains(&tf) => tf,
+                    _ => {
+                        obj.post_error(Error::InvalidTf, "unsupported transfer function");
+                        return;
+                    }
                 };
                 let mut b = data.0.lock().unwrap();
                 already_set!(b.transfer.is_some());
                 b.transfer = Some(tf);
             }
             Request::SetPrimariesNamed { primaries } => {
-                let WEnum::Value(primaries) = primaries else {
-                    obj.post_error(Error::InvalidPrimariesNamed, "unknown named primaries");
-                    return;
+                let primaries = match primaries {
+                    WEnum::Value(p) if SUPPORTED_PRIMARIES.contains(&p) => p,
+                    _ => {
+                        obj.post_error(Error::InvalidPrimariesNamed, "unsupported named primaries");
+                        return;
+                    }
                 };
                 let mut b = data.0.lock().unwrap();
                 already_set!(b.primaries.is_some());
@@ -627,7 +705,8 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsData> for State {
                 b.mastering_primaries = Some([r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y]);
             }
             Request::SetMasteringLuminance { min_lum, max_lum } => {
-                if max_lum <= min_lum {
+                // min_lum is in 0.0001 cd/m², max_lum in cd/m².
+                if (max_lum as u64) * 10000 <= min_lum as u64 {
                     obj.post_error(Error::InvalidLuminance, "max_lum must exceed min_lum");
                     return;
                 }
@@ -636,20 +715,33 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsData> for State {
                 b.mastering_luminance = Some((min_lum, max_lum));
             }
             Request::SetLuminances {
-                min_lum: _,
-                max_lum: _,
-                reference_lum: _,
+                min_lum,
+                max_lum,
+                reference_lum,
             } => {
-                // Accepted (we advertise set_luminances) but not needed for detection.
+                // min_lum is in 0.0001 cd/m², max_lum and reference_lum in cd/m²; both
+                // must exceed min_lum.
+                let min = min_lum as u64;
+                if (max_lum as u64) * 10000 <= min || (reference_lum as u64) * 10000 <= min {
+                    obj.post_error(
+                        Error::InvalidLuminance,
+                        "max_lum and reference_lum must exceed min_lum",
+                    );
+                    return;
+                }
                 let mut b = data.0.lock().unwrap();
-                already_set!(b.luminances_set);
-                b.luminances_set = true;
+                already_set!(b.luminances.is_some());
+                b.luminances = Some((min_lum, max_lum, reference_lum));
             }
             Request::SetMaxCll { max_cll } => {
-                data.0.lock().unwrap().max_cll = Some(max_cll);
+                let mut b = data.0.lock().unwrap();
+                already_set!(b.max_cll.is_some());
+                b.max_cll = Some(max_cll);
             }
             Request::SetMaxFall { max_fall } => {
-                data.0.lock().unwrap().max_fall = Some(max_fall);
+                let mut b = data.0.lock().unwrap();
+                already_set!(b.max_fall.is_some());
+                b.max_fall = Some(max_fall);
             }
             // Features we do not advertise.
             Request::SetTfPower { .. } => {
@@ -661,26 +753,37 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsData> for State {
             Request::Create { image_description } => {
                 let b = data.0.lock().unwrap();
                 // tf + primaries are the required properties for a complete set.
-                if b.transfer.is_none() || b.primaries.is_none() {
+                let (Some(transfer), Some(primaries)) = (b.transfer, b.primaries) else {
                     obj.post_error(
                         Error::IncompleteSet,
                         "transfer characteristic and primaries are required",
                     );
                     return;
-                }
-                let mastering = b.mastering_primaries.map(|primaries| {
-                    let (min_lum, max_lum) = b.mastering_luminance.unwrap_or((0, 0));
+                };
+                let luminances = b.luminances.unwrap_or_else(|| default_luminances(transfer));
+                // The target volume defaults to the primary volume: unset target primaries
+                // are the container primaries, unset target luminances the primary
+                // luminances (10000 cd/m² for PQ), never zero.
+                let mastering = (b.mastering_primaries.is_some()
+                    || b.mastering_luminance.is_some())
+                .then(|| {
+                    let (min_lum, max_lum) = b
+                        .mastering_luminance
+                        .unwrap_or((luminances.0, luminances.1));
                     MasteringDisplay {
-                        primaries,
+                        primaries: b
+                            .mastering_primaries
+                            .or_else(|| named_primaries_chromaticity(primaries))
+                            .unwrap_or(BT2020_PRIMARIES),
                         min_lum,
                         max_lum,
                     }
                 });
                 let desc = ImageDescription {
-                    transfer: b.transfer,
-                    primaries: b.primaries,
+                    transfer: Some(transfer),
+                    primaries: Some(primaries),
                     primaries_chromaticity: None,
-                    luminances: None,
+                    luminances: Some(luminances),
                     mastering,
                     max_cll: b.max_cll,
                     max_fall: b.max_fall,

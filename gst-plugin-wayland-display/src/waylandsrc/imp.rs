@@ -92,7 +92,7 @@ pub struct Settings {
     /// Dynamic HDR color management. When true the compositor advertises wp_color_management_v1 +
     /// frog_color_management_v1, renders into an fp16 target, tracks the active surface's
     /// HDR state and flips the P010 caps colorimetry mid-stream (bt709 <-> bt2100-pq),
-    /// posting `wolf-hdr-state` bus messages on transitions. Set before starting the
+    /// posting `wayland-display-hdr-state` bus messages on transitions. Set before starting the
     /// pipeline (the Wayland globals are created at start). Must be per element -- not an
     /// env var -- so one process can stream an HDR client and an SDR client side by side.
     hdr_cm: bool,
@@ -357,6 +357,14 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .minimum(1.0).maximum(10000.0).default_value(203.0)
                     .blurb("SDR reference white in nits for SDR to HDR conversion")
                     .mutable_ready().build(),
+                glib::ParamSpecUInt::builder("hdr-peak-luminance")
+                    .minimum(1).maximum(10000).default_value(1000)
+                    .blurb(
+                        "Peak luminance in cd/m^2 of the HDR display presented to clients under \
+                         dynamic-hdr (what games calibrate to), and of the default \
+                         mastering-display-info / content-light-level",
+                    )
+                    .mutable_ready().build(),
                 glib::ParamSpecString::builder("vulkan-profile")
                     .blurb("Encode image profile: high/main/baseline/constrained-baseline for NV12, main-10 for P010; match the downstream encoder")
                     .mutable_ready().build(),
@@ -365,7 +373,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                         "Dynamic HDR color management: advertise wp_color_management_v1 + \
                          frog_color_management_v1, render into an fp16 target, follow the active \
                          surface's HDR state and flip the P010 caps colorimetry mid-stream \
-                         (bt709 <-> bt2100-pq), posting wolf-hdr-state bus messages on \
+                         (bt709 <-> bt2100-pq), posting wayland-display-hdr-state bus messages on \
                          transitions. Per element (an HDR and an SDR session can share a \
                          process). Set before starting the pipeline.",
                     )
@@ -408,11 +416,12 @@ impl ObjectImpl for WaylandDisplaySrc {
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
-            "ring-depth" | "linear-encode-src" | "sdr-reference-white" => {
+            "ring-depth" | "linear-encode-src" | "sdr-reference-white" | "hdr-peak-luminance" => {
                 let mut options = self.vulkan_share.conversion_options();
                 match pspec.name() {
                     "ring-depth" => options.ring_depth = value.get::<u32>().unwrap() as usize,
                     "linear-encode-src" => options.linear_encode_src = value.get().unwrap(),
+                    "hdr-peak-luminance" => options.hdr_peak_nits = value.get().unwrap(),
                     _ => options.sdr_reference_white = value.get().unwrap(),
                 }
                 self.vulkan_share.set_conversion_options(options);
@@ -525,6 +534,11 @@ impl ObjectImpl for WaylandDisplaySrc {
                 .vulkan_share
                 .conversion_options()
                 .sdr_reference_white
+                .to_value(),
+            "hdr-peak-luminance" => self
+                .vulkan_share
+                .conversion_options()
+                .hdr_peak_nits
                 .to_value(),
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile.to_value(),
             "dynamic-hdr" => self.settings.lock().unwrap().hdr_cm.to_value(),
@@ -1044,68 +1058,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             caps
         };
 
-        // HDR (BT.2100 PQ) signalling for the P010 path. When `hdr` is set we stamp these
-        // onto the P010 output caps (dmabuf and memory:VulkanImage) so a downstream
-        // vulkanh265enc reads the colorimetry + static metadata from its input caps and emits
-        // the matching VUI + mastering-display / content-light-level SEI. The compositor
-        // content is 8-bit SDR; this is container/signalling (+ a BT.2020 conversion matrix),
-        // not real PQ tone-mapping. NV12/SDR caps are never touched.
-        //   colorimetry: bt2100-pq == primaries=bt2020, transfer=smpte2084, matrix=bt2020,
-        //                range=tv (the gst shorthand for BT.2100 PQ).
-        //   mastering-display-info: R:G:B:W chromaticity (x,y * 50000) + max:min luminance
-        //                (* 10000 cd/m^2) -> BT.2020 primaries, 1000 nit / 0.0001 nit.
-        //   content-light-level: MaxCLL:MaxFALL -> 1000 : 400.
-        // dynamic-hdr: TRUE dynamic HDR. The stream stays P010/Main-10 always, but its
-        // colorimetry flips mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR
-        // content) following the live compositor HDR state (`hdr_active`, driven per-frame
-        // by `poll_hdr_state()` in `create()`). When the flag is unset this is byte-identical
-        // to the previous behaviour: the static `hdr` property alone governs the P010 caps.
-        let (hdr_cm, static_hdr, hdr_mastering_override, hdr_cll_override) = {
-            let settings = self.settings.lock().unwrap();
-            (
-                settings.hdr_cm,
-                settings.hdr,
-                settings.mastering_display_info.clone(),
-                settings.content_light_level.clone(),
-            )
-        };
-        let hdr = if hdr_cm {
-            self.hdr_active.load(Ordering::Relaxed)
-        } else {
-            static_hdr
-        };
-        const HDR_COLORIMETRY: &str = "bt2100-pq";
-        const HDR_MASTERING: &str = "35400:14600:8500:39850:6550:2300:15635:16450:10000000:1";
-        const HDR_CLL: &str = "1000:400";
-        // Effective HDR static metadata. Under dynamic-hdr use the live values the compositor
-        // reported from the game's own color-management signal (frog/gamescope or
-        // wp_color_management/sway) -- so the "HDR Luminance" slider actually flows through to
-        // the encoder's mastering/CLL SEI -- falling back to the hardcoded defaults when the
-        // game provided none. The static `hdr` property path keeps using the defaults verbatim.
-        let (mut hdr_mastering, mut hdr_cll): (String, String) = if hdr_cm {
-            let meta = self.hdr_meta.lock().unwrap();
-            (
-                meta.0.clone().unwrap_or_else(|| HDR_MASTERING.to_string()),
-                meta.1.clone().unwrap_or_else(|| HDR_CLL.to_string()),
-            )
-        } else {
-            (HDR_MASTERING.to_string(), HDR_CLL.to_string())
-        };
-        // Manual override of the static HDR metadata via the mastering-display-info /
-        // content-light-level element properties (per element, so an HDR session and an SDR
-        // session in one process can each carry their own metadata). `None`/empty => leave
-        // as computed above.
-        if let Some(v) = hdr_mastering_override {
-            hdr_mastering = v;
-        }
-        if let Some(v) = hdr_cll_override {
-            hdr_cll = v;
-        }
-        // SDR colorimetry for the P010 path under dynamic-hdr when the content is not PQ:
-        // BT.709 (primaries=bt709, transfer=bt709, matrix=bt709, range=limited) and NO
-        // mastering-display-info / content-light-level, so the encoder flips its VUI back to
-        // SDR. Format stays P010_10LE (Main-10) either way.
-        const SDR_COLORIMETRY: &str = "bt709";
+        // HDR (BT.2100 PQ) signalling for the P010 path; see `p010_hdr_metadata`.
+        let hdr_meta = self.p010_hdr_metadata();
 
         // P010 (10-bit 4:2:0) via the same Vulkan converter, for a downstream that asks for
         // it (e.g. a Main-10 dmabuf encoder). Offered as a fallback after NV12/RGBA -- NV12
@@ -1135,16 +1089,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1));
-            if hdr {
-                b = b
-                    .field("colorimetry", HDR_COLORIMETRY)
-                    .field("mastering-display-info", hdr_mastering.as_str())
-                    .field("content-light-level", hdr_cll.as_str());
-            } else {
-                // The SDR shader uses BT.709, including when dynamic HDR is disabled.
-                b = b.field("colorimetry", SDR_COLORIMETRY);
-            }
-            caps.merge(b.build());
+            let mut one = b.build();
+            set_p010_color(one.get_mut().unwrap().structure_mut(0).unwrap(), &hdr_meta);
+            caps.merge(one);
         }
 
         // `vulkan=true`: advertise NV12 memory:VulkanImage FIRST, so a format-agnostic
@@ -1166,23 +1113,19 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
                 .build();
-            let mut p010_vk_b = gst_video::VideoCapsBuilder::new()
+            let mut p010_vk = gst_video::VideoCapsBuilder::new()
                 .features(["memory:VulkanImage"])
                 .format(VideoFormat::P01010le)
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
-                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1));
-            if hdr {
-                p010_vk_b = p010_vk_b
-                    .field("colorimetry", HDR_COLORIMETRY)
-                    .field("mastering-display-info", hdr_mastering.as_str())
-                    .field("content-light-level", hdr_cll.as_str());
-            } else {
-                // The SDR shader uses BT.709, including when dynamic HDR is disabled.
-                p010_vk_b = p010_vk_b.field("colorimetry", SDR_COLORIMETRY);
-            }
+                .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
+                .build();
+            set_p010_color(
+                p010_vk.get_mut().unwrap().structure_mut(0).unwrap(),
+                &hdr_meta,
+            );
             let mut merged = nv12_vk;
-            merged.merge(p010_vk_b.build());
+            merged.merge(p010_vk);
             merged.merge(caps);
             caps = merged;
         }
@@ -1558,53 +1501,195 @@ impl PushSrcImpl for WaylandDisplaySrc {
         &self,
         _buffer: Option<&mut gst::BufferRef>,
     ) -> Result<CreateSuccess, gst::FlowError> {
-        let mut state_guard = self.state.lock().unwrap();
-        let Some(state) = state_guard.as_mut() else {
-            return Err(gst::FlowError::Eos);
-        };
-
-        // dynamic-hdr: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
-        // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
-        // change, so this posts at most one message per transition.
-        if self.settings.lock().unwrap().hdr_cm {
-            if let Some((hdr, mastering, cll)) = state.display.poll_hdr_state() {
-                // Store the active surface's real mastering / CLL metadata so the next
-                // `caps()` stamps it onto the P010 HDR caps (else the hardcoded defaults).
-                *self.hdr_meta.lock().unwrap() = (mastering, cll);
-                let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-                let structure = Structure::builder("wolf-hdr-state")
-                    .field("hdr", hdr)
-                    .build();
-                if let Err(err) =
-                    elem.post_message(Application::builder(structure).src(&elem).build())
-                {
-                    gst::warning!(CAT, "Failed to post wolf-hdr-state message: {}", err);
+        let hdr_cm = self.settings.lock().unwrap().hdr_cm;
+        loop {
+            let (buffer, hdr_change) = {
+                let mut state_guard = self.state.lock().unwrap();
+                let Some(state) = state_guard.as_mut() else {
+                    return Err(gst::FlowError::Eos);
+                };
+                let subscriber = Registry::default().with(GstLayer);
+                let buffer =
+                    tracing::subscriber::with_default(subscriber, || state.display.frame())?;
+                // dynamic-hdr: drained AFTER the frame. The compositor signals a change right
+                // before it renders the first frame in the new state, so this is exactly the
+                // state `buffer` was converted for.
+                let change = hdr_cm.then(|| state.display.poll_hdr_state()).flatten();
+                (buffer, change)
+            };
+            match hdr_change {
+                Some((hdr, mastering, cll)) => {
+                    if self.apply_hdr_state(hdr, mastering, cll)? {
+                        return Ok(CreateSuccess::NewBuffer(buffer));
+                    }
+                    // Downstream refused HDR and the compositor now renders SDR: this frame
+                    // was converted for HDR, so replace it.
                 }
-
-                // Drive the live HDR-colorimetry state. On an actual change, mark the src pad
-                // for reconfiguration: BaseSrc's streaming loop calls
-                // `gst_pad_check_reconfigure()` before the next buffer, which re-runs
-                // negotiate -> `caps()`/`fixate()`/`set_caps`, producing the new colorimetry
-                // (BT.2100 PQ <-> BT.709) and pushing a fresh CAPS event downstream. The
-                // downstream encoder re-emits its VUI + HDR SEI at the next IDR.
-                if self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr {
-                    gst::info!(
-                        CAT,
-                        "dynamic-hdr: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
-                        hdr
-                    );
-                    self.obj()
-                        .upcast_ref::<gst_base::BaseSrc>()
-                        .src_pad()
-                        .mark_reconfigure();
-                }
+                None => return Ok(CreateSuccess::NewBuffer(buffer)),
             }
         }
+    }
+}
 
-        let subscriber = Registry::default().with(GstLayer);
-        tracing::subscriber::with_default(subscriber, || {
-            state.display.frame().map(CreateSuccess::NewBuffer)
-        })
+impl WaylandDisplaySrc {
+    /// Effective HDR static metadata `(mastering-display-info, content-light-level)` of the
+    /// P010 output, or `None` when it is SDR. Static `hdr` uses the defaults; under
+    /// dynamic-hdr the live state and the active surface's own metadata (frog/gamescope or
+    /// wp_color_management/sway) apply, so the game's "HDR Luminance" slider reaches the
+    /// encoder's SEI. The defaults describe a BT.2020 display of `hdr-peak-luminance`; the
+    /// mastering-display-info / content-light-level properties override either.
+    fn p010_hdr_metadata(&self) -> Option<(String, String)> {
+        let settings = self.settings.lock().unwrap();
+        let hdr = if settings.hdr_cm {
+            self.hdr_active.load(Ordering::Relaxed)
+        } else {
+            settings.hdr
+        };
+        if !hdr {
+            return None;
+        }
+        let peak = self.vulkan_share.conversion_options().hdr_peak_nits;
+        let default_mastering = format!("{HDR_PRIMARIES}:{}:1", u64::from(peak) * 10000);
+        let default_cll = format!("{peak}:{}", (peak * 2 / 5).max(1));
+        let (mastering, cll) = if settings.hdr_cm {
+            self.hdr_meta.lock().unwrap().clone()
+        } else {
+            (None, None)
+        };
+        Some((
+            settings
+                .mastering_display_info
+                .clone()
+                .or(mastering)
+                .unwrap_or(default_mastering),
+            settings
+                .content_light_level
+                .clone()
+                .or(cll)
+                .unwrap_or(default_cll),
+        ))
+    }
+
+    /// Whether the negotiated output is P010, the only format whose caps carry the dynamic
+    /// HDR colorimetry.
+    fn negotiated_p010(&self) -> Option<gst::Caps> {
+        let caps = self.obj().src_pad().current_caps()?;
+        // Only P010 caps carry the dynamic HDR colorimetry.
+        let s = caps.structure(0)?;
+        let p010 = s.get::<&str>("format").ok() == Some("P010_10LE")
+            || s.get::<&str>("drm-format")
+                .is_ok_and(|f| f.starts_with("P010"));
+        p010.then_some(caps)
+    }
+
+    /// Apply a compositor HDR-state change to the element: post the bus message on a
+    /// transition and retag the P010 caps before the frame converted for the new state is
+    /// pushed. Only the colour fields of the current caps change, so the format, size and
+    /// converter stay put. Returns `Ok(false)` when downstream refused HDR: the element is back
+    /// on SDR caps, the compositor has been told to stay SDR, and the caller must render a
+    /// replacement frame.
+    fn apply_hdr_state(
+        &self,
+        hdr: bool,
+        mastering: Option<String>,
+        cll: Option<String>,
+    ) -> Result<bool, gst::FlowError> {
+        let prev_hdr = self.hdr_active.swap(hdr, Ordering::Relaxed);
+        let prev_meta = std::mem::replace(&mut *self.hdr_meta.lock().unwrap(), (mastering, cll));
+        if prev_hdr != hdr {
+            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+            let structure = Structure::builder(HDR_STATE_MESSAGE)
+                .field("hdr", hdr)
+                .build();
+            if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build())
+            {
+                gst::warning!(CAT, "Failed to post {HDR_STATE_MESSAGE} message: {}", err);
+            }
+        }
+        let Some(current) = self.negotiated_p010() else {
+            return Ok(true);
+        };
+        if self.retag_p010(&current) {
+            gst::info!(
+                CAT,
+                imp = self,
+                "dynamic-hdr: output caps retagged (hdr={hdr})"
+            );
+            return Ok(true);
+        }
+        if prev_hdr == hdr {
+            // Updated metadata only; the pixels are unchanged, keep the previous metadata.
+            gst::warning!(
+                CAT,
+                imp = self,
+                "dynamic-hdr: downstream refused updated HDR metadata"
+            );
+            *self.hdr_meta.lock().unwrap() = prev_meta;
+            return Ok(true);
+        }
+        if !hdr {
+            gst::error!(CAT, imp = self, "dynamic-hdr: downstream refused SDR caps");
+            return Err(gst::FlowError::NotNegotiated);
+        }
+        gst::warning!(
+            CAT,
+            imp = self,
+            "dynamic-hdr: downstream refused HDR caps; staying SDR for this stream"
+        );
+        self.hdr_active.store(false, Ordering::Relaxed);
+        *self.hdr_meta.lock().unwrap() = (None, None);
+        if let Some(state) = self.state.lock().unwrap().as_ref() {
+            state.display.refuse_hdr();
+        }
+        if !self.retag_p010(&current) {
+            return Err(gst::FlowError::NotNegotiated);
+        }
+        Ok(false)
+    }
+
+    /// Re-send `current` with the P010 colour fields of the present HDR state, if downstream
+    /// accepts it.
+    fn retag_p010(&self, current: &gst::Caps) -> bool {
+        let mut caps = current.copy();
+        set_p010_color(
+            caps.get_mut().unwrap().structure_mut(0).unwrap(),
+            &self.p010_hdr_metadata(),
+        );
+        if caps == *current {
+            return true;
+        }
+        let obj = self.obj();
+        obj.src_pad().peer_query_accept_caps(&caps)
+            && obj
+                .upcast_ref::<gst_base::BaseSrc>()
+                .set_caps(&caps)
+                .is_ok()
+    }
+}
+
+/// Bus message posted on dynamic-hdr output transitions, with a boolean `hdr` field.
+const HDR_STATE_MESSAGE: &str = "wayland-display-hdr-state";
+/// BT.2020 R/G/B + D65 white chromaticities (x, y * 50000), the default mastering primaries.
+const HDR_PRIMARIES: &str = "35400:14600:8500:39850:6550:2300:15635:16450";
+
+/// Stamp the P010 colorimetry onto one caps structure: BT.2100 PQ (primaries=bt2020,
+/// transfer=smpte2084, matrix=bt2020, range=tv) plus mastering-display-info (R:G:B:W
+/// chromaticity x,y * 50000 + max:min luminance * 10000 cd/m^2) and content-light-level
+/// (MaxCLL:MaxFALL) for HDR, so a downstream vulkanh265enc emits the matching VUI + SEI; or
+/// BT.709 without static metadata for SDR. The converter's SDR output uses the BT.709 matrix
+/// whether or not dynamic HDR is enabled.
+fn set_p010_color(s: &mut gst::StructureRef, hdr: &Option<(String, String)>) {
+    match hdr {
+        Some((mastering, cll)) => {
+            s.set("colorimetry", "bt2100-pq");
+            s.set("mastering-display-info", mastering.as_str());
+            s.set("content-light-level", cll.as_str());
+        }
+        None => {
+            s.set("colorimetry", "bt709");
+            s.remove_field("mastering-display-info");
+            s.remove_field("content-light-level");
+        }
     }
 }
 

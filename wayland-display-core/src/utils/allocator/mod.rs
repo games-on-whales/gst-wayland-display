@@ -4,6 +4,7 @@ pub mod cuda;
 use crate::DrmModifier;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
+use crate::utils::color::FrameColor;
 use crate::utils::device::PCIVendor;
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::vulkan_nv12::{PixFmt, VulkanNv12};
@@ -27,13 +28,12 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 /// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
-/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either the debug
-/// spike (`WOLF_HDR_SPIKE`, synthetic bars) or dynamic HDR (`hdr_cm`, real HDR client
-/// content) is enabled this becomes the 64bpp fp16 `Abgr16161616f` so the render target can
-/// carry linear values > 1.0 (HDR highlights) into the Vulkan P010/PQ converter instead of
-/// clamping them at 8-bit white. Both off = byte-for-byte the current 8-bit path.
+/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. Under dynamic HDR
+/// (`hdr_cm`, real HDR client content) this becomes the 64bpp fp16 `Abgr16161616f` so the
+/// render target carries PQ code values and linear values > 1.0 into the Vulkan P010
+/// converter at full precision instead of clamping them to 8 bits.
 fn rgba_render_fourcc(hdr_cm: bool) -> DrmFourcc {
-    if std::env::var("WOLF_HDR_SPIKE").is_ok() || hdr_cm {
+    if hdr_cm {
         DrmFourcc::Abgr16161616f
     } else {
         DrmFourcc::Abgr8888
@@ -216,10 +216,7 @@ impl GsNv12Buf {
         let (w, h) = (video_info.width(), video_info.height());
         // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under HDR modes.
         let rgba_fourcc = rgba_render_fourcc(options.hdr_cm);
-        tracing::info!(
-            "GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
-            rgba_fourcc == DrmFourcc::Abgr16161616f
-        );
+        tracing::info!("GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?}");
         // RGBA render-target modifier candidates the GLES renderer supports (INVALID last).
         let formats =
             <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
@@ -258,8 +255,7 @@ impl GsNv12Buf {
             .to_video_info()
             .ok()
             .is_some_and(|vi| is_bt2020_matrix(&vi.colorimetry()));
-        // The converter samples the fp16 (linear) render target when it was allocated as such
-        // (the spike / dynamic HDR); the input format -- not any flag -- selects the shader.
+        // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new(
             render_node,
@@ -305,10 +301,7 @@ impl GsVulkanBuf {
 
         // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under HDR modes.
         let rgba_fourcc = rgba_render_fourcc(options.hdr_cm);
-        tracing::info!(
-            "GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
-            rgba_fourcc == DrmFourcc::Abgr16161616f
-        );
+        tracing::info!("GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?}");
         // RGBA render-target modifier (same policy as GsNv12Buf: LINEAR except on Nvidia).
         let formats =
             <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
@@ -353,8 +346,7 @@ impl GsVulkanBuf {
             .build();
         // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
         let bt2020 = is_bt2020_matrix(&video_info.colorimetry());
-        // The converter samples the fp16 (linear) render target when it was allocated as such
-        // (the spike / dynamic HDR); the input format -- not any flag -- selects the shader.
+        // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
             dev, raw, &out_caps, &profile, w, h, fmt, bt2020, fp16_input, options,
@@ -448,21 +440,6 @@ pub enum GsBufferType {
     CUDA(GsCUDABuf),
 }
 
-impl GsBufferType {
-    /// The fourcc of the RGBA dmabuf the scene is rendered into for the Vulkan-converter buffer
-    /// types (NV12/VULKAN) -- i.e. the GLES render target that is also the converter's input.
-    /// `None` for buffer types without a separate RGBA render target. The HDR spike uses this to
-    /// confirm the render target is fp16 (`Abgr16161616f`) before reading it back off the GLES
-    /// framebuffer.
-    pub fn render_rgba_fourcc(&self) -> Option<DrmFourcc> {
-        match self {
-            GsBufferType::NV12(b) => Some(b.rgba.format().code),
-            GsBufferType::VULKAN(b) => Some(b.rgba.format().code),
-            _ => None,
-        }
-    }
-}
-
 pub enum VideoInfoTypes {
     VideoInfo(VideoInfo),
     VideoInfoDmaDrm(VideoInfoDmaDrm),
@@ -475,7 +452,7 @@ pub trait GsBuffer<R: Renderer> {
         &self,
         target: &mut GlesTarget,
         renderer: &mut R,
-        pq_passthrough: bool,
+        color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>>;
 
     // Returns the underlying VideoInfo or VideoInfoDmaDrm
@@ -502,7 +479,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
-        pq_passthrough: bool,
+        color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         match self {
             GsBufferType::RAW(buffer) => {
@@ -611,12 +588,12 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
             GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
             #[cfg(feature = "cuda")]
@@ -639,7 +616,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
-        pq_passthrough: bool,
+        color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
         match self {
             GsBufferType::RAW(buffer) => {
@@ -745,12 +722,12 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
             GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
         }
@@ -938,7 +915,11 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.unwrap().buffer, 10, 10);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
+            .to_gs_buffer(
+                &mut bind_result.unwrap(),
+                &mut renderer,
+                FrameColor::default(),
+            )
             .expect("Failed to convert buffer");
         assert!(gst_buffer.is_writable());
         assert_eq!(gst_buffer.size(), video_info.size());
@@ -1014,7 +995,11 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
+            .to_gs_buffer(
+                &mut bind_result.unwrap(),
+                &mut renderer,
+                FrameColor::default(),
+            )
             .expect("Failed to convert buffer");
         let gst_buffer_size = gst_buffer.size();
         assert!(gst_buffer_size >= 4096); // There might be padding but it should at least contain our data
@@ -1146,7 +1131,11 @@ mod tests {
 
         render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
+            .to_gs_buffer(
+                &mut bind_result.unwrap(),
+                &mut renderer,
+                FrameColor::default(),
+            )
             .expect("Failed to convert buffer");
 
         let gst_buffer_size = gst_buffer.size();

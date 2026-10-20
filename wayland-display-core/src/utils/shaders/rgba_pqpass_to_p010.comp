@@ -2,12 +2,12 @@
 // PQ PASSTHROUGH: already-PQ BT.2020 R'G'B' (in [0,1]) -> P010 (10-bit 4:2:0, BT.2020
 // NON-CONSTANT-LUMINANCE, limited "TV" range). NO transfer/gamut conversion.
 //
-// WOLF_HDR_CM per-frame sibling of rgba_to_p010_bt2020.comp / rgba_to_p010_hdr.comp. It is
-// selected for a frame whose composited content originates from a 10-bit client buffer
-// (gamescope's XB30/AB30/XR30/AR30 HDR output). That content is ALREADY PQ-encoded BT.2020 --
-// gamescope ran the PQ OETF itself -- so re-applying the sRGB EOTF + 709->2020 gamut + PQ OETF
-// (as rgba_to_p010_hdr.comp does) would double-encode PQ and wash the image out. Here we treat
-// the sampled RGB as the final PQ-encoded BT.2020 R'G'B' and ONLY apply the Y'CbCr matrix.
+// Dynamic-HDR per-frame sibling of rgba_to_p010_bt2020.comp / rgba_to_p010_hdr.comp. It is
+// selected for an HDR-tagged frame whose active surface declares PQ (through frog or
+// wp_color_management, e.g. gamescope's HDR output). That content is ALREADY PQ-encoded
+// BT.2020 -- the client ran the PQ OETF itself -- so re-applying the sRGB EOTF + 709->2020
+// gamut + PQ OETF would double-encode PQ and wash the image out. Here we treat the sampled
+// RGB as the final PQ-encoded BT.2020 R'G'B' and ONLY apply the Y'CbCr matrix.
 //
 // Per-pixel pipeline (cf. rgba_to_p010_bt2020.comp, minus EVERY transfer/gamut step):
 //   (input is already PQ-encoded BT.2020 R'G'B' in [0,1] -- no EOTF, no gamut, no PQ OETF)

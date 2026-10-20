@@ -43,19 +43,27 @@ use frog_color_managed_surface::{FrogColorManagedSurface, Primaries, TransferFun
 use frog_color_management_factory_v1::FrogColorManagementFactoryV1;
 
 use crate::wayland::handlers::color_management::{
-    MasteringDisplayInfo, SurfaceHdrColor, set_surface_hdr_color,
+    ContentTransfer, MasteringDisplayInfo, SurfaceHdrColor, set_surface_hdr_color,
 };
 
 /// ZST the `GlobalDispatch`/`Dispatch` impls live on; delegated to from `State` by the
 /// [`delegate_frog_color_management`] macro (same indirection as `wl_drm`).
 pub struct FrogColorManagementState;
 
+/// Global (and factory) user data: the HDR display the compositor presents to clients,
+/// from the element's `hdr-peak-luminance` property.
+#[derive(Debug, Clone, Copy)]
+pub struct FrogGlobalData {
+    /// Display peak luminance in cd/m², what a game calibrates its HDR to.
+    pub peak_nits: u32,
+}
+
 /// Accumulated frog colour state for one `frog_color_managed_surface`. The client sets each
 /// piece in a separate request, so we accumulate here and mirror the whole thing into the
 /// target surface's shared [`SurfaceHdrColor`] after every request.
 #[derive(Default)]
 struct FrogColorAccum {
-    is_pq: bool,
+    transfer: ContentTransfer,
     is_bt2020: bool,
     mastering: Option<MasteringDisplayInfo>,
     max_cll: Option<u32>,
@@ -65,7 +73,7 @@ struct FrogColorAccum {
 impl FrogColorAccum {
     fn to_hdr_color(&self) -> SurfaceHdrColor {
         SurfaceHdrColor {
-            is_pq: self.is_pq,
+            transfer: self.transfer,
             is_bt2020: self.is_bt2020,
             mastering: self.mastering,
             max_cll: self.max_cll,
@@ -83,10 +91,10 @@ pub struct FrogSurfaceData {
 
 // --- frog_color_management_factory_v1 ----------------------------------------------
 
-impl<D> GlobalDispatch<FrogColorManagementFactoryV1, (), D> for FrogColorManagementState
+impl<D> GlobalDispatch<FrogColorManagementFactoryV1, FrogGlobalData, D> for FrogColorManagementState
 where
-    D: GlobalDispatch<FrogColorManagementFactoryV1, ()>
-        + Dispatch<FrogColorManagementFactoryV1, ()>
+    D: GlobalDispatch<FrogColorManagementFactoryV1, FrogGlobalData>
+        + Dispatch<FrogColorManagementFactoryV1, FrogGlobalData>
         + Dispatch<FrogColorManagedSurface, FrogSurfaceData>
         + 'static,
 {
@@ -95,17 +103,17 @@ where
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<FrogColorManagementFactoryV1>,
-        _global_data: &(),
+        global_data: &FrogGlobalData,
         data_init: &mut DataInit<'_, D>,
     ) {
         // The factory singleton has no bind-time events.
-        data_init.init(resource, ());
+        data_init.init(resource, *global_data);
     }
 }
 
-impl<D> Dispatch<FrogColorManagementFactoryV1, (), D> for FrogColorManagementState
+impl<D> Dispatch<FrogColorManagementFactoryV1, FrogGlobalData, D> for FrogColorManagementState
 where
-    D: Dispatch<FrogColorManagementFactoryV1, ()>
+    D: Dispatch<FrogColorManagementFactoryV1, FrogGlobalData>
         + Dispatch<FrogColorManagedSurface, FrogSurfaceData>
         + 'static,
 {
@@ -114,7 +122,7 @@ where
         _client: &Client,
         _factory: &FrogColorManagementFactoryV1,
         request: frog_color_management_factory_v1::Request,
-        _data: &(),
+        data: &FrogGlobalData,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
@@ -140,15 +148,9 @@ where
                 // is the display peak gamescope tone-maps the game to. Only runs under
                 // dynamic HDR (the global is gated there).
                 // Display peak luminance advertised to gamescope (what the game calibrates
-                // its HDR to). Tunable via WOLF_HDR_PEAK_NITS (nits, default 1000) so it can
-                // be matched to the client TV without a rebuild; clamped to frog's u16 range.
-                // max-full-frame ~= 40% of peak (typical sustained-fullscreen ceiling).
-                let peak_nits: u32 = std::env::var("WOLF_HDR_PEAK_NITS")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(1000)
-                    .min(65535);
+                // its HDR to): the element's `hdr-peak-luminance`, clamped to frog's u16
+                // range. max-full-frame ~= 40% of peak (typical sustained-fullscreen ceiling).
+                let peak_nits = data.peak_nits.clamp(1, 65535);
                 let max_full_frame = (peak_nits * 2 / 5).max(100);
                 // preferred_metadata args: transfer function, then BT.2020 R/G/B + D65 white
                 // chromaticities in frog's 0.00002 units (R 0.708,0.292  G 0.170,0.797
@@ -202,11 +204,15 @@ where
 
         match request {
             Request::SetKnownTransferFunction { transfer_function } => {
-                let pq = matches!(transfer_function, WEnum::Value(TransferFunction::St2084Pq));
-                if pq && !accum.is_pq {
-                    tracing::info!(surface = ?surface.id(), "frog: surface -> PQ (ST2084)");
+                let transfer = match transfer_function {
+                    WEnum::Value(TransferFunction::St2084Pq) => ContentTransfer::Pq,
+                    WEnum::Value(TransferFunction::ScrgbLinear) => ContentTransfer::ScrgbLinear,
+                    _ => ContentTransfer::Sdr,
+                };
+                if transfer != accum.transfer {
+                    tracing::info!(surface = ?surface.id(), ?transfer, "frog: transfer function");
                 }
-                accum.is_pq = pq;
+                accum.transfer = transfer;
             }
             Request::SetKnownContainerColorVolume { primaries } => {
                 accum.is_bt2020 = matches!(primaries, WEnum::Value(Primaries::Rec2020));
@@ -272,23 +278,26 @@ where
 
 /// Create the `frog_color_management_factory_v1` global (version 1). Called only under
 /// dynamic HDR.
-pub fn create_frog_color_management_global<D>(display: &DisplayHandle) -> GlobalId
+pub fn create_frog_color_management_global<D>(
+    display: &DisplayHandle,
+    data: FrogGlobalData,
+) -> GlobalId
 where
-    D: GlobalDispatch<FrogColorManagementFactoryV1, ()>
-        + Dispatch<FrogColorManagementFactoryV1, ()>
+    D: GlobalDispatch<FrogColorManagementFactoryV1, FrogGlobalData>
+        + Dispatch<FrogColorManagementFactoryV1, FrogGlobalData>
         + Dispatch<FrogColorManagedSurface, FrogSurfaceData>
         + 'static,
 {
-    display.create_global::<D, FrogColorManagementFactoryV1, _>(1, ())
+    display.create_global::<D, FrogColorManagementFactoryV1, _>(1, data)
 }
 
 macro_rules! delegate_frog_color_management {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
         smithay::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::wayland::protocols::frog_color_management::frog_color_management_factory_v1::FrogColorManagementFactoryV1: ()
+            $crate::wayland::protocols::frog_color_management::frog_color_management_factory_v1::FrogColorManagementFactoryV1: $crate::wayland::protocols::frog_color_management::FrogGlobalData
         ] => $crate::wayland::protocols::frog_color_management::FrogColorManagementState);
         smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::wayland::protocols::frog_color_management::frog_color_management_factory_v1::FrogColorManagementFactoryV1: ()
+            $crate::wayland::protocols::frog_color_management::frog_color_management_factory_v1::FrogColorManagementFactoryV1: $crate::wayland::protocols::frog_color_management::FrogGlobalData
         ] => $crate::wayland::protocols::frog_color_management::FrogColorManagementState);
         smithay::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             $crate::wayland::protocols::frog_color_management::frog_color_managed_surface::FrogColorManagedSurface: $crate::wayland::protocols::frog_color_management::FrogSurfaceData

@@ -40,6 +40,7 @@ impl Fixture {
             &libinput_context,
             event_loop.handle(),
             false,
+            crate::utils::vulkan_nv12::ConversionOptions::default().hdr_peak_nits,
         );
 
         let source = ListeningSocketSource::new_auto().unwrap();

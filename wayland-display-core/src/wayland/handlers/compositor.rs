@@ -58,30 +58,6 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
     });
 }
 
-/// The fourcc of the dmabuf the client just committed to `surface`, or `None` for an SHM /
-/// non-dmabuf / no buffer commit. Used by the dynamic-HDR per-frame PQ-passthrough decision.
-fn committed_dmabuf_fourcc(surface: &WlSurface) -> Option<Fourcc> {
-    with_states(surface, |states| {
-        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-        match &attrs.current().buffer {
-            Some(BufferAssignment::NewBuffer(buffer)) => {
-                get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.format().code)
-            }
-            _ => None,
-        }
-    })
-}
-
-/// True for the 10-bit packed RGB fourccs gamescope emits for already-PQ BT.2020 HDR output
-/// (XB30/AB30/XR30/AR30). Such a frame is already PQ-encoded, so the converter must take the
-/// matrix-only passthrough path rather than re-applying the PQ tone-map.
-fn is_pq_fourcc(fourcc: Fourcc) -> bool {
-    matches!(
-        fourcc,
-        Fourcc::Xbgr2101010 | Fourcc::Abgr2101010 | Fourcc::Xrgb2101010 | Fourcc::Argb2101010
-    )
-}
-
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
@@ -157,24 +133,13 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        // Dynamic HDR: read the just-committed dmabuf fourcc ONCE, here, BEFORE the
-        // window/popup commits below advance the surface's double-buffered state (which would
-        // consume current().buffer and make a later read return None -- that was the bug). One
-        // read drives both the diagnostic log and the per-frame PQ-passthrough decision.
-        // gamescope presents ONE composited output surface whose buffer fourcc flips 8-bit
-        // (Steam UI -> SDR) <-> 10-bit (HDR game -> already-PQ); the converter uses
-        // current_input_is_pq to pick the matrix-only passthrough vs the SDR->PQ tone-map.
-        // Off (no-op) unless dynamic HDR is enabled. Cursors here are MemoryRenderBuffers, not
-        // client dmabufs, so they don't perturb this.
+        // Dynamic HDR: colour state is double-buffered surface state, so latch what the
+        // client staged through frog / wp_color_management together with this commit's
+        // buffer. The fourcc log is a diagnostic only; it is read here, before the
+        // window/popup commits below advance current().buffer.
         if self.hdr_cm {
             log_client_buffer_fourcc(surface);
-            if let Some(fourcc) = committed_dmabuf_fourcc(surface) {
-                let pq = is_pq_fourcc(fourcc);
-                if self.current_input_is_pq != pq {
-                    self.current_input_is_pq = pq;
-                    tracing::info!("pq_passthrough -> {pq} (fourcc={fourcc:?})");
-                }
-            }
+            crate::wayland::handlers::color_management::commit_surface_hdr_color(surface);
         }
 
         if let Some(window) = self

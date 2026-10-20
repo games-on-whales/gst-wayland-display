@@ -86,13 +86,16 @@ use crate::utils::allocator::{
     GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
 };
+use crate::utils::color::FrameColor;
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
+use crate::wayland::handlers::color_management::{SurfaceHdrColor, surface_tree_hdr_color};
 use crate::{
     utils::RenderTarget,
     wayland::protocols::{
-        frog_color_management::create_frog_color_management_global, wl_drm::create_drm_global,
+        frog_color_management::{FrogGlobalData, create_frog_color_management_global},
+        wl_drm::create_drm_global,
     },
 };
 
@@ -119,12 +122,6 @@ pub struct State {
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
-    /// Dynamic-HDR per-frame PQ-passthrough selector: true when the active fullscreen surface's
-    /// most-recent committed buffer is a 10-bit fourcc (gamescope's already-PQ BT.2020 HDR
-    /// output, XB30/AB30/XR30/AR30). Threaded into the Vulkan converter's `convert()` so a
-    /// 10-bit frame uses the matrix-only passthrough shader instead of re-applying PQ. Always
-    /// false unless dynamic HDR is enabled (set only in the compositor commit handler).
-    pub(crate) current_input_is_pq: bool,
 
     // management
     pub output: Option<Output>,
@@ -174,8 +171,16 @@ pub struct State {
     /// behaviour is exactly as before. See [`State::update_hdr_state`].
     hdr_state_tx: Option<Sender<Command>>,
     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
-    /// log + signal on an actual change. Defaults to `false` (SDR).
+    /// log + signal on an actual change. Defaults to `false` (SDR). This committed state,
+    /// not the raw per-commit surface state, picks the converter shader, so a frame's
+    /// pixels always match the colorimetry the element tags it with.
     last_hdr_state: bool,
+    /// Mastering / CLL caps strings last signalled with an HDR state, so a game that updates
+    /// its metadata after the flip reaches the encoder too.
+    last_hdr_meta: Option<(String, String)>,
+    /// Set when downstream refused the HDR colorimetry: the output stays SDR for the rest of
+    /// the stream instead of flipping into caps nobody accepts.
+    hdr_refused: bool,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -271,6 +276,7 @@ impl State {
         input_context: &Libinput,
         event_loop_handle: LoopHandle<'static, State>,
         hdr_cm: bool,
+        hdr_peak_nits: u32,
     ) -> Self {
         let clock = Clock::new();
 
@@ -307,7 +313,12 @@ impl State {
             tracing::info!(
                 "dynamic HDR: advertising frog_color_management_v1 (gamescope HDR path)"
             );
-            Some(create_frog_color_management_global::<State>(&dh))
+            Some(create_frog_color_management_global::<State>(
+                &dh,
+                FrogGlobalData {
+                    peak_nits: hdr_peak_nits,
+                },
+            ))
         } else {
             None
         };
@@ -430,7 +441,6 @@ impl State {
             dmabuf_global,
             video_info: None,
             last_render: None,
-            current_input_is_pq: false,
 
             space,
             popups: PopupManager::default(),
@@ -465,6 +475,8 @@ impl State {
             frog_color_mgmt_global,
             hdr_state_tx: None,
             last_hdr_state: false,
+            last_hdr_meta: None,
+            hdr_refused: false,
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
             hdr_candidate_since: None,
@@ -472,47 +484,78 @@ impl State {
         }
     }
 
-    /// Whether the active fullscreen surface is HDR (BT.2100 PQ / BT.2020, per
-    /// `wp_color_management_v1`). The compositor forces one fullscreen toplevel at a time,
-    /// so the first mapped window in the space is the active one. `false` when no window is
-    /// mapped or it carries no (or a non-HDR) image description.
-    pub fn output_hdr_state(&self) -> bool {
-        // HDR when EITHER the active surface declares HDR via wp_color_management
-        // (surface_is_hdr) OR the current composited content is a 10-bit already-PQ buffer
-        // (current_input_is_pq). gamescope -- the real Steam/HDR path -- does NOT use the
-        // color-management protocol; it just submits 10-bit PQ buffers, so the fourcc-based
-        // current_input_is_pq is the signal that actually flips for it. Without this the
-        // producer colorimetry never flips to bt2100-pq for a gamescope HDR game.
-        if self.current_input_is_pq {
-            return true;
-        }
+    /// The colour state of the active surface: the topmost mapped toplevel (smithay
+    /// iterates the space back to front and `raise_element` moves the focused window to
+    /// the end), including its subsurfaces. Steam and a game can both be mapped, so the
+    /// bottom window is not the one on screen. `None` when nothing is mapped or the
+    /// surface declared no colour state.
+    fn active_surface_hdr_color(&self) -> Option<SurfaceHdrColor> {
         self.space
             .elements()
-            .next()
+            .last()
             .and_then(|window| window.wl_surface())
-            .map(|surface| crate::wayland::handlers::color_management::surface_is_hdr(&surface))
-            .unwrap_or(false)
+            .and_then(|surface| surface_tree_hdr_color(&surface))
     }
 
-    /// The active fullscreen surface's HDR mastering / content-light-level gst caps strings,
-    /// from whichever color-management protocol provided them (frog for gamescope,
-    /// `wp_color_management_v1` for sway). `None` when there is no surface or it carries no
-    /// mastering metadata -- the producer then keeps its hardcoded HDR defaults.
+    /// Whether the active surface declares HDR content (PQ or linear scRGB, through
+    /// `frog_color_management_v1` or `wp_color_management_v1`). The buffer fourcc is not a
+    /// signal: 10-bit SDR exists. Always `false` once downstream refused HDR.
+    pub fn output_hdr_state(&self) -> bool {
+        !self.hdr_refused
+            && self
+                .active_surface_hdr_color()
+                .is_some_and(|color| color.is_hdr())
+    }
+
+    /// The active surface's HDR mastering / content-light-level gst caps strings. `None`
+    /// when it carries no mastering metadata -- the producer then keeps its defaults.
     fn active_surface_mastering_caps(&self) -> Option<(String, String)> {
-        self.space
-            .elements()
-            .next()
-            .and_then(|window| window.wl_surface())
-            .and_then(|surface| {
-                crate::wayland::handlers::color_management::surface_mastering_caps(&surface)
-            })
+        self.active_surface_hdr_color()
+            .and_then(|color| color.mastering_caps())
+    }
+
+    /// How the converter must treat the next frame: the committed (debounced) output state
+    /// the element tags it with, and the transfer function of the content it samples.
+    pub(crate) fn frame_color(&self) -> FrameColor {
+        FrameColor {
+            output_hdr: self.last_hdr_state,
+            content: self
+                .active_surface_hdr_color()
+                .map(|color| color.transfer)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Downstream refused the HDR colorimetry: stay SDR from now on, and switch the very
+    /// next frame (no debounce), since the element has already fallen back to SDR caps.
+    pub(crate) fn refuse_hdr(&mut self) {
+        tracing::warn!("dynamic HDR: downstream refused HDR caps; staying SDR");
+        self.hdr_refused = true;
+        self.hdr_candidate_since = None;
+        if self.last_hdr_state {
+            self.last_hdr_state = false;
+            self.last_hdr_meta = None;
+            self.send_hdr_state(false, None);
+        }
+    }
+
+    fn send_hdr_state(&self, hdr: bool, meta: Option<(String, String)>) {
+        if let Some(tx) = &self.hdr_state_tx {
+            let (mastering, cll) = meta.unzip();
+            let _ = tx.send(Command::HdrState {
+                hdr,
+                mastering,
+                cll,
+            });
+        }
     }
 
     /// Recompute the OUTPUT HDR state and, on an actual change, log it and signal the
-    /// element over the reverse channel (so it can post a `wolf-hdr-state` application
-    /// message on the GStreamer bus). The stored-bool compare debounces repeats. No-op
-    /// unless dynamic HDR wired `hdr_state_tx`, so off = behaviour as before. Does NOT
-    /// touch the producer caps/shader -- this only derives + signals the trigger.
+    /// element over the reverse channel. Runs right before each frame is rendered, and the
+    /// element drains the channel after receiving that frame, so it can retag the caps
+    /// before pushing the first frame rendered in the new state. While HDR, a change in the
+    /// active surface's mastering metadata is signalled too. No-op unless dynamic HDR wired
+    /// `hdr_state_tx`.
     pub(crate) fn update_hdr_state(&mut self) {
         if self.hdr_state_tx.is_none() {
             return;
@@ -520,11 +563,18 @@ impl State {
         let hdr = self.output_hdr_state();
         if hdr == self.last_hdr_state {
             // Settled back to the current committed state -> cancel any pending flip.
-            // This is what filters the rapid HDR<->SDR flicker: a stray 8-bit UI frame
-            // between 10-bit game frames flips output_hdr_state for a few ms, but it
-            // returns to HDR before the debounce elapses, so the candidate is cancelled
-            // and the TV never switches mode.
+            // This is what filters the rapid HDR<->SDR flicker: brief transitions return
+            // before the debounce elapses, so the candidate is cancelled and the TV never
+            // switches mode. Frames in between are still converted for the committed state.
             self.hdr_candidate_since = None;
+            if hdr {
+                let meta = self.active_surface_mastering_caps();
+                if meta.is_some() && meta != self.last_hdr_meta {
+                    tracing::info!("output HDR metadata updated: {meta:?}");
+                    self.last_hdr_meta = meta.clone();
+                    self.send_hdr_state(true, meta);
+                }
+            }
             return;
         }
         // `hdr` differs from the committed state -> a candidate flip. Only commit it once
@@ -539,24 +589,15 @@ impl State {
                     if hdr { "HDR" } else { "SDR" }
                 );
                 // When going HDR, carry the active surface's REAL mastering / CLL metadata
-                // (from whichever color-management protocol the nested compositor speaks) so
-                // the encoder's SEI reflects the game's actual luminance; `None` => the
-                // producer keeps its hardcoded HDR defaults. SDR carries no metadata.
-                let (mastering, cll) = if hdr {
-                    match self.active_surface_mastering_caps() {
-                        Some((m, c)) => (Some(m), Some(c)),
-                        None => (None, None),
-                    }
+                // so the encoder's SEI reflects the game's actual luminance; `None` => the
+                // producer keeps its defaults. SDR carries no metadata.
+                let meta = if hdr {
+                    self.active_surface_mastering_caps()
                 } else {
-                    (None, None)
+                    None
                 };
-                if let Some(tx) = &self.hdr_state_tx {
-                    let _ = tx.send(Command::HdrState {
-                        hdr,
-                        mastering,
-                        cll,
-                    });
-                }
+                self.last_hdr_meta = meta.clone();
+                self.send_hdr_state(hdr, meta);
             }
             Some(_) => {} // candidate still maturing
             None => self.hdr_candidate_since = Some(Instant::now()),
@@ -564,17 +605,16 @@ impl State {
     }
 }
 
-/// True when `new` differs from `prev` ONLY in colorimetry -- same pixel format, width, height,
-/// and frame rate, but a different colorimetry (matrix/transfer/primaries/range, e.g. a dynamic
-/// HDR bt709<->bt2100-pq flip). Used under dynamic HDR to skip the Vulkan converter rebuild
-/// for such a re-negotiation: the converter produces correct pixels per frame regardless of the
-/// caps colorimetry, so only the downstream caps tag needs to change.
-fn colorimetry_only_change(prev: &VideoInfo, new: &VideoInfo) -> bool {
+/// True when `new` has the same pixel format, width, height and frame rate as `prev`, i.e.
+/// a re-negotiation changed only colorimetry or HDR metadata (a dynamic HDR bt709 <->
+/// bt2100-pq flip, or updated mastering metadata). Used under dynamic HDR to skip the Vulkan
+/// converter rebuild: the converter picks its shader per frame from [`State::frame_color`],
+/// so only the downstream caps tag needs to change.
+fn same_geometry(prev: &VideoInfo, new: &VideoInfo) -> bool {
     prev.format() == new.format()
         && prev.width() == new.width()
         && prev.height() == new.height()
         && prev.fps() == new.fps()
-        && prev.colorimetry() != new.colorimetry()
 }
 
 /// Apply a newly-negotiated `GstVideoInfo` to the compositor state: create or update
@@ -640,15 +680,14 @@ pub(crate) fn apply_video_info(
     // Dynamic HDR: the producer flips its output caps colorimetry mid-stream
     // (bt709 SDR <-> bt2100-pq HDR) on the SAME format/resolution/fps. Tearing down and
     // rebuilding the Vulkan converter (GsNv12Buf / VulkanNv12) on the compositor thread for
-    // that starves frame production and crashes the live stream. The converter produces correct
-    // pixels per frame from current_input_is_pq regardless of the caps colorimetry, so a
-    // colorimetry-only re-negotiation can keep the existing converter. The caps tag still
-    // propagates to the encoder via the producer's caps event independently of this.
+    // that starves frame production and crashes the live stream. The converter picks its
+    // shader per frame from the committed HDR state, so such a re-negotiation can keep the
+    // existing converter. The caps tag propagates to the encoder via the producer's caps event.
     let keep_converter = state.hdr_cm
         && state.output_buffer.is_some()
         && prev_video_info
             .as_ref()
-            .is_some_and(|prev| colorimetry_only_change(prev, &base_info));
+            .is_some_and(|prev| same_geometry(prev, &base_info));
     if keep_converter {
         tracing::info!("apply_video_info: colorimetry-only change, keeping converter");
     } else {
@@ -822,6 +861,7 @@ pub(crate) fn init(
         &input_context,
         event_loop.handle(),
         hdr_cm,
+        vulkan_share.conversion_options().hdr_peak_nits,
     );
     state.vulkan_share = vulkan_share;
     state.va_share = va_share;
@@ -1130,6 +1170,7 @@ pub(crate) fn init(
                 // Reverse-direction signal: only ever sent compositor -> element over the
                 // dedicated `hdr_state_tx` channel, never received on this command channel.
                 Event::Msg(Command::HdrState { .. }) => {}
+                Event::Msg(Command::RefuseHdr) => state.refuse_hdr(),
             };
         })
         .unwrap();
