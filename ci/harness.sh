@@ -99,7 +99,7 @@ detect_env() {
   command -v "$CARGO" >/dev/null || { err "cargo not found (install rustup)"; return 1; }
   # bindgen needs libclang for input-event-codes-sys
   if [[ -z "$LIBCLANG" ]]; then
-    LIBCLANG="$(dirname "$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)" 2>/dev/null)"
+    LIBCLANG="$(dirname "$(find /usr/lib64 /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)" 2>/dev/null)"
   fi
   [[ -n "$LIBCLANG" ]] && export LIBCLANG_PATH="$LIBCLANG"
 
