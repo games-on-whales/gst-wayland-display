@@ -6,7 +6,7 @@ edition = "2024"
 license = "MIT"
 description = "GStreamer Wayland Compositor Src"
 repository = "https://github.com/games-on-whales/wolf"
-rust-version = "1.88"
+rust-version = "1.92"
 
 [lib]
 name = "gstwaylanddisplaysrc"
