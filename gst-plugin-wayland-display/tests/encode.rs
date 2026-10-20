@@ -18,6 +18,9 @@
 use gst::prelude::*;
 use std::sync::Once;
 
+#[path = "common/hdr_client.rs"]
+mod hdr_client;
+
 static INIT: Once = Once::new();
 
 fn init() {
@@ -375,4 +378,81 @@ fn vulkan_av1_encode_to_eos() {
          ! vulkanav1enc ! fakesink"
     ))
     .expect("Vulkan AV1 encode");
+}
+
+/// Dynamic HDR end to end: a client declaring PQ through `wp_color_management_v1` makes the
+/// source post `wayland-display-hdr-state` (hdr=true) and retag its P010 caps as BT.2100 PQ
+/// with mastering metadata, after the debounce and without renegotiating format or size.
+#[test]
+#[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
+fn dynamic_hdr_flips_caps_for_a_pq_client() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    let pipeline = gst::parse::launch(&format!(
+        "waylanddisplaysrc name=src render-node={node} dynamic-hdr=true ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=320,height=240,framerate=30/1 ! \
+         fakesink"
+    ))
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    let src = pipeline.by_name("src").unwrap();
+    let bus = pipeline.bus().unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut client = None;
+    let mut flipped = false;
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(20)) {
+        match msg.view() {
+            gst::MessageView::Application(app) => {
+                let s = app.structure().unwrap();
+                if s.name() == "wayland.src" && client.is_none() {
+                    let socket = std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap())
+                        .join(s.get::<String>("WAYLAND_DISPLAY").unwrap());
+                    let stop = stop.clone();
+                    client = Some(std::thread::spawn(move || {
+                        hdr_client::run_pq_client(socket, stop)
+                    }));
+                } else if s.name() == "wayland-display-hdr-state" {
+                    assert!(
+                        s.get::<bool>("hdr").unwrap(),
+                        "first transition must be to HDR"
+                    );
+                    flipped = true;
+                    break;
+                }
+            }
+            gst::MessageView::Error(err) => panic!("{}: {:?}", err.error(), err.debug()),
+            _ => {}
+        }
+    }
+    assert!(flipped, "no wayland-display-hdr-state message within 20s");
+    // The retag happens before the first HDR frame is pushed; give it a frame to land.
+    let mut caps = None;
+    for _ in 0..50 {
+        caps = src.static_pad("src").and_then(|p| p.current_caps());
+        if caps_field(caps.as_ref().unwrap(), "colorimetry").as_deref() == Some("bt2100-pq") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let caps = caps.unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let _ = pipeline.set_state(gst::State::Null);
+    if let Some(c) = client {
+        let _ = c.join();
+    }
+    assert_eq!(
+        caps_field(&caps, "colorimetry").as_deref(),
+        Some("bt2100-pq")
+    );
+    assert!(caps_field(&caps, "mastering-display-info").is_some());
+    let s = caps.structure(0).unwrap();
+    assert_eq!(s.get::<i32>("width").unwrap(), 320);
+    assert!(s.get::<String>("drm-format").unwrap().starts_with("P010"));
 }
