@@ -33,7 +33,10 @@
 #     -v, --verbose                   stream sub-command output
 #     -h, --help                      this help
 #
-# Exit status is non-zero if any selected phase failed.
+# Exit status is non-zero if any selected phase failed. With
+# GST_WAYLAND_DISPLAY_REQUIRE_GPU=1 (set on the GPU runner) a missing GPU or
+# encoder fails the gpu / integration phases and the Rust GPU tests instead of
+# skipping them.
 set -uo pipefail
 
 # --- locate repo root (this script lives in <root>/ci) -----------------------
@@ -184,8 +187,16 @@ phase_unit() {
     $([[ $PROFILE == release ]] && echo --release)
 }
 
+# No render node: skip, unless this runner is supposed to have a GPU.
+no_gpu() {
+  if [[ -n "${GST_WAYLAND_DISPLAY_REQUIRE_GPU:-}" ]]; then
+    err "no GPU render node, but GST_WAYLAND_DISPLAY_REQUIRE_GPU is set"; return 1
+  fi
+  warn "no GPU; skipping"; return 0
+}
+
 phase_gpu() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then no_gpu; return; fi
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
   log "  GPU-gated Rust tests on $node"
   NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
@@ -213,7 +224,7 @@ run_to_eos() { # run_to_eos <label> <pipeline...>
 }
 
 phase_integration() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then no_gpu; return; fi
   command -v gst-inspect-1.0 >/dev/null || { warn "no gst-launch; skipping"; return 0; }
   ginspect waylanddisplaysrc || { err "plugin not built (run 'build' first)"; return 1; }
   local ok=1 node res="width=1280,height=720,framerate=60/1"

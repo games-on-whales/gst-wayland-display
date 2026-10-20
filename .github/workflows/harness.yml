@@ -37,11 +37,14 @@ jobs:
 
   # Full matrix (gpu / integration / bench) on real hardware. Off by default;
   # enable by registering a self-hosted runner labelled `gpu` and setting the
-  # repository variable GPU_RUNNER=true.
+  # repository variable GPU_RUNNER=true. On that runner a skipped GPU test is a
+  # failure.
   harness-gpu:
     name: harness (full · GPU)
     if: ${{ vars.GPU_RUNNER == 'true' }}
     runs-on: [self-hosted, gpu]
+    env:
+      GST_WAYLAND_DISPLAY_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Harness (all phases)
