@@ -376,7 +376,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("vulkan-profile")
-                    .blurb("Encode image profile, matching the downstream encoder: h264 high/main/baseline/constrained-baseline (NV12); h265 main (NV12) or main-10 (P010); av1 main")
+                    .blurb("Encode image profile, matching the downstream encoder: h264 high/main/baseline/constrained-baseline (NV12); h265 main (NV12) or main-10 (P010); av1 main (NV12)")
                     .mutable_ready().build(),
                 glib::ParamSpecBoolean::builder("dynamic-hdr")
                     .blurb(

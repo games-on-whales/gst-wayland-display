@@ -75,7 +75,8 @@ impl VulkanCodec {
             ),
             (VulkanCodec::H265, Nv12) => profile == "main",
             (VulkanCodec::H265, P01010le) => profile == "main-10",
-            (VulkanCodec::Av1, Nv12 | P01010le) => profile == "main",
+            // vulkanav1enc (patches/vulkanav1enc.patch) only takes 8-bit NV12 input.
+            (VulkanCodec::Av1, Nv12) => profile == "main",
             _ => false,
         }
     }

@@ -356,3 +356,23 @@ fn vulkan_h265_nv12_encode_to_eos() {
     ))
     .expect("Vulkan H.265 Main encode");
 }
+
+/// NV12 `memory:VulkanImage` into `vulkanav1enc` Main (the element takes 8-bit input only):
+/// the encode-src images must carry the AV1 profile.
+#[test]
+#[ignore = "needs vulkanav1enc (patched GStreamer); run via ci/harness.sh gpu"]
+fn vulkan_av1_encode_to_eos() {
+    init();
+    let Some(node) = render_node_for(&["amdgpu", "nvidia"]) else {
+        skip!("no AMD/NVIDIA render node")
+    };
+    if !have("vulkanav1enc") {
+        skip!("no vulkanav1enc (needs the patched GStreamer)");
+    }
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=60 ! \
+         video/x-raw(memory:VulkanImage),format=NV12,width=1280,height=720,framerate=60/1 \
+         ! vulkanav1enc ! fakesink"
+    ))
+    .expect("Vulkan AV1 encode");
+}

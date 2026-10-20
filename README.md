@@ -126,7 +126,7 @@ Vulkan encode requires Fedora 44+ and GStreamer 1.28+ with the `patches/` chain 
 Setting `vulkan=true` offers NV12 and P010 as `memory:VulkanImage`. The source answers the
 downstream encoder's `gst.vulkan.device` context query with a `GstVulkanDevice` it owns, and mints
 its output images on that device, so `vulkanh264enc` (NV12), `vulkanh265enc` (NV12 Main, P010
-Main-10) and `vulkanav1enc` (NV12/P010 Main) view them with no copy. Each image is created for
+Main-10) and `vulkanav1enc` (NV12 Main) view them with no copy. Each image is created for
 the consuming encoder's codec profile (see `vulkan-codec` / `vulkan-profile` below). The RGBA to
 NV12/P010 conversion runs as a Vulkan compute shader on that device, submitted through gst's own
 queue lock.
@@ -349,7 +349,7 @@ so independent sessions may use different values:
 | `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR-to-tiled `vkCmdCopyImage`. |
 | `sdr-reference-white` | 203 | SDR white level in nits for SDR → PQ conversion, 1–10000. |
 | `vulkan-codec` | auto | Codec of the consuming encoder: `h264`, `h265` or `av1`. Empty = the directly linked encoder's, else `h264` for NV12 and `h265` for P010. Set it when the encoder sits behind interpipe. |
-| `vulkan-profile` | codec-dependent | Profile of the consuming encoder: H.264 `high` (default), `main`, `baseline`, `constrained-baseline`, `constrained-high`, `progressive-high` for NV12; H.265 `main` for NV12 and `main-10` for P010; AV1 `main`. |
+| `vulkan-profile` | codec-dependent | Profile of the consuming encoder: H.264 `high` (default), `main`, `baseline`, `constrained-baseline`, `constrained-high`, `progressive-high` for NV12; H.265 `main` for NV12 and `main-10` for P010; AV1 `main` (NV12 only). |
 
 A directly connected Vulkan encoder's codec and fixed output profile are discovered
 through simple filters and queues. Raw caps cannot express an encoder's codec/profile
