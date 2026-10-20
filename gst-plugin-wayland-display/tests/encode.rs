@@ -612,3 +612,199 @@ fn resolution_change_keeps_rendering() {
         );
     }
 }
+
+/// The converter's output pixels, not just its caps: a client fills its window with a known
+/// sRGB colour, the source converts it to NV12 (BT.601) or P010 (BT.709) `memory:VulkanImage`
+/// and a Vulkan encoder encodes it; decoding the stream back must give the Y'CbCr the
+/// shaders' matrices produce for that colour. Exercises the GLES -> Vulkan import (queue
+/// ownership, layouts), the compute conversion and the CONCURRENT encode-src image end to end.
+#[test]
+#[ignore = "needs Vulkan encode and decode (patched GStreamer); run via ci/harness.sh gpu"]
+fn vulkan_encode_round_trips_the_client_colour() {
+    use gst_video::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    init();
+    let Some(node) = render_node_for(&["amdgpu", "nvidia"]) else {
+        skip!("no AMD/NVIDIA render node")
+    };
+    for e in [
+        "vulkanh264enc",
+        "vulkanh265enc",
+        "vulkanh264dec",
+        "vulkanh265dec",
+        "vulkandownload",
+    ] {
+        if !have(e) {
+            skip!("no {e}");
+        }
+    }
+    // A saturated red: its BT.709 SDR, SDR -> PQ and PQ-passthrough encodings differ by
+    // >= 0.037 in some component, well over the tolerance, so the right shader must have run.
+    const RGB: [u8; 3] = [240, 16, 16];
+    let [r, g, b] = RGB.map(|c| c as f64 / 255.0);
+    // BT.2020 NCL limited-range matrix on PQ code values (rgba_to_p010_bt2020.comp and
+    // rgba_pqpass_to_p010.comp).
+    let bt2020 = |[r, g, b]: [f64; 3]| {
+        [
+            0.2256 * r + 0.5823 * g + 0.0509 * b + 0.0627,
+            -0.1227 * r - 0.3166 * g + 0.4392 * b + 0.5,
+            0.4392 * r - 0.4039 * g - 0.0353 * b + 0.5,
+        ]
+    };
+    // SDR -> PQ as rgba_to_p010_bt2020.comp does it, at the default 203-nit SDR white.
+    let sdr_to_pq = |c: f64| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let pq_oetf = |l: f64| {
+        let (m1, m2, c1, c2, c3) = (0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875);
+        let lm = l.powf(m1);
+        ((c1 + c2 * lm) / (1.0 + c3 * lm)).powf(m2)
+    };
+    let lin = [sdr_to_pq(r), sdr_to_pq(g), sdr_to_pq(b)];
+    let lin2020 = [
+        0.627404 * lin[0] + 0.329283 * lin[1] + 0.043313 * lin[2],
+        0.069097 * lin[0] + 0.919541 * lin[1] + 0.011362 * lin[2],
+        0.016391 * lin[0] + 0.088013 * lin[1] + 0.895595 * lin[2],
+    ];
+    let tone_mapped = lin2020.map(|v| pq_oetf(v.clamp(0.0, 1.0) * 203.0 / 10000.0));
+    // (label, format, codec, source properties, client declares PQ, expected Y'CbCr).
+    let cases = [
+        (
+            "NV12 SDR (BT.601)",
+            "NV12",
+            "h264",
+            "",
+            false,
+            [
+                0.257 * r + 0.504 * g + 0.098 * b + 0.0625,
+                -0.148 * r - 0.291 * g + 0.439 * b + 0.5,
+                0.439 * r - 0.368 * g - 0.071 * b + 0.5,
+            ],
+        ),
+        (
+            "P010 SDR (BT.709)",
+            "P010_10LE",
+            "h265",
+            "",
+            false,
+            [
+                0.183 * r + 0.614 * g + 0.062 * b + 0.0625,
+                -0.101 * r - 0.339 * g + 0.439 * b + 0.5,
+                0.439 * r - 0.399 * g - 0.040 * b + 0.5,
+            ],
+        ),
+        (
+            "P010 static HDR (SDR -> PQ)",
+            "P010_10LE",
+            "h265",
+            "hdr=true",
+            false,
+            bt2020(tone_mapped),
+        ),
+        (
+            "P010 dynamic HDR (PQ passthrough)",
+            "P010_10LE",
+            "h265",
+            "dynamic-hdr=true",
+            true,
+            bt2020([r, g, b]),
+        ),
+    ];
+    for (label, format, codec, props, client_pq, [ey, ecb, ecr]) in cases {
+        let p = gst::parse::launch(&format!(
+            "waylanddisplaysrc render-node={node} vulkan=true {props} ! \
+             video/x-raw(memory:VulkanImage),format={format},width=320,height=240,framerate=30/1 ! \
+             vulkan{codec}enc ! {codec}parse ! vulkan{codec}dec ! vulkandownload ! \
+             video/x-raw,format={format} ! fakesink name=s signal-handoffs=true"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let p010 = format == "P010_10LE";
+        let last = Arc::new(Mutex::new(None::<(f64, f64, f64)>));
+        let l = last.clone();
+        p.by_name("s")
+            .unwrap()
+            .connect("handoff", false, move |args| {
+                // Never panic here: this runs inside a C callback.
+                let (Ok(buffer), Ok(pad)) =
+                    (args[1].get::<gst::Buffer>(), args[2].get::<gst::Pad>())
+                else {
+                    return None;
+                };
+                let Some(info) = pad
+                    .current_caps()
+                    .and_then(|c| gst_video::VideoInfo::from_caps(&c).ok())
+                else {
+                    return None;
+                };
+                let Ok(frame) = gst_video::VideoFrame::from_buffer_readable(buffer, &info) else {
+                    return None;
+                };
+                let read = |plane: u32, x: usize, y: usize| -> f64 {
+                    let data = frame.plane_data(plane).unwrap();
+                    let at = y * frame.plane_stride()[plane as usize] as usize;
+                    if p010 {
+                        let i = at + x * 2;
+                        (u16::from_le_bytes([data[i], data[i + 1]]) >> 6) as f64 / 1023.0
+                    } else {
+                        data[at + x] as f64 / 255.0
+                    }
+                };
+                // Away from the centre, where the compositor draws its cursor.
+                let y = read(0, 80, 60);
+                let (cb, cr) = (read(1, 80, 30), read(1, 81, 30));
+                *l.lock().unwrap() = Some((y, cb, cr));
+                None
+            });
+        p.set_state(gst::State::Playing).unwrap();
+        let bus = p.bus().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut client = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && client.is_none() {
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+                match msg.view() {
+                    gst::MessageView::Application(app)
+                        if app.structure().unwrap().name() == "wayland.src" =>
+                    {
+                        let display = app
+                            .structure()
+                            .unwrap()
+                            .get::<String>("WAYLAND_DISPLAY")
+                            .unwrap();
+                        let socket =
+                            std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap())
+                                .join(display);
+                        let stop = stop.clone();
+                        client = Some(std::thread::spawn(move || {
+                            hdr_client::run_client(socket, stop, RGB, client_pq)
+                        }));
+                    }
+                    gst::MessageView::Error(e) => {
+                        panic!("{label}: {}: {:?}", e.error(), e.debug())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let got = *last.lock().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = p.set_state(gst::State::Null);
+        if let Some(c) = client {
+            let _ = c.join();
+        }
+        let (y, cb, cr) = got.unwrap_or_else(|| panic!("{label}: no decoded frame"));
+        let tol = 4.0 / 255.0;
+        assert!(
+            (y - ey).abs() < tol && (cb - ecb).abs() < tol && (cr - ecr).abs() < tol,
+            "{label}: decoded Y'CbCr ({y:.4}, {cb:.4}, {cr:.4}), expected ({ey:.4}, {ecb:.4}, {ecr:.4})"
+        );
+    }
+}

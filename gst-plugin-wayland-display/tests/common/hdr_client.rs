@@ -1,5 +1,5 @@
-//! Minimal `wp_color_management_v1` client for the dynamic-HDR GPU test: maps one
-//! xdg toplevel with an SHM buffer whose surface declares ST 2084 PQ / BT.2020.
+//! Minimal Wayland client for the GPU tests: maps one xdg toplevel with a solid-colour SHM
+//! buffer, optionally declaring ST 2084 PQ / BT.2020 through `wp_color_management_v1`.
 
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -91,9 +91,21 @@ delegate_noop!(State: wp_color_management_surface_v1::WpColorManagementSurfaceV1
 
 /// Connect to `socket`, map a PQ-declaring toplevel, and keep the connection alive
 /// (dispatching) until `stop` is set.
+#[allow(dead_code)]
 pub fn run_pq_client(
     socket: std::path::PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    run_client(socket, stop, [0, 0, 0], true)
+}
+
+/// Connect to `socket`, map a toplevel filled with `rgb` (sRGB, 8-bit), optionally declaring
+/// PQ, and keep the connection alive until `stop` is set.
+pub fn run_client(
+    socket: std::path::PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rgb: [u8; 3],
+    pq: bool,
 ) {
     use std::sync::atomic::Ordering;
     let conn = Connection::from_socket(UnixStream::connect(socket).expect("connect")).unwrap();
@@ -104,10 +116,7 @@ pub fn run_pq_client(
     queue.roundtrip(&mut state).unwrap();
     let compositor = state.compositor.clone().expect("wl_compositor");
     let wm_base = state.wm_base.clone().expect("xdg_wm_base");
-    let color = state
-        .color
-        .clone()
-        .expect("wp_color_manager_v1 (dynamic-hdr off?)");
+    let color = state.color.clone();
     let shm = state.shm.clone().expect("wl_shm");
 
     let surface = compositor.create_surface(&qh, ());
@@ -120,17 +129,33 @@ pub fn run_pq_client(
     xdg.ack_configure(state.configured.unwrap());
 
     let (w, h) = (320, 240);
-    let file = tempfile::tempfile().unwrap();
-    file.set_len((w * h * 4) as u64).unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    {
+        use std::io::Write;
+        // XRGB8888 is B, G, R, X in memory.
+        let pixel = [rgb[2], rgb[1], rgb[0], 0xff];
+        let row: Vec<u8> = pixel
+            .iter()
+            .copied()
+            .cycle()
+            .take((w * 4) as usize)
+            .collect();
+        for _ in 0..h {
+            file.write_all(&row).unwrap();
+        }
+    }
     let pool = shm.create_pool(file.as_fd(), w * h * 4, &qh, ());
     let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Xrgb8888, &qh, ());
 
-    let params = color.create_parametric_creator(&qh, ());
-    params.set_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
-    params.set_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
-    let desc = params.create(&qh, ());
-    let cm_surface = color.get_surface(&surface, &qh, ());
-    cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
+    if pq {
+        let color = color.expect("wp_color_manager_v1 (dynamic-hdr off?)");
+        let params = color.create_parametric_creator(&qh, ());
+        params.set_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
+        params.set_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
+        let desc = params.create(&qh, ());
+        let cm_surface = color.get_surface(&surface, &qh, ());
+        cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
+    }
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, w, h);
     surface.commit();
