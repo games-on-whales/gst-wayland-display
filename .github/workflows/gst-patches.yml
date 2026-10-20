@@ -37,7 +37,10 @@ jobs:
       - name: Build dependencies
         run: |
           dnf install -y dnf-plugins-core 'dnf-command(builddep)'
-          dnf builddep -y gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
+          # --allowerasing: when Fedora's Cisco openh264 repo is unreachable the only
+          # openh264-devel candidate is noopenh264-devel, which conflicts with the image's
+          # installed openh264. The patched build doesn't use OpenH264, so let dnf swap it.
+          dnf builddep -y --allowerasing gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
           dnf install -y git gcc gcc-c++ meson ninja-build flex bison nasm \
             pkgconf-pkg-config glib2-devel libdrm-devel vulkan-headers \
             vulkan-loader-devel wayland-devel wayland-protocols-devel
