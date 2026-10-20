@@ -169,7 +169,7 @@ pub struct State {
     /// Reverse channel (compositor -> element) used to signal OUTPUT HDR-state changes.
     /// `Some` only when dynamic HDR is enabled; `None` keeps the per-frame check a no-op so
     /// behaviour is exactly as before. See [`State::update_hdr_state`].
-    hdr_state_tx: Option<Sender<Command>>,
+    pub(crate) hdr_state_tx: Option<Sender<Command>>,
     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
     /// log + signal on an actual change. Defaults to `false` (SDR). This committed state,
     /// not the raw per-commit surface state, picks the converter shader, so a frame's
@@ -714,7 +714,9 @@ pub(crate) fn apply_video_info(
                         _ => None,
                     };
                     if let Some(conv_fmt) = conv_fmt {
-                        let allocator = GsNv12Buf::new(
+                        // A Vulkan setup failure must not take down the compositor thread;
+                        // with no output buffer the render loop fails the frame cleanly.
+                        state.output_buffer = GsNv12Buf::new(
                             &mut state.renderer,
                             node,
                             base_info,
@@ -722,8 +724,10 @@ pub(crate) fn apply_video_info(
                             &state.va_share,
                             state.vulkan_share.conversion_options(),
                         )
-                        .expect("Failed to create GsNv12Buf");
-                        state.output_buffer = Some(GsBufferType::NV12(allocator));
+                        .map(GsBufferType::NV12);
+                        if state.output_buffer.is_none() {
+                            tracing::error!("Failed to create the Vulkan NV12/P010 converter");
+                        }
                     } else {
                         let allocator =
                             GsDmaBuf::new(node, base_info).expect("Failed to create GsDmaBuf");
@@ -739,7 +743,10 @@ pub(crate) fn apply_video_info(
                     // leave output_buffer unset -- the render loop turns that into a clean
                     // FlowError rather than aborting the process.
                     // Clone the Arc so it can be passed to GsVulkanBuf::new while
-                    // `state.renderer` is borrowed mutably below.
+                    // `state.renderer` is borrowed mutably below. Drop the previous converter
+                    // first: if the rebuild fails, keeping it would send buffers of the old
+                    // size/format under the new caps.
+                    state.output_buffer = None;
                     let vulkan_share = Arc::clone(&state.vulkan_share);
                     if vulkan_share
                         .wait_for_shared_device(Duration::from_secs(5))
@@ -749,6 +756,7 @@ pub(crate) fn apply_video_info(
                             &mut state.renderer,
                             node,
                             params.video_info,
+                            params.codec,
                             params.profile,
                             &vulkan_share,
                         ) {
@@ -927,7 +935,7 @@ pub(crate) fn init(
                                 buffer_sender.send(Err(SwapBuffersError::TemporaryFailure(Box::<
                                     dyn std::error::Error + Send + Sync,
                                 >::from(
-                                    "no output buffer: downstream did not share a GstVulkanDevice",
+                                    "no output buffer: the converter for the negotiated caps could not be created",
                                 ))));
                             state.should_quit = true;
                             return;

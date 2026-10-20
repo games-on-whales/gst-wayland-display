@@ -16,6 +16,12 @@ use wayland_client::{
 };
 use wayland_protocols::{
     wp::{
+        color_management::v1::client::{
+            wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+            wp_color_manager_v1::{self, WpColorManagerV1},
+            wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+            wp_image_description_v1::WpImageDescriptionV1,
+        },
         pointer_constraints::zv1::{
             client::zwp_confined_pointer_v1, client::zwp_locked_pointer_v1::ZwpLockedPointerV1,
             client::zwp_pointer_constraints_v1,
@@ -54,6 +60,7 @@ struct State {
     seat: Option<wl_seat::WlSeat>,
     pointer_constraints: Option<ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
+    color_manager: Option<WpColorManagerV1>,
 
     pointer: Option<wl_pointer::WlPointer>,
     pointer_confined: bool,
@@ -139,6 +146,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
                     );
                 }
+                "wp_color_manager_v1" => {
+                    state.color_manager =
+                        Some(registry.bind::<WpColorManagerV1, _, _>(name, version, qh, ()));
+                }
                 "wl_output" => {
                     // The compositor only advertises wl_output after the first
                     // VideoInfo has created it, so this branch may fire well after
@@ -163,6 +174,10 @@ delegate_noop!(State: ignore WpViewport);
 delegate_noop!(State: ignore ZwpPointerConstraintsV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
 delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
+delegate_noop!(State: ignore WpColorManagerV1);
+delegate_noop!(State: WpImageDescriptionCreatorParamsV1);
+delegate_noop!(State: ignore WpImageDescriptionV1);
+delegate_noop!(State: WpColorManagementSurfaceV1);
 
 impl WaylandClient {
     pub fn new(w_socket: UnixStream) -> Self {
@@ -184,6 +199,7 @@ impl WaylandClient {
             seat: None,
             pointer_constraints: None,
             relative_pointer_manager: None,
+            color_manager: None,
 
             pointer: None,
             pointer_confined: false,
@@ -241,6 +257,38 @@ impl WaylandClient {
     /// description). Ownership stays with the client; callers `drain` or inspect.
     pub fn get_output_events(&mut self) -> &mut Vec<wl_output::Event> {
         self.state.output_events.as_mut()
+    }
+
+    /// Stage a parametric image description on window `idx`'s surface through
+    /// `wp_color_management_v1` (taking effect on its next commit). `mastering_primaries`
+    /// sets the target primaries only, leaving the target luminance to its default.
+    pub fn set_image_description(
+        &mut self,
+        idx: usize,
+        tf: wp_color_manager_v1::TransferFunction,
+        primaries: wp_color_manager_v1::Primaries,
+        mastering_primaries: Option<[i32; 8]>,
+    ) {
+        let manager = self
+            .state
+            .color_manager
+            .as_ref()
+            .expect("wp_color_manager_v1");
+        let params = manager.create_parametric_creator(&self.qh, ());
+        params.set_tf_named(tf);
+        params.set_primaries_named(primaries);
+        if let Some(p) = mastering_primaries {
+            params.set_mastering_display_primaries(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+        }
+        let desc = params.create(&self.qh, ());
+        let surface = &self.state.windows[idx].surface;
+        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
+    }
+
+    /// Commit window `idx`'s surface.
+    pub fn commit_window(&self, idx: usize) {
+        self.state.windows[idx].commit();
     }
 
     /// Number of toplevel `configure` events received on the first window.

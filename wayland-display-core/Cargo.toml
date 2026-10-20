@@ -50,7 +50,7 @@ cc = "1"
 [dev-dependencies]
 tracing-subscriber = "0.3.18"
 wayland-client = "0.31.10"
-wayland-protocols = { version = "0.32.8", features = ["client"] }
+wayland-protocols = { version = "0.32.8", features = ["client", "staging"] }
 calloop = { version = "0.14.2", features = ["executor", "futures-io", "signals"] }
 tempfile = "3.20.0"
 test-log = { version = "0.2.18", features = ["trace"] }

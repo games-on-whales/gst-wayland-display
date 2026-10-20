@@ -4,7 +4,9 @@
 //! (printing why) when the matching GPU or encoder element is absent, so a plain
 //! `cargo test` stays green on a machine with no GPU. The harness
 //! (`ci/harness.sh`, phase `gpu`) runs them with `--ignored` on the boxes that
-//! do have GPUs.
+//! do have GPUs. A runner that is meant to have the hardware sets
+//! `GST_WAYLAND_DISPLAY_REQUIRE_GPU=1`, which turns every skip into a failure so a
+//! missing GPU or encoder cannot pass silently.
 //!
 //! What they cover that the unit tests don't:
 //!   * the source negotiates an NV12 modifier the encoder accepts and drives a
@@ -115,7 +117,46 @@ fn run_to_eos(desc: &str) -> Result<(), String> {
 }
 
 macro_rules! skip {
-    ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
+    ($($a:tt)*) => {{
+        let why = format!($($a)*);
+        if std::env::var_os("GST_WAYLAND_DISPLAY_REQUIRE_GPU").is_some() {
+            panic!("required hardware missing: {why}");
+        }
+        eprintln!("skip: {why}");
+        return;
+    }};
+}
+
+/// Run `desc` (whose source is named `src`) to EOS and return the caps the source
+/// negotiated.
+fn negotiated_caps(desc: &str) -> gst::Caps {
+    let pipeline = gst::parse::launch(desc)
+        .expect("parse")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+    let src = pipeline.by_name("src").expect("element named src");
+    pipeline.set_state(gst::State::Playing).expect("Playing");
+    let bus = pipeline.bus().expect("bus");
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
+        match msg.view() {
+            gst::MessageView::Eos(..) => break,
+            gst::MessageView::Error(err) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                panic!("{}: {:?}", err.error(), err.debug());
+            }
+            _ => {}
+        }
+    }
+    let caps = src
+        .static_pad("src")
+        .and_then(|p| p.current_caps())
+        .expect("negotiated caps");
+    let _ = pipeline.set_state(gst::State::Null);
+    caps
+}
+
+fn caps_field(caps: &gst::Caps, field: &str) -> Option<String> {
+    caps.structure(0)?.get::<String>(field).ok()
 }
 
 #[test]
@@ -191,25 +232,127 @@ fn vulkan_encode_to_eos() {
 }
 
 /// Regression for the device-sharing race: forcing `memory:VulkanImage` with **no**
-/// encoder downstream means the source can never absorb a shared `GstVulkanDevice`.
-/// This used to abort the process with a Rust panic in the compositor thread
-/// (`GsVulkanBuf .expect("...no shared GstVulkanDevice?")`). It must now wait for the
-/// device and, when it never arrives, stop with a clean bus error instead of panicking.
+/// encoder downstream used to abort the process with a Rust panic in the compositor thread
+/// (`GsVulkanBuf .expect("...no shared GstVulkanDevice?")`). The source now answers the
+/// device context itself and mints its own device, so it must run to EOS on that device.
 #[test]
 #[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
-fn vulkan_without_encoder_errors_not_panics() {
+fn vulkan_without_encoder_uses_its_own_device() {
     init();
     let Some(node) = any_render_node() else {
         skip!("no render node")
     };
-    let res = run_to_eos(&format!(
+    run_to_eos(&format!(
         "waylanddisplaysrc render-node={node} vulkan=true num-buffers=5 ! \
          video/x-raw(memory:VulkanImage),format=NV12,width=320,height=240 ! fakesink"
+    ))
+    .expect("Vulkan output without an encoder");
+}
+
+/// The NV12 dmabuf converter's caps carry the BT.601 matrix its shader applies, so an HD
+/// stream is not decoded with the BT.709 default.
+#[test]
+#[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
+fn nv12_caps_carry_the_bt601_matrix() {
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    let caps = negotiated_caps(&format!(
+        "waylanddisplaysrc name=src render-node={node} num-buffers=5 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1280,height=720 ! \
+         fakesink"
     ));
-    // A clean bus error (Err) is the pass condition; reaching EOS would be wrong, and a
-    // panic/abort would crash the test binary rather than return here at all.
-    assert!(
-        res.is_err(),
-        "expected a clean error with no encoder downstream, got EOS"
+    let colorimetry: gst_video::VideoColorimetry = caps_field(&caps, "colorimetry")
+        .expect("colorimetry")
+        .parse()
+        .unwrap();
+    assert_eq!(colorimetry.matrix(), gst_video::VideoColorMatrix::Bt601);
+}
+
+/// Static `hdr`: the P010 converter output is tagged BT.2100 PQ with mastering and
+/// content-light-level metadata derived from `hdr-peak-luminance`.
+#[test]
+#[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
+fn p010_hdr_caps_carry_pq_and_metadata() {
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    let caps = negotiated_caps(&format!(
+        "waylanddisplaysrc name=src render-node={node} hdr=true hdr-peak-luminance=600 \
+         num-buffers=5 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1280,height=720 ! \
+         fakesink"
+    ));
+    assert_eq!(
+        caps_field(&caps, "colorimetry").as_deref(),
+        Some("bt2100-pq")
     );
+    assert_eq!(
+        caps_field(&caps, "mastering-display-info").as_deref(),
+        Some("35400:14600:8500:39850:6550:2300:15635:16450:6000000:1")
+    );
+    assert_eq!(
+        caps_field(&caps, "content-light-level").as_deref(),
+        Some("600:240")
+    );
+}
+
+/// dynamic-hdr with no HDR client: the P010 stream starts, and stays, BT.709 without static
+/// metadata, through the dynamic-HDR pipeline set.
+#[test]
+#[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
+fn dynamic_hdr_p010_starts_sdr() {
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    let caps = negotiated_caps(&format!(
+        "waylanddisplaysrc name=src render-node={node} dynamic-hdr=true num-buffers=30 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1280,height=720 ! \
+         fakesink"
+    ));
+    assert_eq!(caps_field(&caps, "colorimetry").as_deref(), Some("bt709"));
+    assert_eq!(caps_field(&caps, "mastering-display-info"), None);
+}
+
+/// P010 `memory:VulkanImage` into `vulkanh265enc` Main-10 (the patched GStreamer), with the
+/// encode-src image created for the H.265 profile.
+#[test]
+#[ignore = "needs vulkanh265enc (patched GStreamer); run via ci/harness.sh gpu"]
+fn vulkan_h265_p010_encode_to_eos() {
+    init();
+    let Some(node) = render_node_for(&["amdgpu", "nvidia"]) else {
+        skip!("no AMD/NVIDIA render node")
+    };
+    if !have("vulkanh265enc") {
+        skip!("no vulkanh265enc (needs the patched GStreamer)");
+    }
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} vulkan=true hdr=true num-buffers=60 ! \
+         video/x-raw(memory:VulkanImage),format=P010_10LE,width=1280,height=720,framerate=60/1 \
+         ! vulkanh265enc ! fakesink"
+    ))
+    .expect("Vulkan H.265 Main-10 encode");
+}
+
+/// NV12 `memory:VulkanImage` into `vulkanh265enc` Main (8-bit): the encode-src image must
+/// carry the H.265 profile, not the H.264 one.
+#[test]
+#[ignore = "needs vulkanh265enc (patched GStreamer); run via ci/harness.sh gpu"]
+fn vulkan_h265_nv12_encode_to_eos() {
+    init();
+    let Some(node) = render_node_for(&["amdgpu", "nvidia"]) else {
+        skip!("no AMD/NVIDIA render node")
+    };
+    if !have("vulkanh265enc") {
+        skip!("no vulkanh265enc (needs the patched GStreamer)");
+    }
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=60 ! \
+         video/x-raw(memory:VulkanImage),format=NV12,width=1280,height=720,framerate=60/1 \
+         ! vulkanh265enc ! fakesink"
+    ))
+    .expect("Vulkan H.265 Main encode");
 }

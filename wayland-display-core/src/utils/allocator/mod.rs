@@ -286,13 +286,13 @@ pub struct GsVulkanBuf {
 }
 
 impl GsVulkanBuf {
-    /// `profile` is the negotiated H.264 profile (for the encode-src image's video profile).
-    /// Returns `None` if no shared `GstVulkanDevice` has been received yet (caller then
-    /// falls back to the dmabuf path).
+    /// `codec` / `profile` are the consuming encoder's (for the encode-src image's video
+    /// profile). Returns `None` if no usable shared `GstVulkanDevice` is available.
     pub fn new(
         renderer: &mut GlesRenderer,
         render_node: DrmNode,
         video_info: VideoInfo,
+        codec: crate::utils::video_info::VulkanCodec,
         profile: String,
         vulkan_share: &crate::utils::vulkan_share::VulkanShare,
     ) -> Option<Self> {
@@ -349,7 +349,7 @@ impl GsVulkanBuf {
         // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
-            dev, raw, &out_caps, &profile, w, h, fmt, bt2020, fp16_input, options,
+            dev, raw, &out_caps, codec, &profile, w, h, fmt, bt2020, fp16_input, options,
         )?;
         Some(GsVulkanBuf {
             rgba,

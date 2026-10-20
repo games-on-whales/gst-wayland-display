@@ -23,6 +23,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::utils::video_info::VulkanCodec;
 use crate::utils::vulkan_nv12::PixFmt;
 use ash::vk;
 use gst::glib::translate::{ToGlibPtr, from_glib_full};
@@ -35,13 +36,40 @@ use std::sync::{Arc, Condvar, Mutex};
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
 // values (stable, and avoids depending on the named ash constants existing).
 const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR: u32 = 0x0000_2000;
-const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
+
+/// Device extensions the converter cannot run without: importing the compositor's RGBA
+/// dmabuf. A device lacking any of them is refused instead of reaching an ash stub.
+pub const REQUIRED_DEVICE_EXTENSIONS: [&str; 3] = [
+    "VK_KHR_external_memory_fd",
+    "VK_EXT_external_memory_dma_buf",
+    "VK_EXT_image_drm_format_modifier",
+];
+/// Enabled when available: queue-family-foreign gives the dmabuf acquire/release barriers
+/// their proper source family (QUEUE_FAMILY_EXTERNAL is used otherwise).
+const OPTIONAL_DEVICE_EXTENSIONS: [&str; 2] = [
+    "VK_KHR_external_semaphore_fd",
+    "VK_EXT_queue_family_foreign",
+];
+
+// VK_KHR_video_encode_av1 postdates ash 0.38; values from vulkan_core.h.
+const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR: i32 = 1_000_513_005;
+const VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_KHR: u32 = 0x0004_0000;
+const STD_VIDEO_AV1_PROFILE_MAIN: u32 = 0;
+
+/// `VkVideoEncodeAV1ProfileInfoKHR`.
+#[repr(C)]
+struct VideoEncodeAv1ProfileInfo {
+    s_type: vk::StructureType,
+    p_next: *const std::ffi::c_void,
+    std_profile: u32,
+}
 
 unsafe extern "C" {
     fn wayland_display_vk_instance(device: *mut gstvk::GstVulkanDevice) -> vk::Instance;
     fn wayland_display_vk_instance_handle(instance: *mut gstvk::GstVulkanInstance) -> vk::Instance;
     fn wayland_display_vk_device(device: *mut gstvk::GstVulkanDevice) -> vk::Device;
     fn wayland_display_vk_queue_family(queue: *mut gstvk::GstVulkanQueue) -> u32;
+    fn wayland_display_vk_queue_handle(queue: *mut gstvk::GstVulkanQueue) -> vk::Queue;
     fn wayland_display_vk_image(memory: *mut gst::ffi::GstMemory) -> vk::Image;
     fn wayland_display_vk_linear_layout(
         memory: *mut gst::ffi::GstMemory,
@@ -51,14 +79,51 @@ unsafe extern "C" {
     fn wayland_display_vk_prepare_encode_image(memory: *mut gst::ffi::GstMemory);
 }
 
-/// Raw Vulkan handles + queue family pulled out of the shared `GstVulkanDevice`, ready to
-/// drive an `ash`-loaded device.
-#[derive(Clone, Copy, Debug)]
+/// Raw Vulkan handles + queue pulled out of the shared `GstVulkanDevice`, ready to drive an
+/// `ash`-loaded device.
+#[derive(Clone, Debug)]
 pub struct RawVk {
     pub instance: vk::Instance,
     pub physical: vk::PhysicalDevice,
     pub device: vk::Device,
     pub gfx_queue_family: u32,
+    /// gst's graphics queue. Submits to its `VkQueue` must hold its submit lock, since the
+    /// encoders on the same device submit to it too.
+    pub gfx_queue: VulkanQueue,
+    /// The family gst opens for video encode, if the device has one.
+    pub encode_queue_family: Option<u32>,
+    /// Whether VK_EXT_queue_family_foreign is enabled on the device.
+    pub queue_family_foreign: bool,
+}
+
+impl RawVk {
+    pub fn gfx_vk_queue(&self) -> vk::Queue {
+        unsafe { wayland_display_vk_queue_handle(self.gfx_queue.as_ptr()) }
+    }
+}
+
+/// Holds a `GstVulkanQueue`'s submit lock for its lifetime.
+pub struct QueueSubmitGuard<'a>(&'a VulkanQueue);
+
+impl<'a> QueueSubmitGuard<'a> {
+    pub fn new(queue: &'a VulkanQueue) -> Self {
+        unsafe { gstvk::gst_vulkan_queue_submit_lock(queue.as_ptr()) };
+        QueueSubmitGuard(queue)
+    }
+}
+
+impl Drop for QueueSubmitGuard<'_> {
+    fn drop(&mut self) {
+        unsafe { gstvk::gst_vulkan_queue_submit_unlock(self.0.as_ptr()) };
+    }
+}
+
+/// The required converter extensions `device` does not have enabled.
+pub fn missing_extensions(device: &VulkanDevice) -> Vec<&'static str> {
+    REQUIRED_DEVICE_EXTENSIONS
+        .into_iter()
+        .filter(|ext| !device.is_extension_enabled(ext))
+        .collect()
 }
 
 /// Per-`waylanddisplaysrc`-element owner of the Vulkan objects the encode path shares.
@@ -91,6 +156,10 @@ pub struct VulkanShare {
     /// when it builds its output ring. Replaces the process-global `device_slot()`.
     device: Mutex<Option<VulkanDevice>>,
     device_ready: Condvar,
+    /// Set once the Vulkan output cannot work for this element (a device offered without
+    /// the converter's extensions, or a downstream encoder on another device); the element
+    /// then stops offering `memory:VulkanImage` and negotiates dmabuf/RGBA instead.
+    refused: std::sync::atomic::AtomicBool,
 }
 
 impl VulkanShare {
@@ -103,6 +172,7 @@ impl VulkanShare {
             options: Mutex::new(Default::default()),
             device: Mutex::new(None),
             device_ready: Condvar::new(),
+            refused: Default::default(),
         })
     }
 
@@ -117,6 +187,16 @@ impl VulkanShare {
             return false;
         }
         let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
+        let missing = missing_extensions(&device);
+        if !missing.is_empty() {
+            tracing::warn!(
+                "vulkan_share: refusing shared GstVulkanDevice {dev_ptr:?} without {missing:?}; \
+                 memory:VulkanImage output is not offered"
+            );
+            self.refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let mut slot = self.device.lock().unwrap();
         // Keep the device this element already has. GstBin fans a have-context message to
         // EVERY child, so with two waylanddisplaysrc in one bin the second element's encoder
@@ -161,6 +241,48 @@ impl VulkanShare {
     /// This element's shared device, if one has been created (or absorbed).
     pub fn shared_device(&self) -> Option<VulkanDevice> {
         self.device.lock().unwrap().clone()
+    }
+
+    /// Whether `memory:VulkanImage` output may still be offered; see `refused`.
+    pub fn usable(&self) -> bool {
+        !self.refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check the device a directly linked downstream element answers a
+    /// `gst.vulkan.device` context query with. A device other than ours means producer and
+    /// encoder would run on different `VkDevice`s, so the Vulkan output is refused. No
+    /// answer (e.g. behind interpipe) proves nothing and is accepted.
+    pub fn check_peer_device(&self, src_pad: &gst::Pad) -> bool {
+        let Some(ours) = self.shared_device() else {
+            return self.usable();
+        };
+        let mut query = gst::query::Context::new("gst.vulkan.device");
+        if !src_pad.peer_query(&mut query) {
+            return self.usable();
+        }
+        let Some(context) = query.context_owned() else {
+            return self.usable();
+        };
+        let mut dev_ptr: *mut gstvk::GstVulkanDevice = std::ptr::null_mut();
+        let got =
+            unsafe { gstvk::gst_context_get_vulkan_device(context.to_glib_none().0, &mut dev_ptr) };
+        if got == gst::glib::ffi::GFALSE || dev_ptr.is_null() {
+            return self.usable();
+        }
+        let theirs: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
+        if theirs.as_ptr() != ours.as_ptr() {
+            if self.usable() {
+                tracing::warn!(
+                    "vulkan_share: downstream encoder is on GstVulkanDevice {:?}, not ours \
+                     ({:?}); falling back to dmabuf/RGBA output",
+                    theirs.as_ptr(),
+                    ours.as_ptr()
+                );
+            }
+            self.refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.usable()
     }
 }
 
@@ -305,13 +427,17 @@ impl VulkanShare {
         };
         let physical = VulkanPhysicalDevice::new(&instance, index);
         let device = VulkanDevice::new(&physical);
-        for ext in [
-            "VK_KHR_external_memory_fd",
-            "VK_EXT_external_memory_dma_buf",
-            "VK_EXT_image_drm_format_modifier",
-            "VK_KHR_external_semaphore_fd",
-        ] {
-            device.enable_extension(ext);
+        // enable_extension() fails when the physical device lacks the extension.
+        for ext in REQUIRED_DEVICE_EXTENSIONS {
+            if !device.enable_extension(ext) {
+                tracing::error!("vulkan_share: physical device {index} lacks {ext}");
+                return None;
+            }
+        }
+        for ext in OPTIONAL_DEVICE_EXTENSIONS {
+            if !device.enable_extension(ext) {
+                tracing::info!("vulkan_share: optional {ext} unavailable");
+            }
         }
         if let Err(e) = device.open() {
             tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
@@ -367,8 +493,8 @@ impl VulkanShare {
     }
 }
 
-/// Extract the raw `VkInstance`/`VkPhysicalDevice`/`VkDevice` + a graphics-capable queue
-/// family from the (shared) `GstVulkanDevice`.
+/// Extract the raw `VkInstance`/`VkPhysicalDevice`/`VkDevice`, gst's graphics queue and the
+/// video-encode queue family from the (shared) `GstVulkanDevice`.
 pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
     let dev_ptr: *mut gstvk::GstVulkanDevice = device.to_glib_none().0;
     if dev_ptr.is_null() {
@@ -384,80 +510,100 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
         if vk_physical == vk::PhysicalDevice::null() {
             return None;
         }
-        // `gst_vulkan_device_select_queue()` is transfer-full: take ownership of the
-        // returned GstVulkanQueue so it is not leaked once the family index is read.
+        // `gst_vulkan_device_select_queue()` is transfer-full.
         let gfx_ptr =
             gstvk::gst_vulkan_device_select_queue(dev_ptr, vk::QueueFlags::GRAPHICS.as_raw());
         if gfx_ptr.is_null() {
             return None;
         }
+        let gfx_queue: VulkanQueue = from_glib_full(gfx_ptr);
         let gfx_queue_family = wayland_display_vk_queue_family(gfx_ptr);
-        drop(from_glib_full::<_, VulkanQueue>(gfx_ptr));
+        let enc_ptr =
+            gstvk::gst_vulkan_device_select_queue(dev_ptr, VK_QUEUE_VIDEO_ENCODE_BIT_KHR.as_raw());
+        let encode_queue_family = (!enc_ptr.is_null()).then(|| {
+            let family = wayland_display_vk_queue_family(enc_ptr);
+            drop(from_glib_full::<_, VulkanQueue>(enc_ptr));
+            family
+        });
         Some(RawVk {
             instance: vk_instance,
             physical: vk_physical,
             device: vk_device,
             gfx_queue_family,
+            gfx_queue,
+            encode_queue_family,
+            queue_family_foreign: device.is_extension_enabled("VK_EXT_queue_family_foreign"),
         })
     }
 }
 
-/// Allocate ONE encode-src NV12 image as a `GstVulkanImageMemory`, built directly via
+/// Allocate ONE encode-src NV12/P010 image as a `GstVulkanImageMemory`, built directly via
 /// `gst_vulkan_image_memory_alloc_with_image_info` so we control the `VkImageCreateInfo`
-/// (usage `TRANSFER_DST | VIDEO_ENCODE_SRC` + the H.264 `VkVideoProfileListInfoKHR` chained
-/// in). This bypasses `GstVulkanImageBufferPool`'s generic-format-feature check, which
+/// (usage `TRANSFER_DST | VIDEO_ENCODE_SRC` + the encoder's `VkVideoProfileListInfoKHR`
+/// chained in). This bypasses `GstVulkanImageBufferPool`'s generic-format-feature check, which
 /// rejects NV12 on NVIDIA because the encode-input feature is only reported via the
-/// profile-specific query. Returns a `GstBuffer` holding the single image memory + VideoMeta.
+/// profile-specific query. The image is shared CONCURRENTly between `queue_families` (our
+/// graphics family and the encoder's video-encode family), so no ownership transfer is needed
+/// between our copy and the encode read. Returns a `GstBuffer` holding the single image
+/// memory + VideoMeta.
+#[allow(clippy::too_many_arguments)]
 pub fn alloc_encode_src_buffer(
     device: &VulkanDevice,
     width: u32,
     height: u32,
+    codec: VulkanCodec,
     profile: &str,
     fmt: PixFmt,
     linear_encsrc: bool,
+    queue_families: &[u32],
 ) -> Option<gst::Buffer> {
-    if fmt == PixFmt::P010 && profile != "main-10" {
-        tracing::error!("P010 encode input requires the H.265 main-10 profile");
+    if !codec.accepts(fmt.gst_format(), profile) {
+        tracing::error!("Vulkan {codec:?} profile {profile} cannot encode {fmt:?}");
         return None;
     }
-    let std_h264_idc = match profile {
-        "high" | "constrained-high" | "progressive-high" => {
-            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
-        }
-        "main" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
-        "baseline" | "constrained-baseline" => {
-            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE
-        }
-        "main-10" if fmt == PixFmt::P010 => {
-            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE
-        }
-        _ => {
-            tracing::error!("Unsupported Vulkan encode profile: {profile}");
-            return None;
-        }
+    let bit_depth = match fmt {
+        PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+        PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
     };
     unsafe {
-        // Profile chain (matches what the encoder's pool builds from caps): the codec struct
-        // chained off the VkVideoProfileInfoKHR; usage info omitted. P010 -> H.265 Main-10
-        // 10-bit (for vulkanh265enc); NV12 -> H.264 8-bit (the default Vulkan-encode path).
+        // Profile chain (matches what the encoder builds from caps): the codec struct chained
+        // off the VkVideoProfileInfoKHR; usage info omitted.
+        let std_h264_idc = match profile {
+            "high" | "constrained-high" | "progressive-high" => {
+                vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+            }
+            "main" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
+            _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
+        };
         let mut h264 = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
-        let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default()
-            .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10);
-        let bit_depth = match fmt {
-            PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
-            PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+        let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(match fmt {
+            PixFmt::P010 => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10,
+            PixFmt::Nv12 => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
+        });
+        let av1 = VideoEncodeAv1ProfileInfo {
+            s_type: vk::StructureType::from_raw(
+                VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
+            ),
+            p_next: std::ptr::null(),
+            std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
         };
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(bit_depth)
             .chroma_bit_depth(bit_depth);
-        profile_info = match fmt {
-            PixFmt::P010 => profile_info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-                .push_next(&mut h265),
-            PixFmt::Nv12 => profile_info
+        profile_info = match codec {
+            VulkanCodec::H264 => profile_info
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
                 .push_next(&mut h264),
+            VulkanCodec::H265 => profile_info
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                .push_next(&mut h265),
+            VulkanCodec::Av1 => {
+                profile_info.p_next = &av1 as *const VideoEncodeAv1ProfileInfo as *const _;
+                profile_info.video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
+                    VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_KHR,
+                ))
+            }
         };
         let profiles = [profile_info];
         let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
@@ -498,6 +644,15 @@ pub fn alloc_encode_src_buffer(
             )
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut profile_list);
+        // EXCLUSIVE would need a graphics -> video-encode ownership transfer that the encoder
+        // (whose barriers use QUEUE_FAMILY_IGNORED) never performs.
+        let image_info = if queue_families.len() > 1 {
+            image_info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(queue_families)
+        } else {
+            image_info
+        };
 
         let mut mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
             device.to_glib_none().0,

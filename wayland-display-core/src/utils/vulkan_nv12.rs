@@ -108,15 +108,15 @@ const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const RING: usize = 4;
 
 /// Optional path for a one-shot debug dump of the converter's NV12 output (the LINEAR
-/// compute scratch, *before* the tiled encode-src copy) as raw NV12. Set
-/// `WOLF_VULKAN_DUMP=<file>` to capture one frame -- if it's clean, the RX 9070 green-bar/
-/// jump corruption is introduced downstream (the tiled copy or the encoder), not our
-/// conversion. Read once; off (zero overhead) when unset.
+/// compute scratch, *before* the tiled copy) as raw NV12. Set
+/// `GST_WAYLAND_DISPLAY_DUMP=<file>` to capture one frame -- if it's clean, the RX 9070
+/// green-bar/jump corruption is introduced downstream (the tiled copy or the encoder), not
+/// our conversion. Read once; off (zero overhead) when unset.
 fn dump_path() -> Option<&'static str> {
     use std::sync::OnceLock;
     static P: OnceLock<Option<String>> = OnceLock::new();
     P.get_or_init(|| {
-        std::env::var("WOLF_VULKAN_DUMP")
+        std::env::var("GST_WAYLAND_DISPLAY_DUMP")
             .ok()
             .filter(|s| !s.is_empty())
     })
@@ -124,14 +124,15 @@ fn dump_path() -> Option<&'static str> {
 }
 static DUMP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Which converted frame to capture when `WOLF_VULKAN_DUMP` is set (default 20, a few frames
-/// in so the scene has settled). Override with `WOLF_VULKAN_DUMP_FRAME` to wait longer -- e.g.
+/// Which converted frame to capture when `GST_WAYLAND_DISPLAY_DUMP` is set (default 20, a few
+/// frames in so the scene has settled). Override with `GST_WAYLAND_DISPLAY_DUMP_FRAME` to wait
+/// longer -- e.g.
 /// for a client to connect and paint a known colour before the dump fires. Read once.
 fn dump_frame_target() -> u64 {
     use std::sync::OnceLock;
     static F: OnceLock<u64> = OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("WOLF_VULKAN_DUMP_FRAME")
+        std::env::var("GST_WAYLAND_DISPLAY_DUMP_FRAME")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(20)
@@ -184,7 +185,7 @@ impl PixFmt {
             PixFmt::P010 => vk::Format::R16G16_UNORM,
         }
     }
-    fn gst_format(self) -> VideoFormat {
+    pub(crate) fn gst_format(self) -> VideoFormat {
         match self {
             PixFmt::Nv12 => VideoFormat::Nv12,
             PixFmt::P010 => VideoFormat::P01010le,
@@ -398,6 +399,14 @@ pub struct VulkanNv12 {
     instance: ash::Instance,
     device: ash::Device,
     queue: vk::Queue,
+    /// gst's `GstVulkanQueue` behind `queue` on the shared-device path: every submit holds
+    /// its submit lock, since the encoders on that device submit to the same `VkQueue`.
+    gst_queue: Option<gstreamer_vulkan::VulkanQueue>,
+    /// Our queue family, the destination of dmabuf acquires and source of releases.
+    qfi: u32,
+    /// The family on the other side of those transfers: QUEUE_FAMILY_FOREIGN_EXT when the
+    /// device has VK_EXT_queue_family_foreign, else QUEUE_FAMILY_EXTERNAL.
+    foreign_qf: u32,
     cmd_pool: vk::CommandPool,
     pipeline: vk::Pipeline,
     /// Per-frame pipelines for dynamic HDR (fp16 P010 path only); `convert` picks one from the
@@ -589,17 +598,40 @@ impl VulkanNv12 {
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qfi)
             .queue_priorities(&prio)];
-        let mut exts = vec![
-            ash::khr::external_memory_fd::NAME.as_ptr(),
-            ash::ext::external_memory_dma_buf::NAME.as_ptr(),
-            ash::ext::image_drm_format_modifier::NAME.as_ptr(),
-        ];
+        // Only enable what the device supports: required extensions fail the converter with
+        // a clear error, optional ones degrade (blocking fence wait, EXTERNAL family).
+        let available: Vec<std::ffi::CString> = instance
+            .enumerate_device_extension_properties(pd)?
+            .iter()
+            .filter_map(|e| e.extension_name_as_c_str().ok().map(|n| n.to_owned()))
+            .collect();
+        let has = |name: &std::ffi::CStr| available.iter().any(|a| a.as_c_str() == name);
+        let mut exts = Vec::new();
+        for name in [
+            ash::khr::external_memory_fd::NAME,
+            ash::ext::external_memory_dma_buf::NAME,
+            ash::ext::image_drm_format_modifier::NAME,
+        ] {
+            if !has(name) {
+                return Err(format!("Vulkan device lacks {name:?}").into());
+            }
+            exts.push(name.as_ptr());
+        }
+        // Needed to export the submit's signal as a SYNC_FD we attach to the dmabuf; without
+        // it the converter blocks on its fence like the Nvidia path.
+        let implicit_sync = implicit_sync && has(ash::khr::external_semaphore_fd::NAME);
         if implicit_sync {
-            // Needed to export the submit's signal as a SYNC_FD we attach to the dmabuf.
             exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
         }
+        let queue_family_foreign = has(ash::ext::queue_family_foreign::NAME);
+        if queue_family_foreign {
+            exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());
+        }
+        let mut supported_ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_ycbcr);
+        instance.get_physical_device_features2(pd, &mut features);
         let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
-            .sampler_ycbcr_conversion(true);
+            .sampler_ycbcr_conversion(supported_ycbcr.sampler_ycbcr_conversion != 0);
         let device = instance.create_device(
             pd,
             &vk::DeviceCreateInfo::default()
@@ -716,6 +748,13 @@ impl VulkanNv12 {
             instance,
             device,
             queue,
+            gst_queue: None,
+            qfi,
+            foreign_qf: if queue_family_foreign {
+                vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                vk::QUEUE_FAMILY_EXTERNAL
+            },
             cmd_pool,
             pipeline,
             dynamic,
@@ -752,6 +791,7 @@ impl VulkanNv12 {
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
         nv12_caps: &gst::Caps,
+        codec: crate::utils::video_info::VulkanCodec,
         profile: &str,
         width: u32,
         height: u32,
@@ -762,7 +802,7 @@ impl VulkanNv12 {
     ) -> Option<Self> {
         match unsafe {
             Self::new_on_shared_inner(
-                device_gst, raw, nv12_caps, profile, width, height, fmt, bt2020, fp16_input,
+                device_gst, raw, nv12_caps, codec, profile, width, height, fmt, bt2020, fp16_input,
                 options,
             )
         } {
@@ -779,6 +819,7 @@ impl VulkanNv12 {
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
         _nv12_caps: &gst::Caps,
+        codec: crate::utils::video_info::VulkanCodec,
         profile: &str,
         width: u32,
         height: u32,
@@ -787,11 +828,24 @@ impl VulkanNv12 {
         fp16_input: bool,
         options: ConversionOptions,
     ) -> Result<Self, Err> {
-        // Drive ash on the encoder's existing instance/device (do NOT create our own).
+        // An absorbed device may lack the import extensions; ash would then call stubs.
+        let missing = crate::utils::vulkan_share::missing_extensions(&device_gst);
+        if !missing.is_empty() {
+            return Err(format!("shared GstVulkanDevice lacks {missing:?}").into());
+        }
+        // Drive ash on the encoder's existing instance/device (do NOT create our own), and
+        // submit to gst's own graphics queue under its submit lock.
         let entry = ash::Entry::load()?;
         let instance = ash::Instance::load(entry.static_fn(), raw.instance);
         let device = ash::Device::load(instance.fp_v1_0(), raw.device);
-        let queue = device.get_device_queue(raw.gfx_queue_family, 0);
+        let queue = raw.gfx_vk_queue();
+        let mut queue_families = vec![raw.gfx_queue_family];
+        if let Some(enc) = raw
+            .encode_queue_family
+            .filter(|f| *f != raw.gfx_queue_family)
+        {
+            queue_families.push(enc);
+        }
         let memp = instance.get_physical_device_memory_properties(raw.physical);
 
         // ---- compute pipeline(s) (same as the dmabuf path, on the shared device) ----
@@ -843,7 +897,9 @@ impl VulkanNv12 {
                 &device,
                 &memp,
                 &device_gst,
+                codec,
                 profile,
+                &queue_families,
                 desc_pool,
                 desc_layout,
                 cmd_pool,
@@ -859,6 +915,13 @@ impl VulkanNv12 {
             instance,
             device,
             queue,
+            qfi: raw.gfx_queue_family,
+            foreign_qf: if raw.queue_family_foreign {
+                vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                vk::QUEUE_FAMILY_EXTERNAL
+            },
+            gst_queue: Some(raw.gfx_queue),
             cmd_pool,
             pipeline,
             dynamic,
@@ -897,57 +960,52 @@ impl VulkanNv12 {
         let fd = rgba.handles().next().ok_or("no fd")?.as_fd().as_raw_fd();
         let key = dma_buf_identity(fd)?;
 
-        // pick the next export ring slot and reclaim its previous (RING-frames-old) work
-        let idx = self.next;
-        self.next = (self.next + 1) % self.outputs.len();
+        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
+        // downstream encoders at once (interpipe delivers it to every consumer). Our own
+        // graphics fence only proves *our* last write to a slot finished -- it says nothing
+        // about the consumers' encode *reads*, which run on the encode queue with no shared
+        // sync to us. Overwriting a slot's image while an encode still reads it is a GPU data
+        // hazard that wedges the encoder, so only a slot every consumer has released (its
+        // buffer writable again, refcount back to 1) may be reused. Take the next free slot in
+        // ring order; if none is free, drop this frame and re-emit the last completed output
+        // (`to_gst_buffer` returns `cur`) rather than block the compositor thread waiting.
+        let idx = if self.encode_src {
+            let n = self.outputs.len();
+            let free = (0..n)
+                .map(|i| (self.next + i) % n)
+                .find(|&i| self.outputs[i].buffer.get_mut().is_some());
+            match free {
+                Some(i) => i,
+                None if !self.have_output => {
+                    return Err(
+                        "VulkanNv12: encode-src ring busy before first completed frame".into(),
+                    );
+                }
+                None => {
+                    self.busy_drops = self.busy_drops.saturating_add(1);
+                    if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
+                        tracing::warn!(
+                            busy_drops = self.busy_drops,
+                            "VulkanNv12: every encode-src slot is still referenced; dropping new frame, re-emitting previous output"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        } else {
+            self.next
+        };
+        self.next = (idx + 1) % self.outputs.len();
+        // Reclaim the slot's previous (RING-frames-old) work. The fence was signalled long
+        // ago in steady state, so this wait is a no-op that lets us recycle the cmd buffer.
         if self.outputs[idx].in_flight {
-            // This fence was signalled RING frames ago, so this is a no-op wait in steady
-            // state -- it just lets us safely recycle the slot's cmd buffer.
             self.device
                 .wait_for_fences(&[self.outputs[idx].fence], true, u64::MAX)?;
             self.device.reset_fences(&[self.outputs[idx].fence])?;
             self.outputs[idx].in_flight = false;
         }
-
-        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
-        // downstream encoders at once (interpipe delivers it to every consumer). Our own
-        // graphics fence above only proves *our* last write to this slot finished -- it says
-        // nothing about the consumers' encode *reads*, which run on the encode queue with no
-        // shared sync to us. Overwriting the slot's image while an encode still reads it is a
-        // GPU data hazard that wedges the encoder. Block until every consumer has dropped its
-        // ref (the buffer is writable again, refcount back to 1) before reusing the slot.
-        if self.encode_src {
-            let mut waited = 0u32;
-            while self.outputs[idx].buffer.get_mut().is_none() {
-                // ~1s cap so a paused/stalled consumer can't deadlock the producer forever.
-                if waited >= 10_000 {
-                    // Never overwrite a slot the encoder still references: that is exactly
-                    // the GPU data hazard this gate exists to prevent, and at RING=1 (one
-                    // slot) "reuse anyway" writes the image the encoder is reading. Drop the
-                    // freshly rendered frame instead and re-emit the last completed output;
-                    // to_gst_buffer returns `cur`, which this early return leaves unchanged.
-                    if !self.have_output {
-                        return Err(
-                            "VulkanNv12: encode-src ring busy before first completed frame".into(),
-                        );
-                    }
-                    self.busy_drops = self.busy_drops.saturating_add(1);
-                    if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
-                        tracing::warn!(
-                            slot = idx,
-                            busy_drops = self.busy_drops,
-                            "VulkanNv12: encode-src slot still referenced after 1s; dropping new frame, re-emitting previous output"
-                        );
-                    }
-                    return Ok(());
-                }
-                std::thread::sleep(std::time::Duration::from_micros(100));
-                waited += 1;
-            }
-            // No timestamp reset on the parent here: to_gst_buffer hands downstream a fresh
-            // child header whose PTS is already NONE, and nothing stamps the parent header
-            // any more. The slot's own timestamps are never read.
-        }
+        // No timestamp reset on the parent: to_gst_buffer hands downstream a fresh child
+        // header whose PTS is already NONE, and nothing stamps the parent header.
 
         // Ensure this slot's cached RGBA import matches the current dmabuf. Built once per
         // slot (the slot is idle here -- we waited its fence above -- so freeing/recreating
@@ -1001,18 +1059,28 @@ impl VulkanNv12 {
         self.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
 
-        // Each import is a distinct image per slot. GLES owns the external writes;
-        // discard this slot's previous Vulkan layout with UNDEFINED on every reuse
-        // rather than assuming a layout shared with another slot or the GLES producer.
-        // compute: RGBA(src) -> NV12 compute_target (storage)
+        // The RGBA import is written by GLES outside Vulkan: acquire it from the foreign
+        // family in GENERAL, the layout it is released back in after every frame. An
+        // UNDEFINED old layout would let the driver discard the contents (and DCC/metadata
+        // of a compressed modifier) before we sample them.
+        let (qfi, foreign) = (self.qfi, self.foreign_qf);
         let to_read = img_barrier(
             import_img,
             vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::AccessFlags::empty(),
             vk::AccessFlags::SHADER_READ,
-        );
+        )
+        .src_queue_family_index(foreign)
+        .dst_queue_family_index(qfi);
+        // The compute target is fully overwritten, so its old contents may be discarded. On
+        // the direct path it is the exported image: acquire it from the consumer.
+        let (t_src, t_dst) = if direct {
+            (foreign, qfi)
+        } else {
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+        };
         let t_y = img_barrier(
             compute_target,
             vk::ImageAspectFlags::PLANE_0,
@@ -1020,7 +1088,9 @@ impl VulkanNv12 {
             vk::ImageLayout::GENERAL,
             vk::AccessFlags::empty(),
             vk::AccessFlags::SHADER_WRITE,
-        );
+        )
+        .src_queue_family_index(t_src)
+        .dst_queue_family_index(t_dst);
         let t_uv = img_barrier(
             compute_target,
             vk::ImageAspectFlags::PLANE_1,
@@ -1028,7 +1098,9 @@ impl VulkanNv12 {
             vk::ImageLayout::GENERAL,
             vk::AccessFlags::empty(),
             vk::AccessFlags::SHADER_WRITE,
-        );
+        )
+        .src_queue_family_index(t_src)
+        .dst_queue_family_index(t_dst);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1059,9 +1131,20 @@ impl VulkanNv12 {
         self.device
             .cmd_dispatch(cmd, (self.width / 2 + 7) / 8, (self.height / 2 + 7) / 8, 1);
 
+        // Hand the RGBA import back to GLES once the compute has read it.
+        let release_import = img_barrier(
+            import_img,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::empty(),
+        )
+        .src_queue_family_index(qfi)
+        .dst_queue_family_index(foreign);
         if direct {
             // LINEAR direct: the compute output *is* the export image. Flush the shader
-            // writes so the dmabuf consumer sees them (ordering to the consumer is the
+            // writes and release it to the dmabuf consumer (ordering to the consumer is the
             // implicit dma-buf write-fence / the CPU wait below).
             let f_y = img_barrier(
                 out_img,
@@ -1070,7 +1153,9 @@ impl VulkanNv12 {
                 vk::ImageLayout::GENERAL,
                 vk::AccessFlags::SHADER_WRITE,
                 vk::AccessFlags::empty(),
-            );
+            )
+            .src_queue_family_index(qfi)
+            .dst_queue_family_index(foreign);
             let f_uv = img_barrier(
                 out_img,
                 vk::ImageAspectFlags::PLANE_1,
@@ -1078,7 +1163,9 @@ impl VulkanNv12 {
                 vk::ImageLayout::GENERAL,
                 vk::AccessFlags::SHADER_WRITE,
                 vk::AccessFlags::empty(),
-            );
+            )
+            .src_queue_family_index(qfi)
+            .dst_queue_family_index(foreign);
             self.device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1086,10 +1173,17 @@ impl VulkanNv12 {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[f_y, f_uv],
+                &[f_y, f_uv, release_import],
             );
         } else {
             // Tiled/DCC: copy NV12 scratch -> NV12 export slot (radv fills DCC metadata).
+            // A dmabuf export slot is acquired from its consumer; the encode-src image is on
+            // our device, shared CONCURRENTly with the encode queue, so it needs no transfer.
+            let (o_src, o_dst) = if self.encode_src {
+                (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+            } else {
+                (foreign, qfi)
+            };
             let s_y_src = img_barrier(
                 compute_target,
                 vk::ImageAspectFlags::PLANE_0,
@@ -1113,7 +1207,9 @@ impl VulkanNv12 {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::AccessFlags::empty(),
                 vk::AccessFlags::TRANSFER_WRITE,
-            );
+            )
+            .src_queue_family_index(o_src)
+            .dst_queue_family_index(o_dst);
             let o_uv = img_barrier(
                 out_img,
                 vk::ImageAspectFlags::PLANE_1,
@@ -1121,7 +1217,9 @@ impl VulkanNv12 {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::AccessFlags::empty(),
                 vk::AccessFlags::TRANSFER_WRITE,
-            );
+            )
+            .src_queue_family_index(o_src)
+            .dst_queue_family_index(o_dst);
             self.device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1129,7 +1227,7 @@ impl VulkanNv12 {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[s_y_src, s_uv_src, o_y, o_uv],
+                &[s_y_src, s_uv_src, o_y, o_uv, release_import],
             );
             let regions = [
                 vk::ImageCopy::default()
@@ -1158,37 +1256,47 @@ impl VulkanNv12 {
                 &regions,
             );
 
-            if self.encode_src {
-                // Hand the encoder its input already in VIDEO_ENCODE_SRC_KHR. The encode
-                // queue read is ordered after this submit by the slot fence wait below
-                // (same device as the encoder).
-                let enc_layout = vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR);
-                let e_y = img_barrier(
-                    out_img,
-                    vk::ImageAspectFlags::PLANE_0,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    enc_layout,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::empty(),
-                );
-                let e_uv = img_barrier(
-                    out_img,
-                    vk::ImageAspectFlags::PLANE_1,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    enc_layout,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::empty(),
-                );
-                self.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[e_y, e_uv],
-                );
-            }
+            // Hand the encoder its input already in VIDEO_ENCODE_SRC_KHR (ordered after this
+            // submit by the slot fence wait below, same device), or release the dmabuf export
+            // slot to its consumer in GENERAL.
+            let (final_layout, r_src, r_dst) = if self.encode_src {
+                (
+                    vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR),
+                    vk::QUEUE_FAMILY_IGNORED,
+                    vk::QUEUE_FAMILY_IGNORED,
+                )
+            } else {
+                (vk::ImageLayout::GENERAL, qfi, foreign)
+            };
+            let e_y = img_barrier(
+                out_img,
+                vk::ImageAspectFlags::PLANE_0,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                final_layout,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            )
+            .src_queue_family_index(r_src)
+            .dst_queue_family_index(r_dst);
+            let e_uv = img_barrier(
+                out_img,
+                vk::ImageAspectFlags::PLANE_1,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                final_layout,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            )
+            .src_queue_family_index(r_src)
+            .dst_queue_family_index(r_dst);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[e_y, e_uv],
+            );
         }
 
         self.device.end_command_buffer(cmd)?;
@@ -1198,7 +1306,7 @@ impl VulkanNv12 {
         if self.implicit_sync {
             submit = submit.signal_semaphores(&sems);
         }
-        self.device.queue_submit(self.queue, &[submit], fence)?;
+        self.submit(&[submit], fence)?;
 
         if self.implicit_sync {
             // Hand the export dmabuf's BO the submit's completion as a *write* fence, so
@@ -1217,9 +1325,10 @@ impl VulkanNv12 {
         // Debug: one-shot readback of the converter's NV12 output to a file. `compute_target`
         // (the LINEAR scratch on the encode-src path) holds exactly what the compute wrote,
         // before the tiled encode-src copy -- so a clean dump localises the green-bar/jump to
-        // the tiled copy or the encoder. Off unless WOLF_VULKAN_DUMP is set; once, a few
-        // frames in (let the scene settle). Failures are logged, never fatal.
-        if let Some(path) = dump_path() {
+        // the tiled copy or the encoder. Off unless GST_WAYLAND_DISPLAY_DUMP is set; once, a
+        // few frames in (let the scene settle). Failures are logged, never fatal. Only the
+        // scratch is readable: on the direct path the image has been released to its consumer.
+        if let Some(path) = dump_path().filter(|_| !direct) {
             // Fire either at the fixed frame target (one-shot) OR on demand whenever a
             // `<path>.now` trigger file exists -- consumed each time so every touch captures
             // exactly one fresh frame. The trigger lets a specific live gameplay frame be
@@ -1232,7 +1341,11 @@ impl VulkanNv12 {
                 if by_trigger {
                     let _ = std::fs::remove_file(&trigger);
                 }
-                self.device.device_wait_idle().ok();
+                // Our submit only: device_wait_idle would need every queue of a shared
+                // device (the encoders') externally synchronised.
+                if self.outputs[idx].in_flight {
+                    self.device.wait_for_fences(&[fence], true, u64::MAX).ok();
+                }
                 let pix = match self.fmt {
                     PixFmt::Nv12 => "nv12",
                     PixFmt::P010 => "p010le",
@@ -1330,11 +1443,7 @@ impl VulkanNv12 {
             .device
             .create_fence(&vk::FenceCreateInfo::default(), None)?;
         let cbs = [cmd];
-        self.device.queue_submit(
-            self.queue,
-            &[vk::SubmitInfo::default().command_buffers(&cbs)],
-            fence,
-        )?;
+        self.submit(&[vk::SubmitInfo::default().command_buffers(&cbs)], fence)?;
         self.device.wait_for_fences(&[fence], true, u64::MAX)?;
 
         let ptr = self
@@ -1349,6 +1458,19 @@ impl VulkanNv12 {
         self.device.free_memory(mem, None);
         res?;
         Ok(())
+    }
+
+    /// Submit to our queue, holding gst's submit lock on the shared-device path.
+    unsafe fn submit(
+        &self,
+        submits: &[vk::SubmitInfo],
+        fence: vk::Fence,
+    ) -> ash::prelude::VkResult<()> {
+        let _lock = self
+            .gst_queue
+            .as_ref()
+            .map(crate::utils::vulkan_share::QueueSubmitGuard::new);
+        self.device.queue_submit(self.queue, submits, fence)
     }
 
     /// Build a sampled VkImage over the source RGBA dmabuf (explicit per-plane layout, so
@@ -1380,8 +1502,7 @@ impl VulkanNv12 {
             .next()
             .ok_or("no fd")?
             .as_fd()
-            .try_clone_to_owned()?
-            .into_raw_fd();
+            .try_clone_to_owned()?;
         let plane_layout: Vec<vk::SubresourceLayout> = strides
             .iter()
             .enumerate()
@@ -1415,12 +1536,43 @@ impl VulkanNv12 {
                 .push_next(&mut explicit),
             None,
         )?;
+        // Everything below frees what it created so far on failure; `src_fd` is closed by its
+        // OwnedFd unless a successful import took ownership of it.
+        let mem = match self.import_memory(img, src_fd) {
+            Ok(mem) => mem,
+            Err(e) => {
+                self.device.destroy_image(img, None);
+                return Err(e);
+            }
+        };
+        let bound = self
+            .device
+            .bind_image_memory(img, mem, 0)
+            .map_err(Err::from)
+            .and_then(|()| plane_view(&self.device, img, pd_format, vk::ImageAspectFlags::COLOR));
+        match bound {
+            Ok(view) => Ok((img, mem, view)),
+            Err(e) => {
+                self.device.destroy_image(img, None);
+                self.device.free_memory(mem, None);
+                Err(e)
+            }
+        }
+    }
+
+    /// Import `fd` as memory for `img`. Vulkan owns the fd only once the allocation
+    /// succeeds; on failure it is closed when `fd` drops.
+    unsafe fn import_memory(
+        &self,
+        img: vk::Image,
+        fd: std::os::fd::OwnedFd,
+    ) -> Result<vk::DeviceMemory, Err> {
         let mr = self.device.get_image_memory_requirements(img);
         let ext_fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
         let mut fd_props = vk::MemoryFdPropertiesKHR::default();
         ext_fd.get_memory_fd_properties(
             vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            src_fd,
+            fd.as_raw_fd(),
             &mut fd_props,
         )?;
         let allowed = mr.memory_type_bits & fd_props.memory_type_bits;
@@ -1429,7 +1581,7 @@ impl VulkanNv12 {
             .ok_or("no import-compatible memory type")?;
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(src_fd);
+            .fd(fd.as_raw_fd());
         let mem = self.device.allocate_memory(
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(mr.size)
@@ -1437,9 +1589,9 @@ impl VulkanNv12 {
                 .push_next(&mut import_info),
             None,
         )?;
-        self.device.bind_image_memory(img, mem, 0)?;
-        let view = plane_view(&self.device, img, pd_format, vk::ImageAspectFlags::COLOR)?;
-        Ok((img, mem, view))
+        // A successful import transfers ownership of the fd to the driver.
+        let _ = fd.into_raw_fd();
+        Ok(mem)
     }
 
     /// Export the submit's signal semaphore as a SYNC_FD and import it onto slot `idx`'s
@@ -1531,7 +1683,17 @@ impl VulkanNv12 {
 impl Drop for VulkanNv12 {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.device_wait_idle();
+            // Wait for our own submits only: on the shared device, device_wait_idle would race
+            // the encoders' unsynchronised use of their queues.
+            let pending: Vec<vk::Fence> = self
+                .outputs
+                .iter()
+                .filter(|o| o.in_flight)
+                .map(|o| o.fence)
+                .collect();
+            if !pending.is_empty() {
+                let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
+            }
             for idx in 0..self.outputs.len() {
                 self.free_import(idx);
             }
@@ -1878,17 +2040,18 @@ unsafe fn create_output(
     };
 
     let ext_fd = ash::khr::external_memory_fd::Device::new(instance, device);
-    let fd = ext_fd.get_memory_fd(
+    // `export_fd` stays ours: it attaches the per-frame write fence (the sync_file attaches to
+    // the shared underlying BO/dma_resv) and is closed in Drop. Each gst memory gets its own
+    // dup and closes it when the last buffer referencing it is freed, so neither the fds nor
+    // the BO they pin outlive their users across renegotiations.
+    let export_fd = ext_fd.get_memory_fd(
         &vk::MemoryGetFdInfoKHR::default()
             .memory(mem)
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
     )?;
-    // Keep our own dup so we can attach a per-frame write fence even after `fd` is owned
-    // by the gst buffer (the sync_file attaches to the shared underlying BO/dma_resv).
-    let export_fd = libc::dup(fd);
-    if export_fd < 0 {
-        return Err("dup(export dmabuf fd) failed".into());
-    }
+    let dup_export = || -> Result<std::os::fd::OwnedFd, Err> {
+        Ok(std::os::fd::BorrowedFd::borrow_raw(export_fd).try_clone_to_owned()?)
+    };
     let l0 = device.get_image_subresource_layout(
         image,
         vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT),
@@ -1916,7 +2079,7 @@ unsafe fn create_output(
     // VA surface sharing is the AMD/Intel NV12 dmabuf-encode optimisation; the P010 path
     // targets the Vulkan encoder, so only attempt the VA-allocator buffer for NV12.
     let shared = if fmt == PixFmt::Nv12 {
-        va_share.build_shared_buffer(fd, mr.size as usize, &layout)
+        va_share.build_shared_buffer(dup_export()?, mr.size as usize, &layout)
     } else {
         None
     };
@@ -1927,9 +2090,9 @@ unsafe fn create_output(
             {
                 let b = buffer.get_mut().unwrap();
                 let gmem = allocator.alloc_dmabuf_with_flags(
-                    fd,
+                    dup_export()?.into_raw_fd(),
                     mr.size as usize,
-                    FdMemoryFlags::DONT_CLOSE,
+                    FdMemoryFlags::NONE,
                 )?;
                 b.append_memory(gmem);
                 VideoMeta::add_full(
@@ -1995,7 +2158,9 @@ unsafe fn create_encode_output(
     device: &ash::Device,
     memp: &vk::PhysicalDeviceMemoryProperties,
     gst_device: &gstreamer_vulkan::VulkanDevice,
+    codec: crate::utils::video_info::VulkanCodec,
     profile: &str,
+    queue_families: &[u32],
     desc_pool: vk::DescriptorPool,
     desc_layout: vk::DescriptorSetLayout,
     cmd_pool: vk::CommandPool,
@@ -2008,9 +2173,11 @@ unsafe fn create_encode_output(
         gst_device,
         width,
         height,
+        codec,
         profile,
         fmt,
         linear_encode_src,
+        queue_families,
     )
     .ok_or("encode-src image allocation failed")?;
     let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)

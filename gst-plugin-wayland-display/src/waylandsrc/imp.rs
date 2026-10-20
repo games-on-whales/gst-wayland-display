@@ -25,6 +25,7 @@ use waylanddisplaycore::utils::allocator::{
 };
 #[cfg(feature = "cuda")]
 use waylanddisplaycore::utils::video_info::CUDAParams;
+use waylanddisplaycore::utils::video_info::VulkanCodec;
 use waylanddisplaycore::{
     ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, Sender,
     WaylandDisplay, channel, utils::device::PCIVendor,
@@ -105,6 +106,9 @@ pub struct Settings {
     /// under dynamic HDR.
     content_light_level: Option<String>,
     vulkan_profile: Option<String>,
+    /// Codec of the Vulkan encoder consuming `memory:VulkanImage` output (`h264`, `h265`,
+    /// `av1`). `None` => the directly linked encoder's, else H.264 for NV12 / H.265 for P010.
+    vulkan_codec: Option<String>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -338,11 +342,13 @@ impl ObjectImpl for WaylandDisplaySrc {
                 glib::ParamSpecBoolean::builder("vulkan")
                     .nick("Prefer NV12 Vulkan output")
                     .blurb(
-                        "Advertise NV12 memory:VulkanImage output on a downstream encoder's \
-                         shared GstVulkanDevice (zero-copy into vulkanh264enc), offered first \
-                         so a format-agnostic interpipesink negotiates it. Requires the encoder \
-                         to share its GstVulkanDevice via context; falls back to dmabuf/RGBA \
-                         otherwise. Default off.",
+                        "Advertise NV12/P010 memory:VulkanImage output on the GstVulkanDevice \
+                         shared with a downstream Vulkan encoder (zero-copy), offered first so a \
+                         format-agnostic interpipesink negotiates it. If the device offered \
+                         lacks the converter's extensions, or a directly linked encoder runs on \
+                         another device, memory:VulkanImage is withdrawn and negotiation falls \
+                         back to the dmabuf/RGBA caps (when downstream accepts them). \
+                         Default off.",
                     )
                     .default_value(false)
                     .build(),
@@ -365,8 +371,12 @@ impl ObjectImpl for WaylandDisplaySrc {
                          mastering-display-info / content-light-level",
                     )
                     .mutable_ready().build(),
+                glib::ParamSpecString::builder("vulkan-codec")
+                    .blurb("Codec of the Vulkan encoder consuming memory:VulkanImage output (h264, h265 or av1). Empty = the directly linked encoder's, else h264 for NV12 and h265 for P010; set it when the encoder sits behind interpipe")
+                    .mutable_ready()
+                    .build(),
                 glib::ParamSpecString::builder("vulkan-profile")
-                    .blurb("Encode image profile: high/main/baseline/constrained-baseline for NV12, main-10 for P010; match the downstream encoder")
+                    .blurb("Encode image profile, matching the downstream encoder: h264 high/main/baseline/constrained-baseline (NV12); h265 main (NV12) or main-10 (P010); av1 main")
                     .mutable_ready().build(),
                 glib::ParamSpecBoolean::builder("dynamic-hdr")
                     .blurb(
@@ -427,6 +437,12 @@ impl ObjectImpl for WaylandDisplaySrc {
                 self.vulkan_share.set_conversion_options(options);
             }
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile = value.get().unwrap(),
+            "vulkan-codec" => {
+                self.settings.lock().unwrap().vulkan_codec = value
+                    .get::<Option<String>>()
+                    .unwrap()
+                    .filter(|v| !v.trim().is_empty())
+            }
             "dynamic-hdr" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.hdr_cm = value.get::<bool>().expect("Type checked upstream");
@@ -541,6 +557,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                 .hdr_peak_nits
                 .to_value(),
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile.to_value(),
+            "vulkan-codec" => self.settings.lock().unwrap().vulkan_codec.to_value(),
             "dynamic-hdr" => self.settings.lock().unwrap().hdr_cm.to_value(),
             "mastering-display-info" => self
                 .settings
@@ -711,7 +728,12 @@ impl ElementImpl for WaylandDisplaySrc {
         // mint encode-src images on the same device (best-effort; no-op for other contexts).
         // Returns true whenever a device is shared afterwards, including when the guard kept
         // the one this element already had; vulkan_share logs which of the two happened.
+        let was_usable = self.vulkan_share.usable();
         self.vulkan_share.handle_set_context(context);
+        if was_usable && !self.vulkan_share.usable() && self.settings.lock().unwrap().vulkan {
+            // Renegotiate without memory:VulkanImage.
+            self.obj().src_pad().mark_reconfigure();
+        }
 
         // Absorb a downstream VA encoder's GstVaDisplay context so our NV12 buffers can
         // attach VA surfaces on the same display (best-effort).
@@ -757,18 +779,22 @@ impl WaylandDisplaySrc {
     /// Guard the NV12 export path: refuse a negotiated modifier the Vulkan converter can't
     /// export, so a bad negotiation fails here with a clear error instead of green/garbled
     /// frames downstream. Non-NV12 DMA caps (the compositor's RGBA dmabuf) pass untouched.
-    /// Encoded profile constraints are downstream of the raw sink pad. Follow
-    /// simple filters/queues to a directly connected H.264 encoder; interpipe
-    /// has no graph edge, so that case uses the explicit vulkan-profile property.
-    fn downstream_h264_profile(&self) -> Option<String> {
+    /// The codec and (if fixed in its caps) profile of a directly linked Vulkan encoder.
+    /// Encoded profile constraints are downstream of the raw sink pad: follow simple
+    /// filters/queues to the encoder. interpipe has no graph edge, so that case uses the
+    /// explicit vulkan-codec / vulkan-profile properties.
+    fn downstream_vulkan_encoder(&self) -> Option<(VulkanCodec, Option<String>)> {
         let mut pad = self.obj().static_pad("src")?;
         for _ in 0..32 {
             let element = pad.peer()?.parent_element()?;
             let factory = element.factory()?;
             let src = element.static_pad("src")?;
-            if factory.name().starts_with("vulkanh264") {
-                let caps = src.current_caps().or_else(|| src.allowed_caps())?;
-                return caps.structure(0)?.get::<String>("profile").ok();
+            if let Some(codec) = VulkanCodec::from_encoder_factory(factory.name().as_str()) {
+                let profile = src
+                    .current_caps()
+                    .or_else(|| src.allowed_caps())
+                    .and_then(|caps| caps.structure(0)?.get::<String>("profile").ok());
+                return Some((codec, profile));
             }
             if !matches!(factory.name().as_str(), "capsfilter" | "queue" | "identity") {
                 return None;
@@ -778,6 +804,9 @@ impl WaylandDisplaySrc {
         None
     }
 
+    /// Guard the NV12 export path: refuse a negotiated modifier the Vulkan converter can't
+    /// export, so a bad negotiation fails here with a clear error instead of green/garbled
+    /// frames downstream. Non-NV12 DMA caps (the compositor's RGBA dmabuf) pass untouched.
     fn check_nv12_export(
         &self,
         caps: &gst::Caps,
@@ -1039,6 +1068,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
                 .format(VideoFormat::DmaDrm)
                 .field("drm-format", drm)
+                .field("colorimetry", nv12_colorimetry())
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -1101,7 +1131,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // NV12 is listed first so a format-agnostic interpipesink (Wolf) fixates on it by
         // default; a downstream Main-10 encoder (vulkanh265enc) constrains the format to
         // P010_10LE, so negotiation intersects to the P010 path on demand.
-        let vulkan_on = self.settings.lock().unwrap().vulkan;
+        // Only while the shared device can actually serve the encoder: a refused device or a
+        // directly linked encoder on another VkDevice drops memory:VulkanImage, so
+        // negotiation falls back to the dmabuf/RGBA caps below.
+        let vulkan_on = self.settings.lock().unwrap().vulkan
+            && self.vulkan_share.check_peer_device(&self.obj().src_pad());
         if vulkan_on {
             // NV12 (8-bit SDR) first so a format-agnostic interpipesink fixates on it; P010 is
             // a separate structure so the HDR fields apply ONLY to it (an `hdr` NV12 stream
@@ -1109,6 +1143,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let nv12_vk = gst_video::VideoCapsBuilder::new()
                 .features(["memory:VulkanImage"])
                 .format(VideoFormat::Nv12)
+                .field("colorimetry", nv12_colorimetry())
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -1264,44 +1299,41 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
             let base_video_info = gst_video::VideoInfo::from_caps(caps)
                 .map_err(|e| gst::loggable_error!(CAT, "Invalid Vulkan caps: {e}"))?;
-            // P010 ⇒ the Vulkan HEVC encoder (vulkanh265enc) Main-10; NV12 ⇒ vulkanh264enc.
-            // The producer's raw caps don't carry the codec, so the negotiated format selects
-            // it (the encode-src image's video profile is built from this downstream).
-            let p010 = base_video_info.format() == VideoFormat::P01010le;
-            let configured_profile = self.settings.lock().unwrap().vulkan_profile.clone();
+            // The producer's raw caps don't carry the codec, so it comes from the property, the
+            // linked encoder, or the format (P010 ⇒ vulkanh265enc Main-10, NV12 ⇒
+            // vulkanh264enc); the encode-src image's video profile is built from it.
+            let format = base_video_info.format();
+            let (configured_codec, configured_profile) = {
+                let s = self.settings.lock().unwrap();
+                (s.vulkan_codec.clone(), s.vulkan_profile.clone())
+            };
+            let downstream = self.downstream_vulkan_encoder();
+            let codec = match configured_codec {
+                Some(name) => VulkanCodec::from_name(&name)
+                    .ok_or_else(|| gst::loggable_error!(CAT, "Unknown vulkan-codec {name}"))?,
+                None => downstream
+                    .as_ref()
+                    .map(|(codec, _)| *codec)
+                    .unwrap_or_else(|| VulkanCodec::default_for(format)),
+            };
             let profile = configured_profile
                 .or_else(|| {
-                    if p010 {
-                        None
-                    } else {
-                        self.downstream_h264_profile()
-                    }
+                    downstream
+                        .filter(|(c, _)| *c == codec)
+                        .and_then(|(_, profile)| profile)
                 })
-                .unwrap_or_else(|| if p010 { "main-10" } else { "high" }.into());
-            let valid = if p010 {
-                profile == "main-10"
-            } else {
-                base_video_info.format() == VideoFormat::Nv12
-                    && matches!(
-                        profile.as_str(),
-                        "high"
-                            | "constrained-high"
-                            | "progressive-high"
-                            | "main"
-                            | "baseline"
-                            | "constrained-baseline"
-                    )
-            };
-            if !valid {
+                .unwrap_or_else(|| codec.default_profile(format).into());
+            if !codec.accepts(format, &profile) {
                 return Err(gst::loggable_error!(
                     CAT,
-                    "Unsupported Vulkan format/profile combination"
+                    "Unsupported Vulkan {codec:?} profile {profile} for {format:?}"
                 ));
             }
             self.vulkan_share.ensure_owned_device(minor);
             let video_info =
                 GstVideoInfo::VULKAN(waylanddisplaycore::utils::video_info::VulkanParams {
                     video_info: base_video_info,
+                    codec,
                     profile,
                 });
             let _ = self.command_tx.send(Command::VideoInfo(video_info));
@@ -1665,6 +1697,19 @@ impl WaylandDisplaySrc {
                 .set_caps(&caps)
                 .is_ok()
     }
+}
+
+/// Colorimetry of the converter's NV12 output: the rgba_to_nv12 shader applies the BT.601
+/// limited-range matrix (bit-comparable with the GLES/VA/CUDA paths) to sRGB/BT.709 content.
+/// Without it, downstream assumes BT.709 for HD sizes and the colours shift.
+fn nv12_colorimetry() -> String {
+    gst_video::VideoColorimetry::new(
+        gst_video::VideoColorRange::Range16_235,
+        gst_video::VideoColorMatrix::Bt601,
+        gst_video::VideoTransferFunction::Bt709,
+        gst_video::VideoColorPrimaries::Bt709,
+    )
+    .to_string()
 }
 
 /// Bus message posted on dynamic-hdr output transitions, with a boolean `hdr` field.

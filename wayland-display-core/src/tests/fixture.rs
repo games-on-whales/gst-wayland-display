@@ -25,6 +25,11 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::with_hdr(false)
+    }
+
+    /// A fixture whose compositor advertises the dynamic-HDR colour-management globals.
+    pub fn with_hdr(hdr_cm: bool) -> Self {
         INIT.call_once(|| {
             gst::init().expect("Failed to initialize GStreamer");
         });
@@ -39,7 +44,7 @@ impl Fixture {
             &dh,
             &libinput_context,
             event_loop.handle(),
-            false,
+            hdr_cm,
             crate::utils::vulkan_nv12::ConversionOptions::default().hdr_peak_nits,
         );
 
@@ -78,6 +83,8 @@ impl Fixture {
             UnixStream::connect(format!("{}/{}", runtime_dir, socket_name)).unwrap(),
         );
 
+        let mut server_state = server_state;
+        server_state.hdr_cm = hdr_cm;
         let mut f = Fixture {
             client: wclient,
             server: server_state,
