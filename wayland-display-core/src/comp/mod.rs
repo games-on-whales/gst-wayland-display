@@ -835,6 +835,32 @@ pub(crate) fn apply_video_info(
         });
         toplevel.send_configure();
     }
+
+    if !output_already_running {
+        // Toplevels that committed before there was an output are still waiting for their
+        // initial configure; they won't commit again until they get it.
+        for window in &state.pending_windows {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            let (sent, max_size) = with_states(toplevel.wl_surface(), |states| {
+                (
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .is_some_and(|d| d.lock().unwrap().initial_configure_sent),
+                    states
+                        .cached_state
+                        .get::<SurfaceCachedState>()
+                        .current()
+                        .max_size,
+                )
+            });
+            if !sent {
+                state.send_initial_configure(window, max_size);
+            }
+        }
+    }
 }
 
 pub(crate) fn init(

@@ -30,6 +30,16 @@ impl Fixture {
 
     /// A fixture whose compositor advertises the dynamic-HDR colour-management globals.
     pub fn with_hdr(hdr_cm: bool) -> Self {
+        Self::build(hdr_cm, true)
+    }
+
+    /// A fixture whose compositor has no output yet, as before the first caps
+    /// negotiation.
+    pub fn without_output() -> Self {
+        Self::build(false, false)
+    }
+
+    fn build(hdr_cm: bool, with_output: bool) -> Self {
         INIT.call_once(|| {
             gst::init().expect("Failed to initialize GStreamer");
         });
@@ -91,7 +101,9 @@ impl Fixture {
             server_event_loop: event_loop,
         };
 
-        f.create_server_output();
+        if with_output {
+            f.create_server_output();
+        }
         f.round_trip();
 
         f

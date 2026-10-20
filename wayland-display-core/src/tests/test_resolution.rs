@@ -240,3 +240,20 @@ fn apply_after_window_mapped_triggers_configure() {
         .expect("expected wl_output.mode event");
     assert_eq!((mode.0, mode.1), (1280, 720));
 }
+
+/// A toplevel that commits before the compositor has an output (a client launched before
+/// the first caps negotiation) must still get its initial configure once the output
+/// exists, instead of being dropped from the pending list and left waiting forever.
+#[test]
+fn toplevel_committed_before_the_output_is_configured_by_it() {
+    let mut f = Fixture::without_output();
+    f.client.create_window();
+    f.round_trip();
+    assert_eq!(f.client.configure_count(), 0);
+
+    apply(&mut f, 320, 240, 60);
+    assert!(
+        f.client.configure_count() >= 1,
+        "toplevel committed before the output never got its initial configure"
+    );
+}

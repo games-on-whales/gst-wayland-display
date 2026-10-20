@@ -58,6 +58,38 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
     });
 }
 
+impl State {
+    /// Size a new toplevel to the output (fullscreen, unless it declared a max size),
+    /// activate it and send its initial configure. Requires an output.
+    pub(crate) fn send_initial_configure(
+        &self,
+        window: &smithay::desktop::Window,
+        max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) {
+        let (Some(toplevel), Some(output)) = (window.toplevel(), self.output.as_ref()) else {
+            return;
+        };
+        if max_size.w == 0 && max_size.h == 0 {
+            toplevel.with_pending_state(|state| {
+                state.size = Some(
+                    output
+                        .current_mode()
+                        .unwrap()
+                        .size
+                        .to_f64()
+                        .to_logical(output.current_scale().fractional_scale())
+                        .to_i32_round(),
+                );
+                state.states.set(XdgState::Fullscreen);
+            });
+        }
+        toplevel.with_pending_state(|state| {
+            state.states.set(XdgState::Activated);
+        });
+        toplevel.send_configure();
+    }
+}
+
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
@@ -175,36 +207,14 @@ impl CompositorHandler for State {
             });
 
             if self.output.is_none() {
+                // No output to size it against yet: keep it pending. The first
+                // apply_video_info sends its initial configure.
+                self.pending_windows.push(window);
                 return;
             }
 
             if !initial_configure_sent {
-                if max_size.w == 0 && max_size.h == 0 {
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some(
-                            self.output
-                                .as_ref()
-                                .unwrap()
-                                .current_mode()
-                                .unwrap()
-                                .size
-                                .to_f64()
-                                .to_logical(
-                                    self.output
-                                        .as_ref()
-                                        .unwrap()
-                                        .current_scale()
-                                        .fractional_scale(),
-                                )
-                                .to_i32_round(),
-                        );
-                        state.states.set(XdgState::Fullscreen);
-                    });
-                }
-                toplevel.with_pending_state(|state| {
-                    state.states.set(XdgState::Activated);
-                });
-                toplevel.send_configure();
+                self.send_initial_configure(&window, max_size);
                 self.pending_windows.push(window);
             } else {
                 let loc = (0, 0);
