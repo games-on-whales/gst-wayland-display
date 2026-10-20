@@ -62,6 +62,42 @@ references, B frames, strict decoding, RPS/IDR output and live bitrate changes
 (see the RPS/IDR regression tests in the patch). AMD H.265 encode validation
 is still pending; the successful AMD H.264 tests do not establish H.265 support.
 
+## vkh264enc-rc-fix.patch
+
+Makes live rate-control changes on `vulkanh264enc` take effect. A bitrate set
+while playing is recorded under the object lock and applied by `encode_frame`
+on the streaming thread, and a reconfigure that keeps the same profile
+re-applies rate control through `gst_vulkan_encoder_request_rc_update()`
+(`vkCmdControlVideoCoding` with the rate-control bit, not a session reset, so
+no forced IDR). The configured rate-control mode is also passed to the encoder
+when a sequence starts. Touches `vkh264enc.c` and adds the
+`request_rc_update` entry point to `gstvkencoder-private.{c,h}`.
+
+## gstreamer-vulkan-rc-retarget-no-reset.patch
+
+Two codec-neutral fixes to the shared encode library
+(`gstvkencoder-private.{c,h}` only):
+
+- `gst_vulkan_encoder_request_rc_reset()` no longer raises
+  `VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR`; it now only updates rate control.
+  A reset invalidates the DPB, so every ABR retarget forced an IDR. Real
+  session (re)starts and rate-control *mode* changes still reset.
+- `gst_vulkan_encoder_picture_clear()` never released DPB slot 0 (`> 0`
+  instead of `>= 0`), shrinking the usable DPB by one slot for the rest of the
+  session.
+
+## vulkanav1enc.patch
+
+Adds a Vulkan **AV1** encoder element (`vulkanav1enc`) and its `GstAV1Encoder`
+base class: forward-only references (no B frames or `show_existing_frame`,
+so DTS == PTS), the driver's own sequence header, CBR/VBR/CQP rate control and
+the input colorimetry signalled in the sequence header and output caps. It
+also implements `av1_encode_caps()`, which stock 1.28.4 leaves returning FALSE
+and so vetoes registration on every device. Registered at rank NONE like
+`vulkanh265enc`. Tests: `elements_vkav1enc`, `libs_vkvideoencodeav1refs` and
+`libs_vkvideoencodeav1`, plus retarget coverage in `elements_vkencoderetarget`.
+Depends on the three patches above; applies last.
+
 (The Vulkan-encode path also needs the device to enable the external-memory
 extensions that `GstVulkanDevice` does not — `VK_KHR_external_memory_fd` etc. —
 to import the compositor's RGBA dmabuf. Rather than fork gstreamer for that, the
