@@ -159,8 +159,10 @@ matching VUI and mastering-display / content-light-level SEI. NV12 (8-bit) outpu
 HDR. The RGBA → P010 conversion, the tone-maps and the PQ passthrough all live in the Vulkan
 compute converter, so HDR is available on its two P010 outputs: `memory:VulkanImage` (the
 supported path, into `vulkanh265enc`) and the P010 dmabuf, whose caps are tagged the same way.
-Whether a VA encoder accepts that P010 dmabuf is driver-dependent (`vah265enc` on radeonsi fails
-to encode it). There is no HDR over the RGBA or CUDA outputs.
+`vah265enc` encodes the P010 dmabuf as Main-10 (give it the tiled modifier it advertises; it
+does not take LINEAR P010), but as of GStreamer 1.28 it writes neither the colour description nor
+the mastering / content-light-level SEI from its input caps, so the stream is not signalled as
+HDR. There is no HDR over the RGBA or CUDA outputs.
 
 There are two modes:
 

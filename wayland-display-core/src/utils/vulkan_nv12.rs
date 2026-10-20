@@ -2067,6 +2067,7 @@ unsafe fn create_output(
     // dmabuf buffer (non-VA encoders, or no VA display shared yet).
     let mr = device.get_image_memory_requirements(image);
     let layout = crate::utils::va_share::Nv12Layout {
+        format: fmt.gst_format(),
         width,
         height,
         fourcc: fmt.fourcc(),
@@ -2076,13 +2077,10 @@ unsafe fn create_output(
         uv_offset: l1.offset as usize,
         uv_stride: l1.row_pitch as i32,
     };
-    // VA surface sharing is the AMD/Intel NV12 dmabuf-encode optimisation; the P010 path
-    // targets the Vulkan encoder, so only attempt the VA-allocator buffer for NV12.
-    let shared = if fmt == PixFmt::Nv12 {
-        va_share.build_shared_buffer(dup_export()?, mr.size as usize, &layout)
-    } else {
-        None
-    };
+    // VA surface sharing, for NV12 and P010 alike: without a VA-allocator buffer the encoder
+    // imports a new surface for every frame and runs out of reconstruct surfaces within
+    // seconds ("Failed to create the reconstruct picture").
+    let shared = va_share.build_shared_buffer(dup_export()?, mr.size as usize, &layout);
     let buffer = match shared {
         Some(b) => b,
         None => {

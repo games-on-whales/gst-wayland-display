@@ -833,3 +833,50 @@ fn nvidia_cuda_encode_to_eos() {
         .expect("CUDA -> NVENC encode");
     }
 }
+
+/// P010 dmabuf into `vah265enc` (Main-10) for longer than the encoder's surface pool lasts
+/// without surface reuse: P010 exports must be VA-allocator buffers like NV12, or every frame
+/// imports a new surface and the encode fails with "Failed to create the reconstruct
+/// picture" after a few seconds.
+#[test]
+#[ignore = "needs an AMD GPU with vah265enc; run via ci/harness.sh gpu"]
+fn amd_va_p010_encode_outlives_the_surface_pool() {
+    init();
+    let Some(node) = render_node_for(&["amdgpu", "radeon"]) else {
+        skip!("no AMD render node")
+    };
+    let Some(factory) = gst::ElementFactory::find("vah265enc") else {
+        skip!("no vah265enc");
+    };
+    // The P010 modifier the encoder imports (it does not take LINEAR P010).
+    let drm_format = factory
+        .static_pad_templates()
+        .into_iter()
+        .filter(|t| t.direction() == gst::PadDirection::Sink)
+        .flat_map(|t| {
+            let caps = t.caps();
+            (0..caps.size())
+                .filter_map(|i| {
+                    let s = caps.structure(i)?;
+                    let v = s.value("drm-format").ok()?;
+                    let list: Vec<String> = v
+                        .get::<gst::List>()
+                        .map(|l| l.iter().filter_map(|x| x.get::<String>().ok()).collect())
+                        .or_else(|_| v.get::<String>().map(|x| vec![x]))
+                        .ok()?;
+                    Some(list)
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .find(|f| f.starts_with("P010:"));
+    let Some(drm_format) = drm_format else {
+        skip!("vah265enc takes no P010 dmabuf");
+    };
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} hdr=true num-buffers=360 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={drm_format},width=1280,height=720,framerate=60/1 ! \
+         vah265enc ! fakesink"
+    ))
+    .expect("P010 VA encode");
+}

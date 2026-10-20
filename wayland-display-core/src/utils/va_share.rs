@@ -171,6 +171,8 @@ impl VaShare {
 
 /// Plane layout of our exported NV12 dmabuf.
 pub struct Nv12Layout {
+    /// NV12 or P010_10LE: the two-plane 4:2:0 formats the converter exports.
+    pub format: VideoFormat,
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
@@ -182,7 +184,7 @@ pub struct Nv12Layout {
 }
 
 impl VaShare {
-    /// Build an NV12 gst buffer over `fd` that the VA encoder can *reuse* (zero per-frame
+    /// Build an NV12/P010 gst buffer over `fd` that the VA encoder can *reuse* (zero per-frame
     /// imports): the memory is from a gst-va dmabuf allocator (so `peek_display` resolves to
     /// the shared display) and a VA surface is attached via `gst_va_dmabuf_memories_setup`.
     /// Returns `None` (caller falls back to a plain dmabuf buffer) if no VA display is shared
@@ -218,7 +220,7 @@ impl VaShare {
             VideoMeta::add_full(
                 b,
                 gst_video::VideoFrameFlags::empty(),
-                VideoFormat::Nv12,
+                l.format,
                 l.width,
                 l.height,
                 &[l.y_offset, l.uv_offset],
@@ -230,12 +232,7 @@ impl VaShare {
         let mem = buffer.peek_memory(0).as_ptr() as *mut GstMemory;
         let mut drm: GstVideoInfoDmaDrm = unsafe { std::mem::zeroed() };
         unsafe {
-            gst_video_info_set_format(
-                &mut drm.vinfo,
-                VideoFormat::Nv12.into_glib(),
-                l.width,
-                l.height,
-            );
+            gst_video_info_set_format(&mut drm.vinfo, l.format.into_glib(), l.width, l.height);
         }
         drm.vinfo.stride[0] = l.y_stride;
         drm.vinfo.stride[1] = l.uv_stride;
