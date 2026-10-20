@@ -7,8 +7,11 @@
 //! debounce and is what picks the frame's shader; and a refusal pins the output to SDR.
 
 use crate::Command;
+use crate::comp::apply_video_info;
 use crate::tests::fixture::Fixture;
+use crate::utils::RenderTarget;
 use crate::utils::color::{ContentTransfer, FrameColor};
+use crate::utils::video_info::GstVideoInfo;
 use std::sync::mpsc;
 use std::time::Duration;
 use test_log::test;
@@ -133,5 +136,39 @@ fn unset_mastering_luminance_defaults_to_the_pq_primary_volume() {
     assert_eq!(
         mastering,
         "35400:14600:8500:39850:6550:2300:15635:16450:100000000:50"
+    );
+}
+
+#[test]
+fn colorimetry_only_renegotiation_leaves_clients_and_pointer_alone() {
+    let mut f = two_windows();
+    f.server.set_pointer_location((10.0, 20.0).into());
+    let configures = f.client.configure_count();
+
+    // What the element sends on an HDR flip: same format/size/fps, new colorimetry.
+    let pq: gst_video::VideoColorimetry = "bt2100-pq".parse().unwrap();
+    let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, 320, 240)
+        .colorimetry(&pq)
+        .build()
+        .unwrap();
+    apply_video_info(
+        &mut f.server,
+        GstVideoInfo::RAW(info),
+        &RenderTarget::Software,
+        None,
+    );
+    f.round_trip();
+    f.round_trip();
+
+    assert_eq!(f.server.pointer_location, (10.0, 20.0).into());
+    assert_eq!(f.client.configure_count(), configures);
+    assert_eq!(
+        f.server
+            .video_info
+            .as_ref()
+            .unwrap()
+            .colorimetry()
+            .transfer(),
+        gst_video::VideoTransferFunction::Smpte2084
     );
 }

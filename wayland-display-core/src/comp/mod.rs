@@ -631,11 +631,32 @@ pub(crate) fn apply_video_info(
     render_target: &RenderTarget,
     render_node: Option<DrmNode>,
 ) {
+    let base_info: VideoInfo = video_info.clone().into();
+
+    // Dynamic HDR: the producer flips its output caps colorimetry mid-stream
+    // (bt709 SDR <-> bt2100-pq HDR), or updates its HDR metadata, on the SAME
+    // format/resolution/fps. Tearing down and rebuilding the Vulkan converter (GsNv12Buf /
+    // VulkanNv12) on the compositor thread for that starves frame production and crashes the
+    // live stream, and nothing about the output changed for the clients either: re-sending the
+    // mode and configures and recentring the pointer would yank the cursor on every HDR flip.
+    // The converter picks its shader per frame from the committed HDR state, and the caps tag
+    // reaches the encoder through the producer's caps event, so just record the new info.
+    if state.hdr_cm
+        && state.output_buffer.is_some()
+        && state
+            .video_info
+            .as_ref()
+            .is_some_and(|prev| same_geometry(prev, &base_info))
+    {
+        tracing::info!("apply_video_info: colorimetry-only change, keeping output and converter");
+        state.video_info = Some(base_info);
+        return;
+    }
+
     let output_already_running = state.output.is_some();
     if output_already_running {
         tracing::info!("Output already running, updating with newly negotiated video info");
     }
-    let base_info: VideoInfo = video_info.clone().into();
     debug!(
         "Requested video format: {} .to_fourcc() = {}",
         base_info.format(),
@@ -674,29 +695,14 @@ pub(crate) fn apply_video_info(
     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
     state.pointer_location = position;
     state.pointer_absolute_location = position;
-    let prev_video_info = state.video_info.clone();
     state.video_info = Some(video_info.clone().into());
 
-    // Dynamic HDR: the producer flips its output caps colorimetry mid-stream
-    // (bt709 SDR <-> bt2100-pq HDR) on the SAME format/resolution/fps. Tearing down and
-    // rebuilding the Vulkan converter (GsNv12Buf / VulkanNv12) on the compositor thread for
-    // that starves frame production and crashes the live stream. The converter picks its
-    // shader per frame from the committed HDR state, so such a re-negotiation can keep the
-    // existing converter. The caps tag propagates to the encoder via the producer's caps event.
-    let keep_converter = state.hdr_cm
-        && state.output_buffer.is_some()
-        && prev_video_info
-            .as_ref()
-            .is_some_and(|prev| same_geometry(prev, &base_info));
-    if keep_converter {
-        tracing::info!("apply_video_info: colorimetry-only change, keeping converter");
-    } else {
+    {
         match render_target {
             RenderTarget::Hardware(_) => match video_info {
                 GstVideoInfo::RAW(base_info) => {
-                    let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
-                        .expect("Failed to create GsGlesbuffer");
-                    state.output_buffer = Some(GsBufferType::RAW(allocator));
+                    state.output_buffer =
+                        GsGlesbuffer::new(&mut state.renderer, base_info).map(GsBufferType::RAW);
                 }
                 GstVideoInfo::DMA(base_info) => {
                     let node = render_node.unwrap();
@@ -714,8 +720,6 @@ pub(crate) fn apply_video_info(
                         _ => None,
                     };
                     if let Some(conv_fmt) = conv_fmt {
-                        // A Vulkan setup failure must not take down the compositor thread;
-                        // with no output buffer the render loop fails the frame cleanly.
                         state.output_buffer = GsNv12Buf::new(
                             &mut state.renderer,
                             node,
@@ -725,13 +729,8 @@ pub(crate) fn apply_video_info(
                             state.vulkan_share.conversion_options(),
                         )
                         .map(GsBufferType::NV12);
-                        if state.output_buffer.is_none() {
-                            tracing::error!("Failed to create the Vulkan NV12/P010 converter");
-                        }
                     } else {
-                        let allocator =
-                            GsDmaBuf::new(node, base_info).expect("Failed to create GsDmaBuf");
-                        state.output_buffer = Some(GsBufferType::DMA(allocator));
+                        state.output_buffer = GsDmaBuf::new(node, base_info).map(GsBufferType::DMA);
                     }
                 }
                 GstVideoInfo::VULKAN(params) => {
@@ -782,22 +781,25 @@ pub(crate) fn apply_video_info(
                         .display()
                         .get_display_handle()
                         .handle;
-                    let allocator = GsCUDABuf::new(
+                    state.output_buffer = GsCUDABuf::new(
                         render_node.unwrap(),
                         base_info.cuda_context,
                         base_info.video_info,
                         Arc::new(Mutex::new(None)),
                         &egl_display,
                     )
-                    .expect("Failed to create GsCUDABuf");
-                    state.output_buffer = Some(GsBufferType::CUDA(allocator));
+                    .map(GsBufferType::CUDA);
                 }
             },
             RenderTarget::Software => {
-                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
-                    .expect("Failed to create GsGlesbuffer");
-                state.output_buffer = Some(GsBufferType::RAW(allocator));
+                state.output_buffer = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
+                    .map(GsBufferType::RAW);
             }
+        }
+        // A setup failure must not take down the compositor thread: with no output buffer
+        // the render loop fails the frame cleanly.
+        if state.output_buffer.is_none() {
+            tracing::error!("Failed to create the output buffer for {base_info:?}");
         }
     }
 
