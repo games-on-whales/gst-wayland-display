@@ -456,3 +456,159 @@ fn dynamic_hdr_flips_caps_for_a_pq_client() {
     assert_eq!(s.get::<i32>("width").unwrap(), 320);
     assert!(s.get::<String>("drm-format").unwrap().starts_with("P010"));
 }
+
+/// Two sessions in one process (as in Wolf): stopping one must not break the other, for each
+/// output type. On NVIDIA every compositor on a device shares one `EGLDisplay`, and the NV12
+/// and Vulkan outputs also open a GBM device on it, so a teardown that terminates the display
+/// would kill the surviving session's renderer.
+#[test]
+#[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
+fn second_session_survives_first_teardown() {
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    let mut outputs = vec![
+        ("RGBx", "video/x-raw,format=RGBx".to_string()),
+        (
+            "NV12 dmabuf",
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12".to_string(),
+        ),
+    ];
+    if have("vulkanh264enc") {
+        outputs.push((
+            "Vulkan",
+            "video/x-raw(memory:VulkanImage),format=NV12 ! vulkanh264enc".to_string(),
+        ));
+    }
+    for (label, tail) in outputs {
+        let vulkan = if label == "Vulkan" { "vulkan=true" } else { "" };
+        second_session_survives(
+            &format!(
+                "waylanddisplaysrc render-node={node} {vulkan} ! {tail},width=320,height=240,framerate=30/1"
+            ),
+            label,
+        );
+    }
+}
+
+fn second_session_survives(head: &str, label: &str) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // The caps filter ends with the size; a trailing encoder takes the rest of `head`.
+    let desc = |name: &str| {
+        let (caps_and_rest, size) = head.rsplit_once(",width=").unwrap();
+        let (caps, rest) = match caps_and_rest.split_once(" ! vulkanh264enc") {
+            Some((caps, _)) => (caps.to_string(), " ! vulkanh264enc"),
+            None => (caps_and_rest.to_string(), ""),
+        };
+        format!("{caps},width={size}{rest} ! fakesink name={name} signal-handoffs=true")
+    };
+    let launch = |name: &str| {
+        let p = gst::parse::launch(&desc(name))
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        let c = count.clone();
+        p.by_name(name)
+            .unwrap()
+            .connect("handoff", false, move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                None
+            });
+        p.set_state(gst::State::Playing).unwrap();
+        (p, count)
+    };
+    let (a, _) = launch("a");
+    let (b, b_frames) = launch("b");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    a.set_state(gst::State::Null).unwrap();
+    drop(a);
+    let before = b_frames.load(Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let after = b_frames.load(Ordering::Relaxed);
+    let errors: Vec<String> = b
+        .bus()
+        .unwrap()
+        .iter()
+        .filter_map(|m| match m.view() {
+            gst::MessageView::Error(e) => Some(format!("{}: {:?}", e.error(), e.debug())),
+            _ => None,
+        })
+        .collect();
+    let _ = b.set_state(gst::State::Null);
+    assert!(before > 0, "{label}: second session never produced a frame");
+    assert!(
+        errors.is_empty(),
+        "{label}: second session errored: {errors:?}"
+    );
+    assert!(
+        after >= before + 30,
+        "{label}: second session stalled after the first was torn down ({before} -> {after} frames in 2s)"
+    );
+}
+
+/// A mid-stream resolution change rebuilds the output (and, for NV12, the converter and its
+/// GBM device) while the session's renderer stays in use; frames must keep coming at the new
+/// size.
+#[test]
+#[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
+fn resolution_change_keeps_rendering() {
+    use std::sync::{Arc, Mutex};
+    init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    for caps in [
+        "video/x-raw,format=RGBx",
+        "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12",
+    ] {
+        let p = gst::parse::launch(&format!(
+            "waylanddisplaysrc render-node={node} ! capsfilter name=f caps=\"{caps},width=320,height=240,framerate=30/1\" ! \
+             fakesink name=s signal-handoffs=true"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let widths = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let w = widths.clone();
+        p.by_name("s")
+            .unwrap()
+            .connect("handoff", false, move |args| {
+                let pad = args[2].get::<gst::Pad>().unwrap();
+                if let Some(c) = pad.current_caps() {
+                    w.lock()
+                        .unwrap()
+                        .push(c.structure(0).unwrap().get::<i32>("width").unwrap());
+                }
+                None
+            });
+        p.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let new_caps: gst::Caps = format!("{caps},width=640,height=480,framerate=30/1")
+            .parse()
+            .unwrap();
+        p.by_name("f").unwrap().set_property("caps", &new_caps);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let errors: Vec<String> = p
+            .bus()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m.view() {
+                gst::MessageView::Error(e) => Some(format!("{}: {:?}", e.error(), e.debug())),
+                _ => None,
+            })
+            .collect();
+        let _ = p.set_state(gst::State::Null);
+        let widths = widths.lock().unwrap();
+        assert!(errors.is_empty(), "{caps}: errored: {errors:?}");
+        let at_new = widths.iter().filter(|w| **w == 640).count();
+        assert!(
+            widths.contains(&320) && at_new >= 30,
+            "{caps}: expected frames at 320 then >=30 at 640, got {} at 640 of {}",
+            at_new,
+            widths.len()
+        );
+    }
+}
