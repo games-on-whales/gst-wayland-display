@@ -808,3 +808,28 @@ fn vulkan_encode_round_trips_the_client_colour() {
         );
     }
 }
+
+/// NVIDIA CUDA output into NVENC, run to EOS and torn down. The CUDA context comes from
+/// downstream here (nvh265enc creates it and answers the source's context query), the order
+/// in which the source used to drop a reference it never owned: a GLib CRITICAL (fatal in
+/// these tests) in g_object_unref when the pipeline disposed its stored GstContext.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an NVIDIA GPU with nvh265enc; run via ci/harness.sh gpu"]
+fn nvidia_cuda_encode_to_eos() {
+    init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no NVIDIA render node")
+    };
+    if !have("nvh265enc") {
+        skip!("no nvh265enc");
+    }
+    for _ in 0..2 {
+        run_to_eos(&format!(
+            "waylanddisplaysrc render-node={node} num-buffers=30 ! \
+             video/x-raw(memory:CUDAMemory),width=1280,height=720,framerate=60/1 ! \
+             nvh265enc ! fakesink"
+        ))
+        .expect("CUDA -> NVENC encode");
+    }
+}

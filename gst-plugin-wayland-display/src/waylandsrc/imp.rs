@@ -115,6 +115,15 @@ pub struct Settings {
     cuda_raw_ptr: AtomicPtr<cuda::GstCudaContext>,
 }
 
+#[cfg(feature = "cuda")]
+impl Drop for Settings {
+    fn drop(&mut self) {
+        // The slot holds the reference the gst_cuda helpers transferred into it; the
+        // `cuda_context` wrapper holds its own (see CUDAContext::from_slot).
+        unsafe { CUDAContext::release_slot(self.cuda_raw_ptr.as_ptr()) };
+    }
+}
+
 pub struct State {
     display: WaylandDisplay,
 }
