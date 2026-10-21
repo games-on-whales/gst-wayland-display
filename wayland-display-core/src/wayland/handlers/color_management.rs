@@ -135,7 +135,7 @@ pub struct SurfaceHdrColor {
 }
 
 impl SurfaceHdrColor {
-    /// A surface is HDR when it declares PQ (ST 2084) or linear scRGB content. The buffer
+    /// A surface is HDR when it declares PQ (ST 2084) content. The buffer
     /// fourcc is deliberately not consulted: a 10-bit buffer can just as well carry SDR.
     pub fn is_hdr(&self) -> bool {
         self.transfer != ContentTransfer::Sdr
@@ -314,7 +314,7 @@ impl Cacheable for HdrColorState {
 /// The active toplevel's declared color state. Preserve the legacy 10-bit PQ fallback
 /// for clients without a declaration; an explicit declaration (including SDR) wins.
 /// Do not infer a whole frame's transfer from an arbitrary subsurface: the renderer
-/// has not converted mixed SDR/PQ/scRGB surfaces into a common working space.
+/// has not converted mixed SDR/PQ surfaces into a common working space.
 pub fn surface_hdr_color(surface: &WlSurface) -> Option<SurfaceHdrColor> {
     with_states(surface, |states| {
         let mut cache = states.cached_state.get::<HdrColorState>();

@@ -206,7 +206,6 @@ where
             Request::SetKnownTransferFunction { transfer_function } => {
                 let transfer = match transfer_function {
                     WEnum::Value(TransferFunction::St2084Pq) => ContentTransfer::Pq,
-                    WEnum::Value(TransferFunction::ScrgbLinear) => ContentTransfer::ScrgbLinear,
                     _ => ContentTransfer::Sdr,
                 };
                 if transfer != accum.transfer {

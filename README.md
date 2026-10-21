@@ -121,7 +121,7 @@ At runtime, you'll need to have access to `libcuda.so` but only to access and us
 
 ## Vulkan encode
 
-Vulkan encode requires Fedora 44+ and GStreamer 1.28+ with the `patches/` chain applied.
+Vulkan encode requires GStreamer 1.28+ with the `patches/` chain applied.
 
 Setting `vulkan=true` offers NV12 and P010 as `memory:VulkanImage`. The source answers the
 downstream encoder's `gst.vulkan.device` context query with a `GstVulkanDevice` it owns, and mints
@@ -199,7 +199,7 @@ learns from either into one shared per-surface HDR state:
   for PQ), never 0.
 - **`frog_color_management_v1`** (gamescope/Steam Deck protocol, vendored XML). gamescope
   does **not** speak `wp_color_management_v1`; through frog it declares its transfer function
-  (ST 2084 PQ, or linear scRGB) and the game's mastering metadata.
+  (ST 2084 PQ) and the game's mastering metadata.
 
 An explicit client color declaration takes precedence, including SDR on a 10-bit buffer.
 For clients without a declaration, the existing 10-bit packed-RGB PQ fallback is retained.
@@ -235,7 +235,6 @@ per-surface color conversion. When the HDR client exits the state is gone with i
    | --- | --- | --- |
    | SDR (sRGB) | SDR→PQ tone-map: sRGB EOTF → BT.2020 → `sdr-reference-white` nits → PQ | BT.709 Y'CbCr |
    | PQ | Y'CbCr matrix only (already PQ) | PQ → BT.709 tone-map with highlight roll-off |
-   | Linear scRGB | linear (1.0 = 80 nits) → BT.2020 → PQ | scRGB → BT.709 tone-map |
 
    The BT.709-tagged HDR-content cells cover the debounce window and a refused HDR stream.
    All pipelines are pre-built, so a flip never rebuilds the converter.
@@ -253,9 +252,8 @@ Streaming settings use per-element properties (see the tables above and the
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `GST_WAYLAND_DISPLAY_DUMP` | unset | Path to write one raw NV12/P010 frame of the converter's output, taken from the compute output before encoding. Also captures one frame whenever `<path>.now` exists. Distinguishes conversion corruption from downstream corruption. |
-| `GST_WAYLAND_DISPLAY_DUMP_FRAME` | `20` | Which frame `GST_WAYLAND_DISPLAY_DUMP` captures. Raise it to let a client connect and paint first. |
-| `WOLF_VULKAN_DUMP` / `WOLF_VULKAN_DUMP_FRAME` | unset / `20` | Existing dump variable names remain supported; the `GST_WAYLAND_DISPLAY_*` names take precedence when valid. |
+| `WOLF_VULKAN_DUMP` | unset | Path to write one raw NV12/P010 frame of the converter's output, taken from the compute output before encoding. Also captures one frame whenever `<path>.now` exists. Distinguishes conversion corruption from downstream corruption. |
+| `WOLF_VULKAN_DUMP_FRAME` | `20` | Which frame `WOLF_VULKAN_DUMP` captures. Raise it to let a client connect and paint first. |
 | `WOLF_HDR_SPIKE` | unset | Draw synthetic above-1.0 brightness bars and read the fp16 framebuffer back once to check whether GLES preserved or clamped them. Forces the fp16 render target even without `dynamic-hdr`; changes the rendered image. |
 | `WOLF_HDR_PEAK_NITS` | `1000` | Existing default for HDR peak luminance (positive nits, capped at 65535); the per-element `hdr-peak-luminance` property overrides it. |
 
@@ -381,8 +379,8 @@ Software Vulkan remains available to embedding applications by default.
 
 HDR — including the `dynamic-hdr`, `mastering-display-info` and `content-light-level`
 properties and the Wayland protocols behind them — has its own section above; see
-[HDR output](#hdr-output). The diagnostic knobs `GST_WAYLAND_DISPLAY_DUMP` and
-`GST_WAYLAND_DISPLAY_DUMP_FRAME` remain environment variables (documented above). Regenerate
+[HDR output](#hdr-output). The diagnostic knobs `WOLF_VULKAN_DUMP` and
+`WOLF_VULKAN_DUMP_FRAME` remain environment variables (documented above). Regenerate
 committed SPIR-V with `bash ci/shaders.sh --update`; CI recompiles and compares every
 shader with its GLSL source.
 

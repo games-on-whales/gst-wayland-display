@@ -79,11 +79,16 @@ const RGBA_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010.spv");
 /// [`RGBA_TO_P010_SPV`] but with the BT.2020 luma/chroma matrix, selected when the producer
 /// signals HDR output so the matrix matches the `matrix=bt2020` caps tagging.
 const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt2020.spv");
-/// Linear-scRGB variant of the BT.2020/PQ P010 converter (dynamic HDR). Same topology/bindings
-/// as [`RGBA_TO_P010_BT2020_SPV`], but its input is the client's **linear** scRGB values in the
-/// fp16 render target instead of sRGB gamma, so it skips the sRGB EOTF. Built with
-/// [`SCRGB_UNIT_NITS`] as the luminance of 1.0. NOTE: the checked-in `.spv` is a compiled
-/// shader; regenerate it with `ci/shaders.sh --update` after changing the GLSL.
+/// HDR render-path spike (`WOLF_HDR_SPIKE`) variant of the BT.2020/PQ P010 converter. Same
+/// topology/bindings as [`RGBA_TO_P010_BT2020_SPV`], but its input is the **linear fp16** RGBA
+/// render target (1.0 == SDR reference white, may exceed 1.0) instead of 8-bit sRGB, so it skips
+/// the sRGB EOTF and tone-maps the already-linear value straight to PQ -- proving a >1.0 value
+/// can travel render-target -> converter -> P010 PQ as a brighter-than-white highlight. Selected
+/// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is a
+/// compiled shader; regenerate it with `ci/shaders.sh --update` after changing the GLSL.
+// Retained for the WOLF_HDR_SPIKE linear-bars proof; the real SDR path uses the sRGB
+// tone-map and HDR content uses the passthrough pipeline, so this is otherwise unused.
+#[allow(dead_code)]
 const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv");
 /// PQ-passthrough variant of the P010 converter (dynamic HDR). Same topology/bindings as
 /// [`RGBA_TO_P010_BT2020_SPV`], but it applies ONLY the BT.2020 limited-range Y'CbCr matrix --
@@ -93,11 +98,9 @@ const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv
 /// with `ci/shaders.sh --update` after changing the GLSL.
 const RGBA_PQPASS_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_pqpass_to_p010.spv");
 /// HDR content -> SDR BT.709 P010 (dynamic HDR), for frames tagged SDR while the active surface
-/// declares PQ or scRGB content (spec constant 1 selects which). Tone-maps instead of showing
+/// declares PQ content. Tone-maps instead of showing
 /// HDR code values as gamma.
 const RGBA_HDR_TO_P010_SDR_SPV: &[u8] = include_bytes!("shaders/rgba_hdr_to_p010_sdr.spv");
-/// Luminance of a linear scRGB value of 1.0 (IEC 61966-2-2).
-const SCRGB_UNIT_NITS: f32 = 80.0;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
@@ -109,38 +112,32 @@ const RING: usize = 4;
 
 /// Optional path for a one-shot debug dump of the converter's NV12 output (the LINEAR
 /// compute scratch, *before* the tiled copy) as raw NV12. Set
-/// `GST_WAYLAND_DISPLAY_DUMP=<file>` to capture one frame -- if it's clean, the RX 9070
+/// `WOLF_VULKAN_DUMP=<file>` to capture one frame -- if it's clean, the RX 9070
 /// green-bar/jump corruption is introduced downstream (the tiled copy or the encoder), not
 /// our conversion. Read once; off (zero overhead) when unset.
 fn dump_path() -> Option<&'static str> {
     use std::sync::OnceLock;
     static P: OnceLock<Option<String>> = OnceLock::new();
     P.get_or_init(|| {
-        std::env::var("GST_WAYLAND_DISPLAY_DUMP")
+        std::env::var("WOLF_VULKAN_DUMP")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("WOLF_VULKAN_DUMP")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
     })
     .as_deref()
 }
 static DUMP_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Which converted frame to capture when `GST_WAYLAND_DISPLAY_DUMP` is set (default 20, a few
-/// frames in so the scene has settled). Override with `GST_WAYLAND_DISPLAY_DUMP_FRAME` to wait
+/// Which converted frame to capture when `WOLF_VULKAN_DUMP` is set (default 20, a few
+/// frames in so the scene has settled). Override with `WOLF_VULKAN_DUMP_FRAME` to wait
 /// longer -- e.g.
 /// for a client to connect and paint a known colour before the dump fires. Read once.
 fn dump_frame_target() -> u64 {
     use std::sync::OnceLock;
     static F: OnceLock<u64> = OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("GST_WAYLAND_DISPLAY_DUMP_FRAME")
+        std::env::var("WOLF_VULKAN_DUMP_FRAME")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .or_else(|| std::env::var("WOLF_VULKAN_DUMP_FRAME").ok()?.parse().ok())
             .unwrap_or(20)
     })
 }
@@ -359,7 +356,7 @@ fn rgba_vk_format(fourcc: DrmFourcc) -> Option<vk::Format> {
         DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => vk::Format::R8G8B8A8_UNORM,
         DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => vk::Format::B8G8R8A8_UNORM,
         // Dynamic HDR: the compositor renders into an fp16 RGBA dmabuf so HDR client values
-        // (PQ code values, or linear scRGB above 1.0) survive composition unclamped.
+        // (including PQ code values) survive composition unclamped.
         DrmFourcc::Abgr16161616f => vk::Format::R16G16B16A16_SFLOAT,
         _ => return None,
     })
@@ -1353,7 +1350,7 @@ impl VulkanNv12 {
         // Debug: one-shot readback of the converter's NV12 output to a file. `compute_target`
         // (the LINEAR scratch on the encode-src path) holds exactly what the compute wrote,
         // before the tiled encode-src copy -- so a clean dump localises the green-bar/jump to
-        // the tiled copy or the encoder. Off unless GST_WAYLAND_DISPLAY_DUMP is set; once, a
+        // the tiled copy or the encoder. Off unless WOLF_VULKAN_DUMP is set; once, a
         // few frames in (let the scene settle). Failures are logged, never fatal. The
         // direct export is reacquired for readback and released again before hand-off.
         if let Some(path) = dump_path() {
@@ -1825,12 +1822,8 @@ struct DynamicPipelines {
     sdr_to_pq: vk::Pipeline,
     /// HDR output: PQ content, matrix only.
     pq_pass: vk::Pipeline,
-    /// HDR output: linear scRGB content -> PQ.
-    scrgb_to_pq: vk::Pipeline,
     /// SDR output: PQ content tone-mapped to BT.709.
     pq_to_sdr: vk::Pipeline,
-    /// SDR output: linear scRGB content tone-mapped to BT.709.
-    scrgb_to_sdr: vk::Pipeline,
 }
 
 impl DynamicPipelines {
@@ -1840,21 +1833,13 @@ impl DynamicPipelines {
         Some(match (color.output_hdr, color.content) {
             (true, ContentTransfer::Sdr) => self.sdr_to_pq,
             (true, ContentTransfer::Pq) => self.pq_pass,
-            (true, ContentTransfer::ScrgbLinear) => self.scrgb_to_pq,
             (false, ContentTransfer::Pq) => self.pq_to_sdr,
-            (false, ContentTransfer::ScrgbLinear) => self.scrgb_to_sdr,
             (false, ContentTransfer::Sdr) => return None,
         })
     }
 
     unsafe fn destroy(self, device: &ash::Device) {
-        for p in [
-            self.sdr_to_pq,
-            self.pq_pass,
-            self.scrgb_to_pq,
-            self.pq_to_sdr,
-            self.scrgb_to_sdr,
-        ] {
+        for p in [self.sdr_to_pq, self.pq_pass, self.pq_to_sdr] {
             device.destroy_pipeline(p, None);
         }
     }
@@ -1873,22 +1858,19 @@ unsafe fn build_pipelines(
     fp16_input: bool,
     options: &ConversionOptions,
 ) -> Result<(vk::Pipeline, Option<DynamicPipelines>), Err> {
-    let ref_white = options.sdr_reference_white.to_bits();
+    let ref_white = options.sdr_reference_white;
     if !(options.hdr_cm && fmt == PixFmt::P010 && fp16_input) {
-        let pipeline = build_compute_pipeline(device, layout, fmt.shader(bt2020), &[ref_white])?;
+        let pipeline = build_compute_pipeline(device, layout, fmt.shader(bt2020), ref_white)?;
         return Ok((pipeline, None));
     }
-    let mut built = Vec::with_capacity(6);
-    let specs: [(&[u8], [u32; 2]); 6] = [
-        (RGBA_TO_P010_SPV, [ref_white, 0]),
-        (RGBA_TO_P010_BT2020_SPV, [ref_white, 0]),
-        (RGBA_PQPASS_TO_P010_SPV, [ref_white, 0]),
-        (RGBA_TO_P010_HDR_SPV, [SCRGB_UNIT_NITS.to_bits(), 0]),
-        (RGBA_HDR_TO_P010_SDR_SPV, [ref_white, 0]),
-        (RGBA_HDR_TO_P010_SDR_SPV, [ref_white, 1]),
-    ];
-    for (spv, spec) in specs {
-        match build_compute_pipeline(device, layout, spv, &spec) {
+    let mut built = Vec::with_capacity(4);
+    for spv in [
+        RGBA_TO_P010_SPV,
+        RGBA_TO_P010_BT2020_SPV,
+        RGBA_PQPASS_TO_P010_SPV,
+        RGBA_HDR_TO_P010_SDR_SPV,
+    ] {
+        match build_compute_pipeline(device, layout, spv, ref_white) {
             Ok(p) => built.push(p),
             Err(e) => {
                 for p in built {
@@ -1901,22 +1883,20 @@ unsafe fn build_pipelines(
     let dynamic = DynamicPipelines {
         sdr_to_pq: built[1],
         pq_pass: built[2],
-        scrgb_to_pq: built[3],
-        pq_to_sdr: built[4],
-        scrgb_to_sdr: built[5],
+        pq_to_sdr: built[3],
     };
     tracing::debug!("VulkanNv12: dynamic-HDR pipelines ready");
     Ok((built[0], Some(dynamic)))
 }
 
-/// Build one RGBA->NV12/P010 compute pipeline from `spv` on `device` with `layout`, binding
-/// `spec[i]` (raw 32-bit values) to specialization constant `i`; Vulkan ignores an entry for a
-/// constant the shader doesn't declare. The shader module is freed before returning.
+/// Build one RGBA->NV12/P010 compute pipeline from `spv` on `device` with `layout`, binding the
+/// SDR reference-white value to specialization constant 0 (constant_id 0; Vulkan ignores it for
+/// a shader that doesn't reference it). The shader module is freed before returning.
 unsafe fn build_compute_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     spv: &[u8],
-    spec: &[u32],
+    sdr_ref_white: f32,
 ) -> Result<vk::Pipeline, Err> {
     let module = device.create_shader_module(
         &vk::ShaderModuleCreateInfo {
@@ -1926,15 +1906,11 @@ unsafe fn build_compute_pipeline(
         },
         None,
     )?;
-    let spec_data: Vec<u8> = spec.iter().flat_map(|v| v.to_ne_bytes()).collect();
-    let spec_entries: Vec<vk::SpecializationMapEntry> = (0..spec.len() as u32)
-        .map(|i| {
-            vk::SpecializationMapEntry::default()
-                .constant_id(i)
-                .offset(i * 4)
-                .size(4)
-        })
-        .collect();
+    let spec_data = sdr_ref_white.to_ne_bytes();
+    let spec_entries = [vk::SpecializationMapEntry::default()
+        .constant_id(0)
+        .offset(0)
+        .size(std::mem::size_of::<f32>())];
     let spec_info = vk::SpecializationInfo::default()
         .map_entries(&spec_entries)
         .data(&spec_data);
@@ -2427,34 +2403,17 @@ fn img_barrier(
 mod legacy_environment_tests {
     #[test]
     fn legacy_diagnostics_and_peak_default_are_preserved() {
-        if let Ok(case) = std::env::var("GST_LEGACY_ENV_TEST_CHILD") {
+        if std::env::var_os("GST_LEGACY_ENV_TEST_CHILD").is_some() {
             assert_eq!(super::ConversionOptions::default().hdr_peak_nits, 1600);
-            assert_eq!(
-                super::dump_path(),
-                Some(if case == "legacy" {
-                    "/tmp/legacy-frame"
-                } else {
-                    "/tmp/new-frame"
-                })
-            );
-            assert_eq!(
-                super::dump_frame_target(),
-                if case == "legacy" { 31 } else { 42 }
-            );
+            assert_eq!(super::dump_path(), Some("/tmp/legacy-frame"));
+            assert_eq!(super::dump_frame_target(), 31);
             return;
         }
-        for case in ["legacy", "override"] {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command.args(["--exact", "utils::vulkan_nv12::legacy_environment_tests::legacy_diagnostics_and_peak_default_are_preserved"])
-                .env("GST_LEGACY_ENV_TEST_CHILD", case).env("WOLF_HDR_PEAK_NITS", "1600")
-                .env("WOLF_VULKAN_DUMP", "/tmp/legacy-frame").env("WOLF_VULKAN_DUMP_FRAME", "31")
-                .env_remove("GST_WAYLAND_DISPLAY_DUMP").env_remove("GST_WAYLAND_DISPLAY_DUMP_FRAME");
-            if case == "override" {
-                command
-                    .env("GST_WAYLAND_DISPLAY_DUMP", "/tmp/new-frame")
-                    .env("GST_WAYLAND_DISPLAY_DUMP_FRAME", "42");
-            }
-            assert!(command.status().unwrap().success());
-        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "utils::vulkan_nv12::legacy_environment_tests::legacy_diagnostics_and_peak_default_are_preserved"])
+            .env("GST_LEGACY_ENV_TEST_CHILD", "1").env("WOLF_HDR_PEAK_NITS", "1600")
+            .env("WOLF_VULKAN_DUMP", "/tmp/legacy-frame").env("WOLF_VULKAN_DUMP_FRAME", "31")
+            .status().unwrap();
+        assert!(status.success());
     }
 }

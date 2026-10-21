@@ -499,7 +499,7 @@ impl State {
             .and_then(|surface| surface_hdr_color(&surface))
     }
 
-    /// Whether the active surface declares HDR content (PQ or linear scRGB, through
+    /// Whether the active surface declares HDR content (PQ, through
     /// `frog_color_management_v1` or `wp_color_management_v1`). The buffer fourcc is not a
     /// signal: 10-bit SDR exists. Always `false` once downstream refused HDR.
     pub fn output_hdr_state(&self) -> bool {

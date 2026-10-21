@@ -11,8 +11,6 @@ pub enum ContentTransfer {
     Sdr,
     /// SMPTE ST 2084 (PQ) code values in BT.2020.
     Pq,
-    /// Linear scRGB: BT.709 primaries, 1.0 == 80 cd/m², may exceed 1.0 or go negative.
-    ScrgbLinear,
 }
 
 /// What the converter must produce for one frame under dynamic HDR.

@@ -12,7 +12,7 @@ several version floors; use a recent distro or the provided container.
 | libwayland        | **1.23**  | `wl_client_set_max_buffer_size` (raised max buffer size)            |
 | rustc             | **1.94**  | `gstreamer-rs` 0.25 (≥1.92) and current `cargo-c` (≥1.94)           |
 
-The Vulkan-encode path (Fedora 44+, GStreamer 1.28+) additionally needs the
+The Vulkan-encode path (GStreamer 1.28+) additionally needs the
 GStreamer patch chain listed, in apply order, in `patches/series`: the H.264 DPB
 pool and rate-control fixes, the shared encoder's reset-free retarget, and the
 `vulkanh265enc` and `vulkanav1enc` elements. The container applies all of them

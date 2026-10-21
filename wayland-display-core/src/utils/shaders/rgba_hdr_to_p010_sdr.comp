@@ -4,14 +4,13 @@
 // Under dynamic HDR the output stays tagged BT.709 until an HDR state has held for the
 // debounce period (and for good once downstream refuses HDR), but the active surface may
 // already declare HDR content. Passing that content through the BT.709 shader would show
-// PQ code values (or linear light) as gamma: washed out or dark. This shader brings it
+// PQ code values as gamma: washed out. This shader brings it
 // into the SDR signal the stream is tagged with instead. Sibling of rgba_to_p010.comp
 // (identical output matrix) for HDR input.
 //
 // Per-pixel pipeline:
-//   1. decode         : PQ code value -> linear nits (BT.2020), or
-//                       linear scRGB -> nits (BT.709, 1.0 == 80 cd/m²)   [INPUT_SCRGB]
-//   2. gamut          : linear BT.2020 -> linear BT.709 (PQ input only)
+//   1. decode         : PQ code value -> linear nits (BT.2020)
+//   2. gamut          : linear BT.2020 -> linear BT.709
 //   3. tone-map       : nits / REF_WHITE_NITS (SDR white == 1.0), luminance roll-off of
 //                       everything above 0.8 into [0.8, 1.0), so highlights compress
 //                       instead of clipping and hue is kept
@@ -34,8 +33,6 @@ layout(push_constant) uniform Push { ivec2 size; } pc;
 
 // The luminance SDR white maps to (the element's sdr-reference-white).
 layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
-// 0: the input is PQ-encoded BT.2020; 1: the input is linear scRGB.
-layout(constant_id = 1) const int INPUT_SCRGB = 0;
 
 // linear BT.2020 -> linear BT.709 primaries (D65). Column-major: each argument below is a
 // COLUMN of the standard row-major 2020->709 matrix.
@@ -68,13 +65,8 @@ vec3 linear_to_srgb(vec3 c) {
 
 // HDR input -> sRGB-gamma BT.709 R'G'B' in [0,1].
 vec3 hdr_to_sdr(vec3 c) {
-    vec3 nits709;
-    if (INPUT_SCRGB != 0) {
-        nits709 = c * 80.0;
-    } else {
-        vec3 nits2020 = vec3(pq_eotf(c.r), pq_eotf(c.g), pq_eotf(c.b)) * 10000.0;
-        nits709 = BT2020_TO_BT709 * nits2020;
-    }
+    vec3 nits2020 = vec3(pq_eotf(c.r), pq_eotf(c.g), pq_eotf(c.b)) * 10000.0;
+    vec3 nits709 = BT2020_TO_BT709 * nits2020;
     vec3 rel = max(nits709 / REF_WHITE_NITS, vec3(0.0));
     float y = dot(rel, vec3(0.2126, 0.7152, 0.0722));
     rel *= y > 0.0 ? roll_off(y) / y : 0.0;

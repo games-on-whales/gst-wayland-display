@@ -1,20 +1,25 @@
 #version 450
-// LINEAR scRGB -> P010 (10-bit 4:2:0, BT.2020 NON-CONSTANT-LUMINANCE, limited "TV" range,
-// SMPTE ST 2084 / PQ transfer).
+// HDR render-path spike: LINEAR fp16 RGBA -> P010 (10-bit 4:2:0, BT.2020 NON-CONSTANT-
+// LUMINANCE, limited "TV" range, SMPTE ST 2084 / PQ transfer).
 //
-// Sibling of rgba_to_p010_bt2020.comp for a surface that declares linear scRGB content
-// (frog's scrgb_linear). The only difference is the input encoding:
-//   - rgba_to_p010_bt2020.comp samples *sRGB-gamma* values, so it must apply the sRGB EOTF
-//     to linearise before the gamut/PQ math.
-//   - This shader samples the fp16 render target (R16G16B16A16_SFLOAT) holding the client's
-//     LINEAR scRGB values (BT.709 primaries, may exceed 1.0). So it MUST NOT apply the sRGB
-//     EOTF; the value goes straight into the gamut + scaling + PQ pipeline.
+// This is the WOLF_HDR_SPIKE sibling of rgba_to_p010_bt2020.comp. The ONLY difference is the
+// input encoding:
+//   - rgba_to_p010_bt2020.comp samples an 8-bit *sRGB-gamma* render target, so it must apply
+//     the sRGB EOTF to linearise before the gamut/PQ math.
+//   - This shader samples the WOLF_HDR_SPIKE *fp16* render target (R16G16B16A16_SFLOAT), whose
+//     values are already LINEAR scRGB-like BT.709 light with 1.0 == SDR reference white and
+//     highlights ALLOWED TO EXCEED 1.0. So we MUST NOT apply the sRGB EOTF -- the input is
+//     already linear -- we feed it straight into the gamut + reference-white + PQ pipeline.
+//
+// The point of the spike: a bar rendered at e.g. 4.0 (4x SDR white) survives the fp16 render
+// target, is read here without clamping, scaled to 4*REF_WHITE_NITS nits, PQ-encoded, and lands
+// in P010 as a real brighter-than-white highlight (clamped only at the 10000-nit PQ ceiling).
 //
 // Per-pixel pipeline (cf. the bt2020 shader, minus step 1's sRGB EOTF):
 //   1. (input is already linear BT.709 light, may be > 1.0 -- no EOTF)
 //   2. gamut          : linear BT.709 -> linear BT.2020       (709 fits inside 2020)
-//   3. scaling        : linear -> nits, 1.0 -> REF_WHITE_NITS (the converter sets this to
-//                       scRGB's 80 cd/m²), then normalise /10000 for PQ (clamp to [0,1])
+//   3. reference white: linear (1.0 = SDR white) -> nits, 1.0 -> REF_WHITE_NITS, 4.0 ->
+//                       4*REF_WHITE_NITS, then normalise /10000 for PQ (clamp to [0,1])
 //   4. PQ OETF        : normalised linear nits -> PQ code value [0,1]
 //   5. BT.2020 NCL Y'CbCr matrix (limited range) on the PQ-encoded R'G'B'  (identical consts)
 //
@@ -32,9 +37,10 @@ layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
 
 layout(push_constant) uniform Push { ivec2 size; } pc;
 
-// Luminance of an input value of 1.0. Specialization constant: the converter builds this
-// shader with scRGB's 80 cd/m².
-layout(constant_id = 0) const float REF_WHITE_NITS = 80.0;
+// SDR diffuse white on the HDR display (BT.2408 graphics white = 203). Specialization
+// constant: set at pipeline-build time from the producer's sdr-reference-white (Wolf's
+// [gstreamer.video] sdr_reference_white config), so it's tunable without recompiling.
+layout(constant_id = 0) const float REF_WHITE_NITS = 203.0;
 
 // linear BT.709 -> linear BT.2020 primaries (D65, same white point). GLSL is column-major,
 // so each argument below is a COLUMN of the standard row-major 709->2020 matrix.
@@ -55,7 +61,7 @@ float pq_oetf(float L) {
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
-// LINEAR BT.709 light (may exceed 1.0) -> PQ-encoded BT.2020 R'G'B'.
+// LINEAR BT.709 light (1.0 = SDR white, may exceed 1.0) -> PQ-encoded BT.2020 R'G'B'.
 // No sRGB EOTF: the fp16 render target is already linear.
 vec3 linear_to_pq(vec3 lin709) {
     vec3 lin2020 = BT709_TO_BT2020 * max(lin709, vec3(0.0));
