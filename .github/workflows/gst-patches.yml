@@ -36,14 +36,14 @@ jobs:
 
       - name: Build dependencies
         run: |
-          dnf install -y dnf-plugins-core 'dnf-command(builddep)'
-          # --allowerasing: when Fedora's Cisco openh264 repo is unreachable the only
-          # openh264-devel candidate is noopenh264-devel, which conflicts with the image's
-          # installed openh264. The patched build doesn't use OpenH264, so let dnf swap it.
-          dnf builddep -y --allowerasing gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
-          dnf install -y git gcc gcc-c++ meson ninja-build flex bison nasm \
+          # ci/gst-patches.sh enables the Vulkan tests, not every distro codec.
+          # Install their binary build dependencies directly: builddep also loads
+          # source repositories and Cisco metadata this build does not need.
+          dnf --disablerepo='*openh264*' install -y \
+            git gcc gcc-c++ meson ninja-build flex bison nasm python3 glslc \
             pkgconf-pkg-config glib2-devel libdrm-devel vulkan-headers \
-            vulkan-loader-devel wayland-devel wayland-protocols-devel
+            vulkan-loader-devel wayland-devel wayland-protocols-devel \
+            libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel
 
       - name: Build patched GStreamer and run the Vulkan tests
         run: bash ci/gst-patches.sh .gst-patches
