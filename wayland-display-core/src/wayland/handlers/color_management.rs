@@ -7,7 +7,7 @@
 //       Wolf already stamps onto its P010 caps) so HDR clients enable their HDR
 //       path, and
 //   (b) tracks, per `wl_surface`, the image description (colorspace) a client
-//       sets, so downstream code can ask `surface_tree_hdr_color(&surface)`.
+//       sets, so downstream code can ask `surface_hdr_color(&surface)`.
 //
 // Everything here is gated behind the `dynamic-hdr` element property at the global-creation
 // site in `State::new`; when unset the global is never advertised and none of this
@@ -18,7 +18,7 @@
 // implement `GlobalDispatch`/`Dispatch` straight onto `State`, the same way the
 // rest of the smithay protocol handlers do.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -37,7 +37,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
     Weak as WlWeak, backend::ClientId, protocol::wl_surface::WlSurface,
 };
-use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::{Cacheable, with_states};
 
 use crate::comp::State;
 pub use crate::utils::color::ContentTransfer;
@@ -118,7 +118,7 @@ impl MasteringDisplayInfo {
 /// `wp_color_management_v1` handler (used by sway) via [`set_surface_hdr_color`] and the
 /// `frog_color_management_v1` handler (used by gamescope, in
 /// `wayland::protocols::frog_color_management`), and read back by the protocol-agnostic
-/// [`surface_tree_hdr_color`]. The consumer never cares which protocol set it. Gated by
+/// [`surface_hdr_color`]. The consumer never cares which protocol set it. Gated by
 /// dynamic HDR at the global-creation sites.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SurfaceHdrColor {
@@ -292,84 +292,88 @@ pub struct ParamsData(Mutex<ParamsBuilder>);
 #[derive(Default)]
 struct ColorSurfaceAttached(Cell<bool>);
 
-/// The colour state of one surface, double-buffered like the rest of `wl_surface` state:
-/// protocol requests write `pending`, and [`commit_surface_hdr_color`] latches it into
-/// `current` on `wl_surface.commit`, so it takes effect together with the buffer it
-/// describes.
-#[derive(Debug, Default)]
-struct HdrColorSlots {
-    pending: Option<SurfaceHdrColor>,
-    current: Option<SurfaceHdrColor>,
-    dirty: bool,
+/// Color state participates in Smithay's commit transactions, including synchronized
+/// subsurfaces and acquire-fence blockers. A request must not change the current frame
+/// before the associated buffer becomes current.
+#[derive(Debug, Clone, Default)]
+struct HdrColorState {
+    color: Option<SurfaceHdrColor>,
+    legacy_pq: bool,
 }
 
-/// The committed colour state of the surface in `root`'s tree (the surface itself and its
-/// subsurfaces) that best describes the frame: PQ wins over scRGB, which wins over SDR, so
-/// an HDR game surface under an SDR overlay subsurface still reads as HDR. `None` when no
-/// surface in the tree declared any colour state.
-pub fn surface_tree_hdr_color(root: &WlSurface) -> Option<SurfaceHdrColor> {
-    use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
-    fn rank(color: &SurfaceHdrColor) -> u8 {
-        match color.transfer {
-            ContentTransfer::Pq => 2,
-            ContentTransfer::ScrgbLinear => 1,
-            ContentTransfer::Sdr => 0,
-        }
+impl Cacheable for HdrColorState {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+        self.clone()
     }
-    let mut best: Option<SurfaceHdrColor> = None;
-    with_surface_tree_downward(
-        root,
-        (),
-        |_, _, _| TraversalAction::DoChildren(()),
-        |_, states, _| {
-            let Some(slots) = states.data_map.get::<RefCell<HdrColorSlots>>() else {
-                return;
-            };
-            if let Some(color) = slots.borrow().current.as_ref() {
-                if best.as_ref().is_none_or(|b| rank(color) > rank(b)) {
-                    best = Some(color.clone());
-                }
-            }
-        },
-        |_, _, _| true,
-    );
-    best
+
+    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+        *into = self;
+    }
 }
 
-/// Stage (`Some`) or clear (`None`) the shared [`SurfaceHdrColor`] for `surface`; it takes
-/// effect on the surface's next commit. Public so the frog handler writes the same shared
-/// state the `wp_color_management_v1` path does.
+/// The active toplevel's declared color state. Preserve the legacy 10-bit PQ fallback
+/// for clients without a declaration; an explicit declaration (including SDR) wins.
+/// Do not infer a whole frame's transfer from an arbitrary subsurface: the renderer
+/// has not converted mixed SDR/PQ/scRGB surfaces into a common working space.
+pub fn surface_hdr_color(surface: &WlSurface) -> Option<SurfaceHdrColor> {
+    with_states(surface, |states| {
+        let mut cache = states.cached_state.get::<HdrColorState>();
+        let current = cache.current();
+        current.color.clone().or_else(|| {
+            current.legacy_pq.then(|| SurfaceHdrColor {
+                transfer: ContentTransfer::Pq,
+                is_bt2020: true,
+                ..Default::default()
+            })
+        })
+    })
+}
+
+/// Compatibility accessor for callers interested only in HDR detection.
+pub fn surface_is_hdr(surface: &WlSurface) -> bool {
+    surface_hdr_color(surface).is_some_and(|color| color.is_hdr())
+}
+
+/// Compatibility accessor for the active surface's mastering metadata.
+pub fn surface_mastering_caps(surface: &WlSurface) -> Option<(String, String)> {
+    surface_hdr_color(surface).and_then(|color| color.mastering_caps())
+}
+
+/// Stage a declaration for the next surface commit (shared by wp and frog).
 pub fn set_surface_hdr_color(surface: &WlSurface, new: Option<SurfaceHdrColor>) {
     with_states(surface, |states| {
-        let slots = states
-            .data_map
-            .get_or_insert::<RefCell<HdrColorSlots>, _>(Default::default);
-        let mut slots = slots.borrow_mut();
-        slots.pending = new;
-        slots.dirty = true;
+        states.cached_state.get::<HdrColorState>().pending().color = new;
     });
 }
 
-/// Latch the pending colour state of `surface` on `wl_surface.commit`, logging HDR
-/// transitions so they can be observed on the target device.
-pub fn commit_surface_hdr_color(surface: &WlSurface) {
+/// Capture the old gamescope fallback before Smithay commits the buffer state. An
+/// absent attachment preserves the previous format; SHM and detach clear the fallback.
+pub fn stage_legacy_hdr_buffer(surface: &WlSurface) {
+    use smithay::backend::allocator::{Buffer as _, Fourcc};
+    use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+    use smithay::wayland::dmabuf::get_dmabuf;
     with_states(surface, |states| {
-        let Some(slots) = states.data_map.get::<RefCell<HdrColorSlots>>() else {
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        let Some(assignment) = attrs.pending().buffer.as_ref() else {
             return;
         };
-        let mut slots = slots.borrow_mut();
-        if !slots.dirty {
-            return;
-        }
-        slots.dirty = false;
-        let was_hdr = slots.current.as_ref().is_some_and(|s| s.is_hdr());
-        slots.current = slots.pending.clone();
-        let now = slots.current.as_ref().map(|s| s.transfer);
-        if now.is_some_and(|t| t != ContentTransfer::Sdr) && !was_hdr {
-            tracing::info!(surface = ?surface.id(), transfer = ?now, "color_mgmt: surface -> HDR");
-        } else if was_hdr && !now.is_some_and(|t| t != ContentTransfer::Sdr) {
-            tracing::info!(surface = ?surface.id(), "color_mgmt: surface -> SDR");
-        }
+        let pq = match assignment {
+            BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).is_ok_and(|dmabuf| {
+                matches!(
+                    dmabuf.format().code,
+                    Fourcc::Xbgr2101010
+                        | Fourcc::Abgr2101010
+                        | Fourcc::Xrgb2101010
+                        | Fourcc::Argb2101010
+                )
+            }),
+            BufferAssignment::Removed => false,
+        };
+        states
+            .cached_state
+            .get::<HdrColorState>()
+            .pending()
+            .legacy_pq = pq;
     });
 }
 
@@ -849,5 +853,55 @@ impl Dispatch<WpImageDescriptionInfoV1, ()> for State {
         _obj: &WpImageDescriptionInfoV1,
         _data: &(),
     ) {
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::tests::fixture::Fixture;
+    use smithay::wayland::seat::WaylandFocus;
+
+    #[test]
+    fn undeclared_legacy_pq_survives_but_explicit_sdr_wins() {
+        let mut f = Fixture::with_hdr(true);
+        f.create_window(320, 240);
+        let surface = f
+            .server
+            .space
+            .elements()
+            .last()
+            .unwrap()
+            .wl_surface()
+            .unwrap()
+            .into_owned();
+        with_states(&surface, |states| {
+            states
+                .cached_state
+                .get::<HdrColorState>()
+                .pending()
+                .legacy_pq = true;
+        });
+        f.client.commit_window(0);
+        f.round_trip();
+        assert!(surface_is_hdr(&surface));
+        set_surface_hdr_color(&surface, Some(SurfaceHdrColor::default()));
+        assert!(
+            surface_is_hdr(&surface),
+            "uncommitted SDR must not affect the current frame"
+        );
+        f.client.commit_window(0);
+        f.round_trip();
+        assert!(
+            !surface_is_hdr(&surface),
+            "declared SDR overrides the fourcc heuristic"
+        );
+        set_surface_hdr_color(&surface, None);
+        f.client.commit_window(0);
+        f.round_trip();
+        assert!(
+            surface_is_hdr(&surface),
+            "clearing the declaration restores legacy detection"
+        );
     }
 }

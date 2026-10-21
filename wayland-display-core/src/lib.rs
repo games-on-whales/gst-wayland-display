@@ -52,7 +52,7 @@ pub enum Command {
     /// active fullscreen surface changed. Sent only when dynamic HDR is enabled, over a
     /// dedicated reverse channel (never the element -> compositor command channel), and
     /// drained by the element via [`WaylandDisplay::poll_hdr_state`] so it can surface
-    /// the change as a `wayland-display-hdr-state` application message on the GStreamer bus
+    /// the change as a `wolf-hdr-state` application message on the GStreamer bus
     /// and retag its caps. Also sent while HDR when the active surface's metadata changes.
     ///
     /// `mastering` / `cll` carry the active surface's REAL HDR static metadata (the gst

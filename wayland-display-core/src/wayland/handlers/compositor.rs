@@ -105,6 +105,9 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            if state.hdr_cm {
+                crate::wayland::handlers::color_management::stage_legacy_hdr_buffer(surface);
+            }
             let mut acquire_point = None;
             let maybe_dmabuf = with_states(surface, |surface_data| {
                 acquire_point.clone_from(
@@ -165,13 +168,10 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        // Dynamic HDR: colour state is double-buffered surface state, so latch what the
-        // client staged through frog / wp_color_management together with this commit's
-        // buffer. The fourcc log is a diagnostic only; it is read here, before the
-        // window/popup commits below advance current().buffer.
+        // Color state was applied with the buffer by Smithay. Log before the window
+        // and popup handlers consume current().buffer.
         if self.hdr_cm {
             log_client_buffer_fourcc(surface);
-            crate::wayland::handlers::color_management::commit_surface_hdr_color(surface);
         }
 
         if let Some(window) = self
@@ -191,7 +191,6 @@ impl CompositorHandler for State {
         {
             let window = self.pending_windows.swap_remove(idx);
 
-            let toplevel = window.toplevel().unwrap();
             let (initial_configure_sent, max_size) = with_states(surface, |states| {
                 let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap();
                 let attributes_guard = attributes.lock().unwrap();

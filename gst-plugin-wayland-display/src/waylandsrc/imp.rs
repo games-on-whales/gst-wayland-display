@@ -93,7 +93,7 @@ pub struct Settings {
     /// Dynamic HDR color management. When true the compositor advertises wp_color_management_v1 +
     /// frog_color_management_v1, renders into an fp16 target, tracks the active surface's
     /// HDR state and flips the P010 caps colorimetry mid-stream (bt709 <-> bt2100-pq),
-    /// posting `wayland-display-hdr-state` bus messages on transitions. Set before starting the
+    /// posting `wolf-hdr-state` bus messages on transitions. Set before starting the
     /// pipeline (the Wayland globals are created at start). Must be per element -- not an
     /// env var -- so one process can stream an HDR client and an SDR client side by side.
     hdr_cm: bool,
@@ -392,7 +392,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                         "Dynamic HDR color management: advertise wp_color_management_v1 + \
                          frog_color_management_v1, render into an fp16 target, follow the active \
                          surface's HDR state and flip the P010 caps colorimetry mid-stream \
-                         (bt709 <-> bt2100-pq), posting wayland-display-hdr-state bus messages on \
+                         (bt709 <-> bt2100-pq), posting wolf-hdr-state bus messages on \
                          transitions. Per element (an HDR and an SDR session can share a \
                          process). Set before starting the pipeline.",
                     )
@@ -1637,20 +1637,12 @@ impl WaylandDisplaySrc {
     ) -> Result<bool, gst::FlowError> {
         let prev_hdr = self.hdr_active.swap(hdr, Ordering::Relaxed);
         let prev_meta = std::mem::replace(&mut *self.hdr_meta.lock().unwrap(), (mastering, cll));
-        if prev_hdr != hdr {
-            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-            let structure = Structure::builder(HDR_STATE_MESSAGE)
-                .field("hdr", hdr)
-                .build();
-            if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build())
-            {
-                gst::warning!(CAT, "Failed to post {HDR_STATE_MESSAGE} message: {}", err);
-            }
-        }
         let Some(current) = self.negotiated_p010() else {
+            self.post_hdr_transition(prev_hdr, hdr);
             return Ok(true);
         };
         if self.retag_p010(&current) {
+            self.post_hdr_transition(prev_hdr, hdr);
             gst::info!(
                 CAT,
                 imp = self,
@@ -1688,6 +1680,20 @@ impl WaylandDisplaySrc {
         Ok(false)
     }
 
+    /// Notify the host only after downstream accepted the new output state.
+    fn post_hdr_transition(&self, prev_hdr: bool, hdr: bool) {
+        if prev_hdr != hdr {
+            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+            let structure = Structure::builder(HDR_STATE_MESSAGE)
+                .field("hdr", hdr)
+                .build();
+            if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build())
+            {
+                gst::warning!(CAT, "Failed to post {HDR_STATE_MESSAGE} message: {}", err);
+            }
+        }
+    }
+
     /// Re-send `current` with the P010 colour fields of the present HDR state, if downstream
     /// accepts it.
     fn retag_p010(&self, current: &gst::Caps) -> bool {
@@ -1722,7 +1728,7 @@ fn nv12_colorimetry() -> String {
 }
 
 /// Bus message posted on dynamic-hdr output transitions, with a boolean `hdr` field.
-const HDR_STATE_MESSAGE: &str = "wayland-display-hdr-state";
+const HDR_STATE_MESSAGE: &str = "wolf-hdr-state";
 /// BT.2020 R/G/B + D65 white chromaticities (x, y * 50000), the default mastering primaries.
 const HDR_PRIMARIES: &str = "35400:14600:8500:39850:6550:2300:15635:16450";
 

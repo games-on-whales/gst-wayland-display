@@ -201,11 +201,13 @@ learns from either into one shared per-surface HDR state:
   does **not** speak `wp_color_management_v1`; through frog it declares its transfer function
   (ST 2084 PQ, or linear scRGB) and the game's mastering metadata.
 
-HDR is what the client **declares** through either protocol, not the buffer format: a 10-bit
-buffer can carry SDR. Colour state is double-buffered surface state, applied on the
+An explicit client color declaration takes precedence, including SDR on a 10-bit buffer.
+For clients without a declaration, the existing 10-bit packed-RGB PQ fallback is retained.
+Colour state is double-buffered surface state, applied on the
 `wl_surface.commit` that carries the buffer it describes. It is read from the **topmost** mapped
-window (with Steam and a game both mapped, the game, not Steam) and its subsurfaces; PQ wins over
-scRGB, which wins over SDR. When the HDR client exits the state is gone with its surface.
+window (with Steam and a game both mapped, the game, not Steam). Subsurface declarations
+do not select a transfer function for the whole frame; mixed-transfer composition needs
+per-surface color conversion. When the HDR client exits the state is gone with its surface.
 
 ### How it works end to end
 
@@ -215,7 +217,7 @@ scRGB, which wins over SDR. When the HDR client exits the state is gone with its
 2. **Signalling**: on a committed flip the compositor sends the new state (plus the game's
    mastering/CLL metadata when it provided any) to the source. While HDR, updated metadata is
    sent too. The source drains this after receiving the frame rendered in the new state and
-   (a) posts a `wayland-display-hdr-state` application message (boolean `hdr` field) on the bus
+   (a) posts a `wolf-hdr-state` application message (boolean `hdr` field) on the bus
    on a flip, and (b) re-sends the current caps with only the colour fields changed, **before
    pushing that frame**, so pixels and caps switch on the same buffer.
 3. **Renegotiation**: the new caps carry BT.2100 PQ + mastering-display-info +
@@ -245,14 +247,17 @@ overridden.
 
 ## Environment variables
 
-These are read once at startup, are off when unset, and exist only for tracking driver bugs.
-Everything that affects streaming is a per-element property (see the tables above and the
-[HDR section](#hdr-output)).
+The dump settings are read once; `WOLF_HDR_SPIKE` enables the existing render diagnostic.
+Streaming settings use per-element properties (see the tables above and the
+[HDR section](#hdr-output)); the legacy peak-luminance variable supplies a default.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `GST_WAYLAND_DISPLAY_DUMP` | unset | Path to write one raw NV12/P010 frame of the converter's output, taken from the compute scratch before the tiled copy (not available on the LINEAR direct path). Also captures one frame whenever `<path>.now` exists. Distinguishes conversion corruption from downstream corruption. |
+| `GST_WAYLAND_DISPLAY_DUMP` | unset | Path to write one raw NV12/P010 frame of the converter's output, taken from the compute output before encoding. Also captures one frame whenever `<path>.now` exists. Distinguishes conversion corruption from downstream corruption. |
 | `GST_WAYLAND_DISPLAY_DUMP_FRAME` | `20` | Which frame `GST_WAYLAND_DISPLAY_DUMP` captures. Raise it to let a client connect and paint first. |
+| `WOLF_VULKAN_DUMP` / `WOLF_VULKAN_DUMP_FRAME` | unset / `20` | Existing dump variable names remain supported; the `GST_WAYLAND_DISPLAY_*` names take precedence when valid. |
+| `WOLF_HDR_SPIKE` | unset | Draw synthetic above-1.0 brightness bars and read the fp16 framebuffer back once to check whether GLES preserved or clamped them. Forces the fp16 render target even without `dynamic-hdr`; changes the rendered image. |
+| `WOLF_HDR_PEAK_NITS` | `1000` | Existing default for HDR peak luminance (positive nits, capped at 65535); the per-element `hdr-peak-luminance` property overrides it. |
 
 ## Run without a GPU
 

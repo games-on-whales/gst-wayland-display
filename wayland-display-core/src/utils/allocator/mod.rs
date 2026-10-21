@@ -28,12 +28,13 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 /// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
-/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. Under dynamic HDR
-/// (`hdr_cm`, real HDR client content) this becomes the 64bpp fp16 `Abgr16161616f` so the
-/// render target carries PQ code values and linear values > 1.0 into the Vulkan P010
-/// converter at full precision instead of clamping them to 8 bits.
+/// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either the debug
+/// spike (`WOLF_HDR_SPIKE`, synthetic bars) or dynamic HDR (`hdr_cm`, real HDR client
+/// content) is enabled this becomes the 64bpp fp16 `Abgr16161616f` so the render target can
+/// carry linear values > 1.0 (HDR highlights) into the Vulkan P010/PQ converter instead of
+/// clamping them at 8-bit white. Both off = byte-for-byte the current 8-bit path.
 fn rgba_render_fourcc(hdr_cm: bool) -> DrmFourcc {
-    if hdr_cm {
+    if std::env::var("WOLF_HDR_SPIKE").is_ok() || hdr_cm {
         DrmFourcc::Abgr16161616f
     } else {
         DrmFourcc::Abgr8888
@@ -438,6 +439,21 @@ pub enum GsBufferType {
     VULKAN(GsVulkanBuf),
     #[cfg(feature = "cuda")]
     CUDA(GsCUDABuf),
+}
+
+impl GsBufferType {
+    /// The fourcc of the RGBA dmabuf the scene is rendered into for the Vulkan-converter buffer
+    /// types (NV12/VULKAN) -- i.e. the GLES render target that is also the converter's input.
+    /// `None` for buffer types without a separate RGBA render target. The HDR spike uses this to
+    /// confirm the render target is fp16 (`Abgr16161616f`) before reading it back off the GLES
+    /// framebuffer.
+    pub fn render_rgba_fourcc(&self) -> Option<DrmFourcc> {
+        match self {
+            GsBufferType::NV12(b) => Some(b.rgba.format().code),
+            GsBufferType::VULKAN(b) => Some(b.rgba.format().code),
+            _ => None,
+        }
+    }
 }
 
 pub enum VideoInfoTypes {
@@ -1284,5 +1300,24 @@ mod tests {
         // Anything not in the table (incl. non-RGB formats) falls through.
         assert_eq!(gst_video_format_name_to_drm_fourcc("NV12".into()), None);
         assert_eq!(gst_video_format_name_to_drm_fourcc("".into()), None);
+    }
+}
+
+#[cfg(test)]
+mod hdr_spike_compatibility {
+    #[test]
+    fn hdr_spike_selects_fp16_without_dynamic_hdr() {
+        if std::env::var_os("GST_HDR_SPIKE_TEST_CHILD").is_some() {
+            assert_eq!(
+                super::rgba_render_fourcc(false),
+                super::DrmFourcc::Abgr16161616f
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "utils::allocator::hdr_spike_compatibility::hdr_spike_selects_fp16_without_dynamic_hdr"])
+            .env("GST_HDR_SPIKE_TEST_CHILD", "1").env("WOLF_HDR_SPIKE", "")
+            .status().unwrap();
+        assert!(status.success());
     }
 }

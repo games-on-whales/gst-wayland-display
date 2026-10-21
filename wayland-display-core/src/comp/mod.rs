@@ -90,7 +90,7 @@ use crate::utils::color::FrameColor;
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
-use crate::wayland::handlers::color_management::{SurfaceHdrColor, surface_tree_hdr_color};
+use crate::wayland::handlers::color_management::{SurfaceHdrColor, surface_hdr_color};
 use crate::{
     utils::RenderTarget,
     wayland::protocols::{
@@ -126,6 +126,7 @@ pub struct State {
     // management
     pub output: Option<Output>,
     pub video_info: Option<VideoInfo>,
+    negotiated_output: Option<GstVideoInfo>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -440,6 +441,7 @@ impl State {
             render_node,
             dmabuf_global,
             video_info: None,
+            negotiated_output: None,
             last_render: None,
 
             space,
@@ -486,7 +488,7 @@ impl State {
 
     /// The colour state of the active surface: the topmost mapped toplevel (smithay
     /// iterates the space back to front and `raise_element` moves the focused window to
-    /// the end), including its subsurfaces. Steam and a game can both be mapped, so the
+    /// the end), using the toplevel's color state. Steam and a game can both be mapped, so the
     /// bottom window is not the one on screen. `None` when nothing is mapped or the
     /// surface declared no colour state.
     fn active_surface_hdr_color(&self) -> Option<SurfaceHdrColor> {
@@ -494,7 +496,7 @@ impl State {
             .elements()
             .last()
             .and_then(|window| window.wl_surface())
-            .and_then(|surface| surface_tree_hdr_color(&surface))
+            .and_then(|surface| surface_hdr_color(&surface))
     }
 
     /// Whether the active surface declares HDR content (PQ or linear scRGB, through
@@ -569,7 +571,7 @@ impl State {
             self.hdr_candidate_since = None;
             if hdr {
                 let meta = self.active_surface_mastering_caps();
-                if meta.is_some() && meta != self.last_hdr_meta {
+                if meta != self.last_hdr_meta {
                     tracing::info!("output HDR metadata updated: {meta:?}");
                     self.last_hdr_meta = meta.clone();
                     self.send_hdr_state(true, meta);
@@ -605,16 +607,41 @@ impl State {
     }
 }
 
-/// True when `new` has the same pixel format, width, height and frame rate as `prev`, i.e.
-/// a re-negotiation changed only colorimetry or HDR metadata (a dynamic HDR bt709 <->
-/// bt2100-pq flip, or updated mastering metadata). Used under dynamic HDR to skip the Vulkan
-/// converter rebuild: the converter picks its shader per frame from [`State::frame_color`],
-/// so only the downstream caps tag needs to change.
-fn same_geometry(prev: &VideoInfo, new: &VideoInfo) -> bool {
-    prev.format() == new.format()
-        && prev.width() == new.width()
-        && prev.height() == new.height()
-        && prev.fps() == new.fps()
+/// Keep a converter only when the complete memory/layout/codec contract is unchanged.
+/// Color fields are the only fields a dynamic HDR retag may change without rebuilding.
+fn same_output_contract(prev: &GstVideoInfo, new: &GstVideoInfo) -> bool {
+    fn without_color(caps: Result<gst::Caps, gst::glib::BoolError>) -> Option<gst::Caps> {
+        let mut caps = caps.ok()?;
+        let s = caps.get_mut()?.structure_mut(0)?;
+        for field in [
+            "colorimetry",
+            "mastering-display-info",
+            "content-light-level",
+        ] {
+            s.remove_field(field);
+        }
+        Some(caps)
+    }
+    let (prev, new) = match (prev, new) {
+        (GstVideoInfo::RAW(p), GstVideoInfo::RAW(n)) => (p.to_caps(), n.to_caps()),
+        (GstVideoInfo::DMA(p), GstVideoInfo::DMA(n)) => (p.to_caps(), n.to_caps()),
+        (GstVideoInfo::VULKAN(p), GstVideoInfo::VULKAN(n))
+            if p.codec == n.codec && p.profile == n.profile =>
+        {
+            (p.video_info.to_caps(), n.video_info.to_caps())
+        }
+        #[cfg(feature = "cuda")]
+        (GstVideoInfo::CUDA(p), GstVideoInfo::CUDA(n))
+            if Arc::ptr_eq(&p.cuda_context, &n.cuda_context) =>
+        {
+            (p.video_info.to_caps(), n.video_info.to_caps())
+        }
+        _ => return false,
+    };
+    match (without_color(prev), without_color(new)) {
+        (Some(p), Some(n)) => p == n,
+        _ => false,
+    }
 }
 
 /// Apply a newly-negotiated `GstVideoInfo` to the compositor state: create or update
@@ -644,15 +671,17 @@ pub(crate) fn apply_video_info(
     if state.hdr_cm
         && state.output_buffer.is_some()
         && state
-            .video_info
+            .negotiated_output
             .as_ref()
-            .is_some_and(|prev| same_geometry(prev, &base_info))
+            .is_some_and(|prev| same_output_contract(prev, &video_info))
     {
         tracing::info!("apply_video_info: colorimetry-only change, keeping output and converter");
         state.video_info = Some(base_info);
+        state.negotiated_output = Some(video_info);
         return;
     }
 
+    state.negotiated_output = Some(video_info.clone());
     let output_already_running = state.output.is_some();
     if output_already_running {
         tracing::info!("Output already running, updating with newly negotiated video info");
@@ -741,37 +770,36 @@ pub(crate) fn apply_video_info(
                     // of panicking when it merely hasn't been shared yet. If it never comes,
                     // leave output_buffer unset -- the render loop turns that into a clean
                     // FlowError rather than aborting the process.
-                    // Clone the Arc so it can be passed to GsVulkanBuf::new while
-                    // `state.renderer` is borrowed mutably below. Drop the previous converter
-                    // first: if the rebuild fails, keeping it would send buffers of the old
-                    // size/format under the new caps.
-                    state.output_buffer = None;
+                    // Build the replacement before dropping the old allocation, as on
+                    // the DMA path.
+                    // Always replace it with None on failure, so old geometry is never sent
+                    // under newly negotiated caps.
                     let vulkan_share = Arc::clone(&state.vulkan_share);
-                    if vulkan_share
+                    let replacement = if vulkan_share
                         .wait_for_shared_device(Duration::from_secs(5))
                         .is_some()
                     {
-                        match GsVulkanBuf::new(
+                        let allocation = GsVulkanBuf::new(
                             &mut state.renderer,
                             node,
                             params.video_info,
                             params.codec,
                             params.profile,
                             &vulkan_share,
-                        ) {
-                            Some(allocator) => {
-                                state.output_buffer = Some(GsBufferType::VULKAN(allocator))
-                            }
-                            None => tracing::error!(
+                        );
+                        if allocation.is_none() {
+                            tracing::error!(
                                 "Failed to create Vulkan output buffer despite a shared GstVulkanDevice"
-                            ),
+                            );
                         }
+                        allocation.map(GsBufferType::VULKAN)
                     } else {
                         tracing::error!(
-                            "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder \
-                         never shared its device. Cannot produce memory:VulkanImage output."
+                            "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder never shared its device. Cannot produce memory:VulkanImage output."
                         );
-                    }
+                        None
+                    };
+                    state.output_buffer = replacement;
                 }
                 #[cfg(feature = "cuda")]
                 GstVideoInfo::CUDA(base_info) => {
@@ -1256,5 +1284,65 @@ pub(crate) fn init(
         }
     }) {
         tracing::error!(?err, "Event loop broke.");
+    }
+}
+
+#[cfg(test)]
+mod output_contract_tests {
+    use super::*;
+    use crate::utils::video_info::{VulkanCodec, VulkanParams};
+    use gst_video::{VideoFormat, VideoInfoDmaDrm};
+
+    #[test]
+    fn retag_requires_the_same_memory_modifier_codec_and_layout() {
+        gst::init().unwrap();
+        let info = VideoInfo::builder(VideoFormat::P01010le, 320, 240)
+            .build()
+            .unwrap();
+        let pq = "bt2100-pq".parse::<gst_video::VideoColorimetry>().unwrap();
+        let hdr = VideoInfo::builder(VideoFormat::P01010le, 320, 240)
+            .colorimetry(&pq)
+            .build()
+            .unwrap();
+        let raw = GstVideoInfo::RAW(info.clone());
+        assert!(same_output_contract(&raw, &GstVideoInfo::RAW(hdr)));
+        let vk = GstVideoInfo::VULKAN(VulkanParams {
+            video_info: info,
+            codec: VulkanCodec::H265,
+            profile: "main-10".into(),
+        });
+        assert!(
+            !same_output_contract(&raw, &vk),
+            "equal geometry cannot bridge memory types"
+        );
+        let mut changed = vk.clone();
+        if let GstVideoInfo::VULKAN(params) = &mut changed {
+            params.codec = VulkanCodec::Av1;
+        }
+        assert!(!same_output_contract(&vk, &changed));
+        if let GstVideoInfo::VULKAN(params) = &mut changed {
+            params.codec = VulkanCodec::H265;
+            params.profile = "main".into();
+        }
+        assert!(!same_output_contract(&vk, &changed));
+        let dma = |drm: &str| {
+            let caps = gst::Caps::builder("video/x-raw")
+                .features(["memory:DMABuf"])
+                .field("format", "DMA_DRM")
+                .field("drm-format", drm)
+                .field("width", 320i32)
+                .field("height", 240i32)
+                .build();
+            GstVideoInfo::DMA(VideoInfoDmaDrm::from_caps(&caps).unwrap())
+        };
+        assert!(!same_output_contract(
+            &dma("P010"),
+            &dma("P010:0x0100000000000002")
+        ));
+        let par = VideoInfo::builder(VideoFormat::P01010le, 320, 240)
+            .par((2, 1))
+            .build()
+            .unwrap();
+        assert!(!same_output_contract(&raw, &GstVideoInfo::RAW(par)));
     }
 }

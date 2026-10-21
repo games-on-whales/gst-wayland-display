@@ -119,6 +119,11 @@ fn dump_path() -> Option<&'static str> {
         std::env::var("GST_WAYLAND_DISPLAY_DUMP")
             .ok()
             .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("WOLF_VULKAN_DUMP")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
     })
     .as_deref()
 }
@@ -135,6 +140,7 @@ fn dump_frame_target() -> u64 {
         std::env::var("GST_WAYLAND_DISPLAY_DUMP_FRAME")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| std::env::var("WOLF_VULKAN_DUMP_FRAME").ok()?.parse().ok())
             .unwrap_or(20)
     })
 }
@@ -440,6 +446,7 @@ pub struct VulkanNv12 {
     /// True once at least one frame has completed conversion, so a busy-drop has a previous
     /// output to safely re-emit rather than reusing a slot the encoder still references.
     have_output: bool,
+    last_output_hdr: bool,
     /// Count of frames dropped because the target encode-src slot was still referenced at
     /// reuse time; drives rate-limited logging only.
     busy_drops: u64,
@@ -479,7 +486,12 @@ impl Default for ConversionOptions {
             ring_depth: RING,
             linear_encode_src: false,
             sdr_reference_white: 203.0,
-            hdr_peak_nits: 1000,
+            hdr_peak_nits: std::env::var("WOLF_HDR_PEAK_NITS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1000)
+                .min(65535),
             hdr_cm: false,
         }
     }
@@ -772,6 +784,7 @@ impl VulkanNv12 {
             outputs,
             next: 0,
             have_output: false,
+            last_output_hdr: false,
             busy_drops: 0,
             cur: 0,
             width,
@@ -939,6 +952,7 @@ impl VulkanNv12 {
             outputs,
             next: 0,
             have_output: false,
+            last_output_hdr: false,
             busy_drops: 0,
             cur: 0,
             width,
@@ -968,12 +982,26 @@ impl VulkanNv12 {
         // hazard that wedges the encoder, so only a slot every consumer has released (its
         // buffer writable again, refcount back to 1) may be reused. Take the next free slot in
         // ring order; if none is free, drop this frame and re-emit the last completed output
-        // (`to_gst_buffer` returns `cur`) rather than block the compositor thread waiting.
+        // (`to_gst_buffer` returns `cur`). A colorimetry transition must wait for a fresh
+        // slot: repeating SDR pixels under HDR caps (or vice versa) is never valid.
         let idx = if self.encode_src {
             let n = self.outputs.len();
-            let free = (0..n)
-                .map(|i| (self.next + i) % n)
-                .find(|&i| self.outputs[i].buffer.get_mut().is_some());
+            let started = std::time::Instant::now();
+            let changing_color = self.dynamic.is_some() && self.last_output_hdr != color.output_hdr;
+            let free = loop {
+                let free = (0..n)
+                    .map(|i| (self.next + i) % n)
+                    .find(|&i| self.outputs[i].buffer.get_mut().is_some());
+                if free.is_some() || !changing_color {
+                    break free;
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(1) {
+                    return Err(
+                        "VulkanNv12: no free encode-src slot for HDR colorimetry transition".into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            };
             match free {
                 Some(i) => i,
                 None if !self.have_output => {
@@ -1326,9 +1354,9 @@ impl VulkanNv12 {
         // (the LINEAR scratch on the encode-src path) holds exactly what the compute wrote,
         // before the tiled encode-src copy -- so a clean dump localises the green-bar/jump to
         // the tiled copy or the encoder. Off unless GST_WAYLAND_DISPLAY_DUMP is set; once, a
-        // few frames in (let the scene settle). Failures are logged, never fatal. Only the
-        // scratch is readable: on the direct path the image has been released to its consumer.
-        if let Some(path) = dump_path().filter(|_| !direct) {
+        // few frames in (let the scene settle). Failures are logged, never fatal. The
+        // direct export is reacquired for readback and released again before hand-off.
+        if let Some(path) = dump_path() {
             // Fire either at the fixed frame target (one-shot) OR on demand whenever a
             // `<path>.now` trigger file exists -- consumed each time so every touch captures
             // exactly one fresh frame. The trigger lets a specific live gameplay frame be
@@ -1367,11 +1395,12 @@ impl VulkanNv12 {
 
         self.cur = idx;
         self.have_output = true;
+        self.last_output_hdr = color.output_hdr;
         Ok(())
     }
 
     /// One-shot debug readback of a multiplanar NV12/P010 image (must be in
-    /// TRANSFER_SRC_OPTIMAL and have TRANSFER_SRC usage -- true for the compute scratch) into
+    /// TRANSFER_SRC_OPTIMAL for scratch, GENERAL/foreign for direct exports) into
     /// a host buffer, then write tight raw planar (`w*h*bpp` Y plane + `w*h/2*bpp` interleaved
     /// UV) to `path`. `bpp` is 1 for NV12, 2 for P010 (16-bit samples, value in the MSBs).
     unsafe fn dump_planar(&self, img: vk::Image, w: u32, h: u32, path: &str) -> Result<(), Err> {
@@ -1405,6 +1434,30 @@ impl VulkanNv12 {
         )?[0];
         self.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+        if self.direct {
+            let barriers =
+                [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1].map(|aspect| {
+                    img_barrier(
+                        img,
+                        aspect,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_READ,
+                    )
+                    .src_queue_family_index(self.foreign_qf)
+                    .dst_queue_family_index(self.qfi)
+                });
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+        }
         let regions = [
             vk::BufferImageCopy::default()
                 .buffer_offset(0)
@@ -1438,6 +1491,30 @@ impl VulkanNv12 {
             buf,
             &regions,
         );
+        if self.direct {
+            let barriers =
+                [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1].map(|aspect| {
+                    img_barrier(
+                        img,
+                        aspect,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::empty(),
+                    )
+                    .src_queue_family_index(self.qfi)
+                    .dst_queue_family_index(self.foreign_qf)
+                });
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+        }
         self.device.end_command_buffer(cmd)?;
         let fence = self
             .device
@@ -1981,7 +2058,13 @@ unsafe fn create_output(
             memp,
             width,
             height,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | if dump_path().is_some() {
+                    vk::ImageUsageFlags::TRANSFER_SRC
+                } else {
+                    vk::ImageUsageFlags::empty()
+                },
             true,
             fmt,
         )?;
@@ -2338,4 +2421,40 @@ fn img_barrier(
             base_array_layer: 0,
             layer_count: 1,
         })
+}
+
+#[cfg(test)]
+mod legacy_environment_tests {
+    #[test]
+    fn legacy_diagnostics_and_peak_default_are_preserved() {
+        if let Ok(case) = std::env::var("GST_LEGACY_ENV_TEST_CHILD") {
+            assert_eq!(super::ConversionOptions::default().hdr_peak_nits, 1600);
+            assert_eq!(
+                super::dump_path(),
+                Some(if case == "legacy" {
+                    "/tmp/legacy-frame"
+                } else {
+                    "/tmp/new-frame"
+                })
+            );
+            assert_eq!(
+                super::dump_frame_target(),
+                if case == "legacy" { 31 } else { 42 }
+            );
+            return;
+        }
+        for case in ["legacy", "override"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "utils::vulkan_nv12::legacy_environment_tests::legacy_diagnostics_and_peak_default_are_preserved"])
+                .env("GST_LEGACY_ENV_TEST_CHILD", case).env("WOLF_HDR_PEAK_NITS", "1600")
+                .env("WOLF_VULKAN_DUMP", "/tmp/legacy-frame").env("WOLF_VULKAN_DUMP_FRAME", "31")
+                .env_remove("GST_WAYLAND_DISPLAY_DUMP").env_remove("GST_WAYLAND_DISPLAY_DUMP_FRAME");
+            if case == "override" {
+                command
+                    .env("GST_WAYLAND_DISPLAY_DUMP", "/tmp/new-frame")
+                    .env("GST_WAYLAND_DISPLAY_DUMP_FRAME", "42");
+            }
+            assert!(command.status().unwrap().success());
+        }
+    }
 }

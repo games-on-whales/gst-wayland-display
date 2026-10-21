@@ -4,9 +4,8 @@
 //! (printing why) when the matching GPU or encoder element is absent, so a plain
 //! `cargo test` stays green on a machine with no GPU. The harness
 //! (`ci/harness.sh`, phase `gpu`) runs them with `--ignored` on the boxes that
-//! do have GPUs. A runner that is meant to have the hardware sets
-//! `GST_WAYLAND_DISPLAY_REQUIRE_GPU=1`, which turns every skip into a failure so a
-//! missing GPU or encoder cannot pass silently.
+//! do have GPUs. `GST_WAYLAND_DISPLAY_REQUIRE_GPU=1` makes the harness require
+//! a render node. Tests for other vendors or unsupported codecs still skip.
 //!
 //! What they cover that the unit tests don't:
 //!   * the source negotiates an NV12 modifier the encoder accepts and drives a
@@ -50,8 +49,18 @@ fn ensure_runtime_dir() {
 
 /// First render node whose kernel driver matches any of `drivers`.
 fn render_node_for(drivers: &[&str]) -> Option<String> {
+    // The harness already supplies VULKAN_ENC_NODE/NV12_TEST_NODE. Honor that
+    // selection for the full suite, so a multi-GPU host can validate each device.
+    let selected =
+        std::env::var_os("VULKAN_ENC_NODE").or_else(|| std::env::var_os("NV12_TEST_NODE"));
     let entries = std::fs::read_dir("/dev/dri").ok()?;
     for e in entries.flatten() {
+        if selected
+            .as_ref()
+            .is_some_and(|node| e.path() != std::path::Path::new(node))
+        {
+            continue;
+        }
         let name = e.file_name().to_string_lossy().into_owned();
         if !name.starts_with("renderD") {
             continue;
@@ -122,9 +131,6 @@ fn run_to_eos(desc: &str) -> Result<(), String> {
 macro_rules! skip {
     ($($a:tt)*) => {{
         let why = format!($($a)*);
-        if std::env::var_os("GST_WAYLAND_DISPLAY_REQUIRE_GPU").is_some() {
-            panic!("required hardware missing: {why}");
-        }
         eprintln!("skip: {why}");
         return;
     }};
@@ -140,9 +146,13 @@ fn negotiated_caps(desc: &str) -> gst::Caps {
     let src = pipeline.by_name("src").expect("element named src");
     pipeline.set_state(gst::State::Playing).expect("Playing");
     let bus = pipeline.bus().expect("bus");
+    let mut saw_eos = false;
     for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
         match msg.view() {
-            gst::MessageView::Eos(..) => break,
+            gst::MessageView::Eos(..) => {
+                saw_eos = true;
+                break;
+            }
             gst::MessageView::Error(err) => {
                 let _ = pipeline.set_state(gst::State::Null);
                 panic!("{}: {:?}", err.error(), err.debug());
@@ -155,6 +165,10 @@ fn negotiated_caps(desc: &str) -> gst::Caps {
         .and_then(|p| p.current_caps())
         .expect("negotiated caps");
     let _ = pipeline.set_state(gst::State::Null);
+    assert!(
+        saw_eos,
+        "caps were negotiated but the source never reached EOS"
+    );
     caps
 }
 
@@ -247,7 +261,7 @@ fn vulkan_without_encoder_uses_its_own_device() {
     };
     run_to_eos(&format!(
         "waylanddisplaysrc render-node={node} vulkan=true num-buffers=5 ! \
-         video/x-raw(memory:VulkanImage),format=NV12,width=320,height=240 ! fakesink"
+         video/x-raw(memory:VulkanImage),format=NV12,width=320,height=240,framerate=30/1 ! fakesink"
     ))
     .expect("Vulkan output without an encoder");
 }
@@ -263,7 +277,7 @@ fn nv12_caps_carry_the_bt601_matrix() {
     };
     let caps = negotiated_caps(&format!(
         "waylanddisplaysrc name=src render-node={node} num-buffers=5 ! \
-         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1280,height=720 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1280,height=720,framerate=30/1 ! \
          fakesink"
     ));
     let colorimetry: gst_video::VideoColorimetry = caps_field(&caps, "colorimetry")
@@ -285,7 +299,7 @@ fn p010_hdr_caps_carry_pq_and_metadata() {
     let caps = negotiated_caps(&format!(
         "waylanddisplaysrc name=src render-node={node} hdr=true hdr-peak-luminance=600 \
          num-buffers=5 ! \
-         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1280,height=720 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1280,height=720,framerate=30/1 ! \
          fakesink"
     ));
     assert_eq!(
@@ -313,7 +327,7 @@ fn dynamic_hdr_p010_starts_sdr() {
     };
     let caps = negotiated_caps(&format!(
         "waylanddisplaysrc name=src render-node={node} dynamic-hdr=true num-buffers=30 ! \
-         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1280,height=720 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1280,height=720,framerate=30/1 ! \
          fakesink"
     ));
     assert_eq!(caps_field(&caps, "colorimetry").as_deref(), Some("bt709"));
@@ -381,7 +395,7 @@ fn vulkan_av1_encode_to_eos() {
 }
 
 /// Dynamic HDR end to end: a client declaring PQ through `wp_color_management_v1` makes the
-/// source post `wayland-display-hdr-state` (hdr=true) and retag its P010 caps as BT.2100 PQ
+/// source post `wolf-hdr-state` (hdr=true) and retag its P010 caps as BT.2100 PQ
 /// with mastering metadata, after the debounce and without renegotiating format or size.
 #[test]
 #[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
@@ -418,7 +432,7 @@ fn dynamic_hdr_flips_caps_for_a_pq_client() {
                     client = Some(std::thread::spawn(move || {
                         hdr_client::run_pq_client(socket, stop)
                     }));
-                } else if s.name() == "wayland-display-hdr-state" {
+                } else if s.name() == "wolf-hdr-state" {
                     assert!(
                         s.get::<bool>("hdr").unwrap(),
                         "first transition must be to HDR"
@@ -431,7 +445,7 @@ fn dynamic_hdr_flips_caps_for_a_pq_client() {
             _ => {}
         }
     }
-    assert!(flipped, "no wayland-display-hdr-state message within 20s");
+    assert!(flipped, "no wolf-hdr-state message within 20s");
     // The retag happens before the first HDR frame is pushed; give it a frame to land.
     let mut caps = None;
     for _ in 0..50 {
@@ -560,12 +574,20 @@ fn resolution_change_keeps_rendering() {
     let Some(node) = any_render_node() else {
         skip!("no render node")
     };
-    for caps in [
-        "video/x-raw,format=RGBx",
-        "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12",
-    ] {
+    let mut outputs = vec![
+        ("video/x-raw,format=RGBx", false),
+        (
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12",
+            false,
+        ),
+    ];
+    if have("vulkanh264enc") {
+        outputs.push(("video/x-raw(memory:VulkanImage),format=NV12", true));
+    }
+    for (caps, vulkan) in outputs {
+        let vk = if vulkan { "vulkan=true" } else { "" };
         let p = gst::parse::launch(&format!(
-            "waylanddisplaysrc render-node={node} ! capsfilter name=f caps=\"{caps},width=320,height=240,framerate=30/1\" ! \
+            "waylanddisplaysrc render-node={node} {vk} ! capsfilter name=f caps=\"{caps},width=320,height=240,framerate=30/1\" ! \
              fakesink name=s signal-handoffs=true"
         ))
         .unwrap()

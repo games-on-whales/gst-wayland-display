@@ -187,16 +187,6 @@ impl VulkanShare {
             return false;
         }
         let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
-        let missing = missing_extensions(&device);
-        if !missing.is_empty() {
-            tracing::warn!(
-                "vulkan_share: refusing shared GstVulkanDevice {dev_ptr:?} without {missing:?}; \
-                 memory:VulkanImage output is not offered"
-            );
-            self.refused
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return false;
-        }
         let mut slot = self.device.lock().unwrap();
         // Keep the device this element already has. GstBin fans a have-context message to
         // EVERY child, so with two waylanddisplaysrc in one bin the second element's encoder
@@ -223,6 +213,16 @@ impl VulkanShare {
                 }
             }
             return true;
+        }
+        let missing = missing_extensions(&device);
+        if !missing.is_empty() {
+            tracing::warn!(
+                "vulkan_share: refusing shared GstVulkanDevice {dev_ptr:?} without {missing:?}; \
+                 memory:VulkanImage output is not offered"
+            );
+            self.refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
         }
         tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
         *slot = Some(device);

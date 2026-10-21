@@ -37,8 +37,8 @@ jobs:
 
   # Full matrix (gpu / integration / bench) on real hardware. Off by default;
   # enable by registering a self-hosted runner labelled `gpu` and setting the
-  # repository variable GPU_RUNNER=true. On that runner a skipped GPU test is a
-  # failure.
+  # repository variable GPU_RUNNER=true. Require a render node and at least
+  # one compatible encoder integration; tests for other vendors may skip.
   harness-gpu:
     name: harness (full · GPU)
     if: ${{ vars.GPU_RUNNER == 'true' }}
