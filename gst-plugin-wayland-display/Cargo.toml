@@ -6,7 +6,7 @@ edition = "2024"
 license = "MIT"
 description = "GStreamer Wayland Compositor Src"
 repository = "https://github.com/games-on-whales/wolf"
-rust-version = "1.88"
+rust-version = "1.92"
 
 [lib]
 name = "gstwaylanddisplaysrc"
@@ -31,6 +31,12 @@ tracing.workspace = true
 once_cell.workspace = true
 tracing-subscriber = "0.3.16"
 input-event-codes-sys = "0.1.0"
+
+[dev-dependencies]
+# The dynamic-HDR GPU test drives a wp_color_management_v1 client against the source.
+wayland-client = "0.31.10"
+wayland-protocols = { version = "0.32.8", features = ["client", "staging"] }
+tempfile = "3.20.0"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.7.5"

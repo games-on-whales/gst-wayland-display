@@ -33,7 +33,10 @@
 #     -v, --verbose                   stream sub-command output
 #     -h, --help                      this help
 #
-# Exit status is non-zero if any selected phase failed.
+# Exit status is non-zero if any selected phase failed. With
+# GST_WAYLAND_DISPLAY_REQUIRE_GPU=1 (set on the GPU runner) a
+# missing render node fails the gpu / integration phases. Tests for other vendors
+# and unsupported codecs still skip.
 set -uo pipefail
 
 # --- locate repo root (this script lives in <root>/ci) -----------------------
@@ -69,7 +72,7 @@ log()  { printf '%s==>%s %s\n' "$c_cyn" "$c_reset" "$*"; }
 warn() { printf '%sWARN%s %s\n' "$c_ylw" "$c_reset" "$*"; }
 err()  { printf '%sFAIL%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
 
-declare -A RESULT  # phase -> PASS/FAIL/SKIP
+declare -A RESULT=()  # phase -> PASS/FAIL/SKIP
 run_phase() {       # run_phase <name> <fn>
   local name="$1" fn="$2"
   log "phase: $name"
@@ -93,13 +96,13 @@ sh_run() {
 CARGO="${CARGO:-cargo}"
 LIBCLANG="${LIBCLANG_PATH:-}"
 HAVE_NVIDIA=0
-declare -A NODE_FOR_VENDOR  # vendor -> /dev/dri/renderDNNN
+declare -A NODE_FOR_VENDOR=()  # vendor -> /dev/dri/renderDNNN
 
 detect_env() {
   command -v "$CARGO" >/dev/null || { err "cargo not found (install rustup)"; return 1; }
   # bindgen needs libclang for input-event-codes-sys
   if [[ -z "$LIBCLANG" ]]; then
-    LIBCLANG="$(dirname "$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)" 2>/dev/null)"
+    LIBCLANG="$(dirname "$(find /usr/lib64 /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)" 2>/dev/null)"
   fi
   [[ -n "$LIBCLANG" ]] && export LIBCLANG_PATH="$LIBCLANG"
 
@@ -184,8 +187,16 @@ phase_unit() {
     $([[ $PROFILE == release ]] && echo --release)
 }
 
+# No render node: skip, unless this runner is supposed to have a GPU.
+no_gpu() {
+  if [[ -n "${GST_WAYLAND_DISPLAY_REQUIRE_GPU:-}" ]]; then
+    err "no GPU render node, but GST_WAYLAND_DISPLAY_REQUIRE_GPU is set"; return 1
+  fi
+  warn "no GPU; skipping"; return 0
+}
+
 phase_gpu() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then no_gpu; return; fi
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
   log "  GPU-gated Rust tests on $node"
   NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
@@ -213,19 +224,26 @@ run_to_eos() { # run_to_eos <label> <pipeline...>
 }
 
 phase_integration() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
-  command -v gst-inspect-1.0 >/dev/null || { warn "no gst-launch; skipping"; return 0; }
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then no_gpu; return; fi
+  command -v gst-inspect-1.0 >/dev/null || {
+    if [[ -n "${GST_WAYLAND_DISPLAY_REQUIRE_GPU:-}" ]]; then
+      err "gst-inspect is required on the GPU runner"; return 1
+    fi
+    warn "no gst-inspect; skipping"; return 0
+  }
   ginspect waylanddisplaysrc || { err "plugin not built (run 'build' first)"; return 1; }
-  local ok=1 node res="width=1280,height=720,framerate=60/1"
+  local ok=1 ran=0 node res="width=1280,height=720,framerate=60/1"
 
   # AMD / Intel: the VA encoder pulls NV12 straight from the source dmabuf.
   if [[ -n "${NODE_FOR_VENDOR[amd]:-}" ]] && gst-inspect-1.0 vah265enc >/dev/null 2>&1; then
     node="${NODE_FOR_VENDOR[amd]}"
+    ran=1
     run_to_eos "amd:vah265enc" waylanddisplaysrc render-node="$node" num-buffers=30 \
       ! vah265enc ! fakesink || ok=0
   fi
   if [[ -n "${NODE_FOR_VENDOR[intel]:-}" ]] && gst-inspect-1.0 vah265lpenc >/dev/null 2>&1; then
     node="${NODE_FOR_VENDOR[intel]}"
+    ran=1
     LIBVA_DRIVER_NAME=iHD run_to_eos "intel:vah265lpenc" \
       waylanddisplaysrc render-node="$node" num-buffers=30 ! vah265lpenc ! fakesink || ok=0
   fi
@@ -233,6 +251,7 @@ phase_integration() {
   if [[ -n "${NODE_FOR_VENDOR[nvidia]:-}" ]] && gst-inspect-1.0 nvh265enc >/dev/null 2>&1 \
      && ginspect dmabuftocuda; then
     node="${NODE_FOR_VENDOR[nvidia]}"
+    ran=1
     run_to_eos "nvidia:nvh265enc" waylanddisplaysrc render-node="$node" num-buffers=30 \
       ! "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,$res" \
       ! dmabuftocuda render-node="$node" ! nvh265enc ! fakesink || ok=0
@@ -242,9 +261,13 @@ phase_integration() {
   if gst-inspect-1.0 vulkanh264enc >/dev/null 2>&1; then
     node="${FORCE_NODE:-${NODE_FOR_VENDOR[nvidia]:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-}}}}"
     if [[ -n "$node" ]]; then
+      ran=1
       run_to_eos "vulkan:vulkanh264enc" waylanddisplaysrc render-node="$node" vulkan=true \
         num-buffers=30 ! vulkanh264enc ! fakesink || ok=0
     fi
+  fi
+  if [[ $ran -eq 0 && -n "${GST_WAYLAND_DISPLAY_REQUIRE_GPU:-}" ]]; then
+    err "no compatible GPU encoder integration ran"; return 1
   fi
   [[ $ok -eq 1 ]]
 }

@@ -86,13 +86,16 @@ use crate::utils::allocator::{
     GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
 };
+use crate::utils::color::FrameColor;
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
+use crate::wayland::handlers::color_management::{SurfaceHdrColor, surface_hdr_color};
 use crate::{
     utils::RenderTarget,
     wayland::protocols::{
-        frog_color_management::create_frog_color_management_global, wl_drm::create_drm_global,
+        frog_color_management::{FrogGlobalData, create_frog_color_management_global},
+        wl_drm::create_drm_global,
     },
 };
 
@@ -119,16 +122,11 @@ pub struct State {
     pub renderer: GlesRenderer,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
-    /// Dynamic-HDR per-frame PQ-passthrough selector: true when the active fullscreen surface's
-    /// most-recent committed buffer is a 10-bit fourcc (gamescope's already-PQ BT.2020 HDR
-    /// output, XB30/AB30/XR30/AR30). Threaded into the Vulkan converter's `convert()` so a
-    /// 10-bit frame uses the matrix-only passthrough shader instead of re-applying PQ. Always
-    /// false unless dynamic HDR is enabled (set only in the compositor commit handler).
-    pub(crate) current_input_is_pq: bool,
 
     // management
     pub output: Option<Output>,
     pub video_info: Option<VideoInfo>,
+    negotiated_output: Option<GstVideoInfo>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -172,10 +170,18 @@ pub struct State {
     /// Reverse channel (compositor -> element) used to signal OUTPUT HDR-state changes.
     /// `Some` only when dynamic HDR is enabled; `None` keeps the per-frame check a no-op so
     /// behaviour is exactly as before. See [`State::update_hdr_state`].
-    hdr_state_tx: Option<Sender<Command>>,
+    pub(crate) hdr_state_tx: Option<Sender<Command>>,
     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
-    /// log + signal on an actual change. Defaults to `false` (SDR).
+    /// log + signal on an actual change. Defaults to `false` (SDR). This committed state,
+    /// not the raw per-commit surface state, picks the converter shader, so a frame's
+    /// pixels always match the colorimetry the element tags it with.
     last_hdr_state: bool,
+    /// Mastering / CLL caps strings last signalled with an HDR state, so a game that updates
+    /// its metadata after the flip reaches the encoder too.
+    last_hdr_meta: Option<(String, String)>,
+    /// Set when downstream refused the HDR colorimetry: the output stays SDR for the rest of
+    /// the stream instead of flipping into caps nobody accepts.
+    hdr_refused: bool,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -271,6 +277,7 @@ impl State {
         input_context: &Libinput,
         event_loop_handle: LoopHandle<'static, State>,
         hdr_cm: bool,
+        hdr_peak_nits: u32,
     ) -> Self {
         let clock = Clock::new();
 
@@ -307,7 +314,12 @@ impl State {
             tracing::info!(
                 "dynamic HDR: advertising frog_color_management_v1 (gamescope HDR path)"
             );
-            Some(create_frog_color_management_global::<State>(&dh))
+            Some(create_frog_color_management_global::<State>(
+                &dh,
+                FrogGlobalData {
+                    peak_nits: hdr_peak_nits,
+                },
+            ))
         } else {
             None
         };
@@ -429,8 +441,8 @@ impl State {
             render_node,
             dmabuf_global,
             video_info: None,
+            negotiated_output: None,
             last_render: None,
-            current_input_is_pq: false,
 
             space,
             popups: PopupManager::default(),
@@ -465,6 +477,8 @@ impl State {
             frog_color_mgmt_global,
             hdr_state_tx: None,
             last_hdr_state: false,
+            last_hdr_meta: None,
+            hdr_refused: false,
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
             hdr_candidate_since: None,
@@ -472,47 +486,78 @@ impl State {
         }
     }
 
-    /// Whether the active fullscreen surface is HDR (BT.2100 PQ / BT.2020, per
-    /// `wp_color_management_v1`). The compositor forces one fullscreen toplevel at a time,
-    /// so the first mapped window in the space is the active one. `false` when no window is
-    /// mapped or it carries no (or a non-HDR) image description.
-    pub fn output_hdr_state(&self) -> bool {
-        // HDR when EITHER the active surface declares HDR via wp_color_management
-        // (surface_is_hdr) OR the current composited content is a 10-bit already-PQ buffer
-        // (current_input_is_pq). gamescope -- the real Steam/HDR path -- does NOT use the
-        // color-management protocol; it just submits 10-bit PQ buffers, so the fourcc-based
-        // current_input_is_pq is the signal that actually flips for it. Without this the
-        // producer colorimetry never flips to bt2100-pq for a gamescope HDR game.
-        if self.current_input_is_pq {
-            return true;
-        }
+    /// The colour state of the active surface: the topmost mapped toplevel (smithay
+    /// iterates the space back to front and `raise_element` moves the focused window to
+    /// the end), using the toplevel's color state. Steam and a game can both be mapped, so the
+    /// bottom window is not the one on screen. `None` when nothing is mapped or the
+    /// surface declared no colour state.
+    fn active_surface_hdr_color(&self) -> Option<SurfaceHdrColor> {
         self.space
             .elements()
-            .next()
+            .last()
             .and_then(|window| window.wl_surface())
-            .map(|surface| crate::wayland::handlers::color_management::surface_is_hdr(&surface))
-            .unwrap_or(false)
+            .and_then(|surface| surface_hdr_color(&surface))
     }
 
-    /// The active fullscreen surface's HDR mastering / content-light-level gst caps strings,
-    /// from whichever color-management protocol provided them (frog for gamescope,
-    /// `wp_color_management_v1` for sway). `None` when there is no surface or it carries no
-    /// mastering metadata -- the producer then keeps its hardcoded HDR defaults.
+    /// Whether the active surface declares HDR content (PQ, through
+    /// `frog_color_management_v1` or `wp_color_management_v1`). The buffer fourcc is not a
+    /// signal: 10-bit SDR exists. Always `false` once downstream refused HDR.
+    pub fn output_hdr_state(&self) -> bool {
+        !self.hdr_refused
+            && self
+                .active_surface_hdr_color()
+                .is_some_and(|color| color.is_hdr())
+    }
+
+    /// The active surface's HDR mastering / content-light-level gst caps strings. `None`
+    /// when it carries no mastering metadata -- the producer then keeps its defaults.
     fn active_surface_mastering_caps(&self) -> Option<(String, String)> {
-        self.space
-            .elements()
-            .next()
-            .and_then(|window| window.wl_surface())
-            .and_then(|surface| {
-                crate::wayland::handlers::color_management::surface_mastering_caps(&surface)
-            })
+        self.active_surface_hdr_color()
+            .and_then(|color| color.mastering_caps())
+    }
+
+    /// How the converter must treat the next frame: the committed (debounced) output state
+    /// the element tags it with, and the transfer function of the content it samples.
+    pub(crate) fn frame_color(&self) -> FrameColor {
+        FrameColor {
+            output_hdr: self.last_hdr_state,
+            content: self
+                .active_surface_hdr_color()
+                .map(|color| color.transfer)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Downstream refused the HDR colorimetry: stay SDR from now on, and switch the very
+    /// next frame (no debounce), since the element has already fallen back to SDR caps.
+    pub(crate) fn refuse_hdr(&mut self) {
+        tracing::warn!("dynamic HDR: downstream refused HDR caps; staying SDR");
+        self.hdr_refused = true;
+        self.hdr_candidate_since = None;
+        if self.last_hdr_state {
+            self.last_hdr_state = false;
+            self.last_hdr_meta = None;
+            self.send_hdr_state(false, None);
+        }
+    }
+
+    fn send_hdr_state(&self, hdr: bool, meta: Option<(String, String)>) {
+        if let Some(tx) = &self.hdr_state_tx {
+            let (mastering, cll) = meta.unzip();
+            let _ = tx.send(Command::HdrState {
+                hdr,
+                mastering,
+                cll,
+            });
+        }
     }
 
     /// Recompute the OUTPUT HDR state and, on an actual change, log it and signal the
-    /// element over the reverse channel (so it can post a `wolf-hdr-state` application
-    /// message on the GStreamer bus). The stored-bool compare debounces repeats. No-op
-    /// unless dynamic HDR wired `hdr_state_tx`, so off = behaviour as before. Does NOT
-    /// touch the producer caps/shader -- this only derives + signals the trigger.
+    /// element over the reverse channel. Runs right before each frame is rendered, and the
+    /// element drains the channel after receiving that frame, so it can retag the caps
+    /// before pushing the first frame rendered in the new state. While HDR, a change in the
+    /// active surface's mastering metadata is signalled too. No-op unless dynamic HDR wired
+    /// `hdr_state_tx`.
     pub(crate) fn update_hdr_state(&mut self) {
         if self.hdr_state_tx.is_none() {
             return;
@@ -520,11 +565,18 @@ impl State {
         let hdr = self.output_hdr_state();
         if hdr == self.last_hdr_state {
             // Settled back to the current committed state -> cancel any pending flip.
-            // This is what filters the rapid HDR<->SDR flicker: a stray 8-bit UI frame
-            // between 10-bit game frames flips output_hdr_state for a few ms, but it
-            // returns to HDR before the debounce elapses, so the candidate is cancelled
-            // and the TV never switches mode.
+            // This is what filters the rapid HDR<->SDR flicker: brief transitions return
+            // before the debounce elapses, so the candidate is cancelled and the TV never
+            // switches mode. Frames in between are still converted for the committed state.
             self.hdr_candidate_since = None;
+            if hdr {
+                let meta = self.active_surface_mastering_caps();
+                if meta != self.last_hdr_meta {
+                    tracing::info!("output HDR metadata updated: {meta:?}");
+                    self.last_hdr_meta = meta.clone();
+                    self.send_hdr_state(true, meta);
+                }
+            }
             return;
         }
         // `hdr` differs from the committed state -> a candidate flip. Only commit it once
@@ -539,24 +591,15 @@ impl State {
                     if hdr { "HDR" } else { "SDR" }
                 );
                 // When going HDR, carry the active surface's REAL mastering / CLL metadata
-                // (from whichever color-management protocol the nested compositor speaks) so
-                // the encoder's SEI reflects the game's actual luminance; `None` => the
-                // producer keeps its hardcoded HDR defaults. SDR carries no metadata.
-                let (mastering, cll) = if hdr {
-                    match self.active_surface_mastering_caps() {
-                        Some((m, c)) => (Some(m), Some(c)),
-                        None => (None, None),
-                    }
+                // so the encoder's SEI reflects the game's actual luminance; `None` => the
+                // producer keeps its defaults. SDR carries no metadata.
+                let meta = if hdr {
+                    self.active_surface_mastering_caps()
                 } else {
-                    (None, None)
+                    None
                 };
-                if let Some(tx) = &self.hdr_state_tx {
-                    let _ = tx.send(Command::HdrState {
-                        hdr,
-                        mastering,
-                        cll,
-                    });
-                }
+                self.last_hdr_meta = meta.clone();
+                self.send_hdr_state(hdr, meta);
             }
             Some(_) => {} // candidate still maturing
             None => self.hdr_candidate_since = Some(Instant::now()),
@@ -564,17 +607,41 @@ impl State {
     }
 }
 
-/// True when `new` differs from `prev` ONLY in colorimetry -- same pixel format, width, height,
-/// and frame rate, but a different colorimetry (matrix/transfer/primaries/range, e.g. a dynamic
-/// HDR bt709<->bt2100-pq flip). Used under dynamic HDR to skip the Vulkan converter rebuild
-/// for such a re-negotiation: the converter produces correct pixels per frame regardless of the
-/// caps colorimetry, so only the downstream caps tag needs to change.
-fn colorimetry_only_change(prev: &VideoInfo, new: &VideoInfo) -> bool {
-    prev.format() == new.format()
-        && prev.width() == new.width()
-        && prev.height() == new.height()
-        && prev.fps() == new.fps()
-        && prev.colorimetry() != new.colorimetry()
+/// Keep a converter only when the complete memory/layout/codec contract is unchanged.
+/// Color fields are the only fields a dynamic HDR retag may change without rebuilding.
+fn same_output_contract(prev: &GstVideoInfo, new: &GstVideoInfo) -> bool {
+    fn without_color(caps: Result<gst::Caps, gst::glib::BoolError>) -> Option<gst::Caps> {
+        let mut caps = caps.ok()?;
+        let s = caps.get_mut()?.structure_mut(0)?;
+        for field in [
+            "colorimetry",
+            "mastering-display-info",
+            "content-light-level",
+        ] {
+            s.remove_field(field);
+        }
+        Some(caps)
+    }
+    let (prev, new) = match (prev, new) {
+        (GstVideoInfo::RAW(p), GstVideoInfo::RAW(n)) => (p.to_caps(), n.to_caps()),
+        (GstVideoInfo::DMA(p), GstVideoInfo::DMA(n)) => (p.to_caps(), n.to_caps()),
+        (GstVideoInfo::VULKAN(p), GstVideoInfo::VULKAN(n))
+            if p.codec == n.codec && p.profile == n.profile =>
+        {
+            (p.video_info.to_caps(), n.video_info.to_caps())
+        }
+        #[cfg(feature = "cuda")]
+        (GstVideoInfo::CUDA(p), GstVideoInfo::CUDA(n))
+            if Arc::ptr_eq(&p.cuda_context, &n.cuda_context) =>
+        {
+            (p.video_info.to_caps(), n.video_info.to_caps())
+        }
+        _ => return false,
+    };
+    match (without_color(prev), without_color(new)) {
+        (Some(p), Some(n)) => p == n,
+        _ => false,
+    }
 }
 
 /// Apply a newly-negotiated `GstVideoInfo` to the compositor state: create or update
@@ -591,11 +658,34 @@ pub(crate) fn apply_video_info(
     render_target: &RenderTarget,
     render_node: Option<DrmNode>,
 ) {
+    let base_info: VideoInfo = video_info.clone().into();
+
+    // Dynamic HDR: the producer flips its output caps colorimetry mid-stream
+    // (bt709 SDR <-> bt2100-pq HDR), or updates its HDR metadata, on the SAME
+    // format/resolution/fps. Tearing down and rebuilding the Vulkan converter (GsNv12Buf /
+    // VulkanNv12) on the compositor thread for that starves frame production and crashes the
+    // live stream, and nothing about the output changed for the clients either: re-sending the
+    // mode and configures and recentring the pointer would yank the cursor on every HDR flip.
+    // The converter picks its shader per frame from the committed HDR state, and the caps tag
+    // reaches the encoder through the producer's caps event, so just record the new info.
+    if state.hdr_cm
+        && state.output_buffer.is_some()
+        && state
+            .negotiated_output
+            .as_ref()
+            .is_some_and(|prev| same_output_contract(prev, &video_info))
+    {
+        tracing::info!("apply_video_info: colorimetry-only change, keeping output and converter");
+        state.video_info = Some(base_info);
+        state.negotiated_output = Some(video_info);
+        return;
+    }
+
+    state.negotiated_output = Some(video_info.clone());
     let output_already_running = state.output.is_some();
     if output_already_running {
         tracing::info!("Output already running, updating with newly negotiated video info");
     }
-    let base_info: VideoInfo = video_info.clone().into();
     debug!(
         "Requested video format: {} .to_fourcc() = {}",
         base_info.format(),
@@ -634,30 +724,14 @@ pub(crate) fn apply_video_info(
     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
     state.pointer_location = position;
     state.pointer_absolute_location = position;
-    let prev_video_info = state.video_info.clone();
     state.video_info = Some(video_info.clone().into());
 
-    // Dynamic HDR: the producer flips its output caps colorimetry mid-stream
-    // (bt709 SDR <-> bt2100-pq HDR) on the SAME format/resolution/fps. Tearing down and
-    // rebuilding the Vulkan converter (GsNv12Buf / VulkanNv12) on the compositor thread for
-    // that starves frame production and crashes the live stream. The converter produces correct
-    // pixels per frame from current_input_is_pq regardless of the caps colorimetry, so a
-    // colorimetry-only re-negotiation can keep the existing converter. The caps tag still
-    // propagates to the encoder via the producer's caps event independently of this.
-    let keep_converter = state.hdr_cm
-        && state.output_buffer.is_some()
-        && prev_video_info
-            .as_ref()
-            .is_some_and(|prev| colorimetry_only_change(prev, &base_info));
-    if keep_converter {
-        tracing::info!("apply_video_info: colorimetry-only change, keeping converter");
-    } else {
+    {
         match render_target {
             RenderTarget::Hardware(_) => match video_info {
                 GstVideoInfo::RAW(base_info) => {
-                    let allocator = GsGlesbuffer::new(&mut state.renderer, base_info)
-                        .expect("Failed to create GsGlesbuffer");
-                    state.output_buffer = Some(GsBufferType::RAW(allocator));
+                    state.output_buffer =
+                        GsGlesbuffer::new(&mut state.renderer, base_info).map(GsBufferType::RAW);
                 }
                 GstVideoInfo::DMA(base_info) => {
                     let node = render_node.unwrap();
@@ -675,7 +749,7 @@ pub(crate) fn apply_video_info(
                         _ => None,
                     };
                     if let Some(conv_fmt) = conv_fmt {
-                        let allocator = GsNv12Buf::new(
+                        state.output_buffer = GsNv12Buf::new(
                             &mut state.renderer,
                             node,
                             base_info,
@@ -683,12 +757,9 @@ pub(crate) fn apply_video_info(
                             &state.va_share,
                             state.vulkan_share.conversion_options(),
                         )
-                        .expect("Failed to create GsNv12Buf");
-                        state.output_buffer = Some(GsBufferType::NV12(allocator));
+                        .map(GsBufferType::NV12);
                     } else {
-                        let allocator =
-                            GsDmaBuf::new(node, base_info).expect("Failed to create GsDmaBuf");
-                        state.output_buffer = Some(GsBufferType::DMA(allocator));
+                        state.output_buffer = GsDmaBuf::new(node, base_info).map(GsBufferType::DMA);
                     }
                 }
                 GstVideoInfo::VULKAN(params) => {
@@ -699,33 +770,36 @@ pub(crate) fn apply_video_info(
                     // of panicking when it merely hasn't been shared yet. If it never comes,
                     // leave output_buffer unset -- the render loop turns that into a clean
                     // FlowError rather than aborting the process.
-                    // Clone the Arc so it can be passed to GsVulkanBuf::new while
-                    // `state.renderer` is borrowed mutably below.
+                    // Build the replacement before dropping the old allocation, as on
+                    // the DMA path.
+                    // Always replace it with None on failure, so old geometry is never sent
+                    // under newly negotiated caps.
                     let vulkan_share = Arc::clone(&state.vulkan_share);
-                    if vulkan_share
+                    let replacement = if vulkan_share
                         .wait_for_shared_device(Duration::from_secs(5))
                         .is_some()
                     {
-                        match GsVulkanBuf::new(
+                        let allocation = GsVulkanBuf::new(
                             &mut state.renderer,
                             node,
                             params.video_info,
+                            params.codec,
                             params.profile,
                             &vulkan_share,
-                        ) {
-                            Some(allocator) => {
-                                state.output_buffer = Some(GsBufferType::VULKAN(allocator))
-                            }
-                            None => tracing::error!(
+                        );
+                        if allocation.is_none() {
+                            tracing::error!(
                                 "Failed to create Vulkan output buffer despite a shared GstVulkanDevice"
-                            ),
+                            );
                         }
+                        allocation.map(GsBufferType::VULKAN)
                     } else {
                         tracing::error!(
-                            "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder \
-                         never shared its device. Cannot produce memory:VulkanImage output."
+                            "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder never shared its device. Cannot produce memory:VulkanImage output."
                         );
-                    }
+                        None
+                    };
+                    state.output_buffer = replacement;
                 }
                 #[cfg(feature = "cuda")]
                 GstVideoInfo::CUDA(base_info) => {
@@ -735,22 +809,25 @@ pub(crate) fn apply_video_info(
                         .display()
                         .get_display_handle()
                         .handle;
-                    let allocator = GsCUDABuf::new(
+                    state.output_buffer = GsCUDABuf::new(
                         render_node.unwrap(),
                         base_info.cuda_context,
                         base_info.video_info,
                         Arc::new(Mutex::new(None)),
                         &egl_display,
                     )
-                    .expect("Failed to create GsCUDABuf");
-                    state.output_buffer = Some(GsBufferType::CUDA(allocator));
+                    .map(GsBufferType::CUDA);
                 }
             },
             RenderTarget::Software => {
-                let allocator = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
-                    .expect("Failed to create GsGlesbuffer");
-                state.output_buffer = Some(GsBufferType::RAW(allocator));
+                state.output_buffer = GsGlesbuffer::new(&mut state.renderer, base_info.clone())
+                    .map(GsBufferType::RAW);
             }
+        }
+        // A setup failure must not take down the compositor thread: with no output buffer
+        // the render loop fails the frame cleanly.
+        if state.output_buffer.is_none() {
+            tracing::error!("Failed to create the output buffer for {base_info:?}");
         }
     }
 
@@ -785,6 +862,32 @@ pub(crate) fn apply_video_info(
             state.states.set(XdgState::Activated);
         });
         toplevel.send_configure();
+    }
+
+    if !output_already_running {
+        // Toplevels that committed before there was an output are still waiting for their
+        // initial configure; they won't commit again until they get it.
+        for window in &state.pending_windows {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            let (sent, max_size) = with_states(toplevel.wl_surface(), |states| {
+                (
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .is_some_and(|d| d.lock().unwrap().initial_configure_sent),
+                    states
+                        .cached_state
+                        .get::<SurfaceCachedState>()
+                        .current()
+                        .max_size,
+                )
+            });
+            if !sent {
+                state.send_initial_configure(window, max_size);
+            }
+        }
     }
 }
 
@@ -822,6 +925,7 @@ pub(crate) fn init(
         &input_context,
         event_loop.handle(),
         hdr_cm,
+        vulkan_share.conversion_options().hdr_peak_nits,
     );
     state.vulkan_share = vulkan_share;
     state.va_share = va_share;
@@ -887,7 +991,7 @@ pub(crate) fn init(
                                 buffer_sender.send(Err(SwapBuffersError::TemporaryFailure(Box::<
                                     dyn std::error::Error + Send + Sync,
                                 >::from(
-                                    "no output buffer: downstream did not share a GstVulkanDevice",
+                                    "no output buffer: the converter for the negotiated caps could not be created",
                                 ))));
                             state.should_quit = true;
                             return;
@@ -1130,6 +1234,7 @@ pub(crate) fn init(
                 // Reverse-direction signal: only ever sent compositor -> element over the
                 // dedicated `hdr_state_tx` channel, never received on this command channel.
                 Event::Msg(Command::HdrState { .. }) => {}
+                Event::Msg(Command::RefuseHdr) => state.refuse_hdr(),
             };
         })
         .unwrap();
@@ -1179,5 +1284,65 @@ pub(crate) fn init(
         }
     }) {
         tracing::error!(?err, "Event loop broke.");
+    }
+}
+
+#[cfg(test)]
+mod output_contract_tests {
+    use super::*;
+    use crate::utils::video_info::{VulkanCodec, VulkanParams};
+    use gst_video::{VideoFormat, VideoInfoDmaDrm};
+
+    #[test]
+    fn retag_requires_the_same_memory_modifier_codec_and_layout() {
+        gst::init().unwrap();
+        let info = VideoInfo::builder(VideoFormat::P01010le, 320, 240)
+            .build()
+            .unwrap();
+        let pq = "bt2100-pq".parse::<gst_video::VideoColorimetry>().unwrap();
+        let hdr = VideoInfo::builder(VideoFormat::P01010le, 320, 240)
+            .colorimetry(&pq)
+            .build()
+            .unwrap();
+        let raw = GstVideoInfo::RAW(info.clone());
+        assert!(same_output_contract(&raw, &GstVideoInfo::RAW(hdr)));
+        let vk = GstVideoInfo::VULKAN(VulkanParams {
+            video_info: info,
+            codec: VulkanCodec::H265,
+            profile: "main-10".into(),
+        });
+        assert!(
+            !same_output_contract(&raw, &vk),
+            "equal geometry cannot bridge memory types"
+        );
+        let mut changed = vk.clone();
+        if let GstVideoInfo::VULKAN(params) = &mut changed {
+            params.codec = VulkanCodec::Av1;
+        }
+        assert!(!same_output_contract(&vk, &changed));
+        if let GstVideoInfo::VULKAN(params) = &mut changed {
+            params.codec = VulkanCodec::H265;
+            params.profile = "main".into();
+        }
+        assert!(!same_output_contract(&vk, &changed));
+        let dma = |drm: &str| {
+            let caps = gst::Caps::builder("video/x-raw")
+                .features(["memory:DMABuf"])
+                .field("format", "DMA_DRM")
+                .field("drm-format", drm)
+                .field("width", 320i32)
+                .field("height", 240i32)
+                .build();
+            GstVideoInfo::DMA(VideoInfoDmaDrm::from_caps(&caps).unwrap())
+        };
+        assert!(!same_output_contract(
+            &dma("P010"),
+            &dma("P010:0x0100000000000002")
+        ));
+        let par = VideoInfo::builder(VideoFormat::P01010le, 320, 240)
+            .par((2, 1))
+            .build()
+            .unwrap();
+        assert!(!same_output_contract(&raw, &GstVideoInfo::RAW(par)));
     }
 }

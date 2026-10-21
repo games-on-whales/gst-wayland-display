@@ -21,7 +21,7 @@ use gst_video::{VideoFormat, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use libloading::Library;
 use std::ffi::CString;
-use std::os::fd::RawFd;
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::{Mutex, OnceLock};
 
@@ -171,6 +171,8 @@ impl VaShare {
 
 /// Plane layout of our exported NV12 dmabuf.
 pub struct Nv12Layout {
+    /// NV12 or P010_10LE: the two-plane 4:2:0 formats the converter exports.
+    pub format: VideoFormat,
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
@@ -182,12 +184,18 @@ pub struct Nv12Layout {
 }
 
 impl VaShare {
-    /// Build an NV12 gst buffer over `fd` that the VA encoder can *reuse* (zero per-frame
+    /// Build an NV12/P010 gst buffer over `fd` that the VA encoder can *reuse* (zero per-frame
     /// imports): the memory is from a gst-va dmabuf allocator (so `peek_display` resolves to
     /// the shared display) and a VA surface is attached via `gst_va_dmabuf_memories_setup`.
     /// Returns `None` (caller falls back to a plain dmabuf buffer) if no VA display is shared
-    /// or anything fails.
-    pub fn build_shared_buffer(&self, fd: RawFd, size: usize, l: &Nv12Layout) -> Option<GstBuffer> {
+    /// or anything fails. Takes ownership of `fd`: the buffer's memory closes it when freed,
+    /// and it is closed right away on failure.
+    pub fn build_shared_buffer(
+        &self,
+        fd: OwnedFd,
+        size: usize,
+        l: &Nv12Layout,
+    ) -> Option<GstBuffer> {
         let lib = valib()?;
         let display = self.display.lock().ok()?.clone()?;
         let disp = display.as_ptr() as *mut c_void;
@@ -199,16 +207,20 @@ impl VaShare {
         let allocator = alloc.downcast::<DmaBufAllocator>().ok()?;
 
         let mut buffer = GstBuffer::new();
+        let fd = fd.into_raw_fd();
         {
             let b = buffer.get_mut().unwrap();
-            let gmem =
-                unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::DONT_CLOSE) }
-                    .ok()?;
+            let Ok(gmem) =
+                (unsafe { allocator.alloc_dmabuf_with_flags(fd, size, FdMemoryFlags::NONE) })
+            else {
+                unsafe { libc::close(fd) };
+                return None;
+            };
             b.append_memory(gmem);
             VideoMeta::add_full(
                 b,
                 gst_video::VideoFrameFlags::empty(),
-                VideoFormat::Nv12,
+                l.format,
                 l.width,
                 l.height,
                 &[l.y_offset, l.uv_offset],
@@ -220,12 +232,7 @@ impl VaShare {
         let mem = buffer.peek_memory(0).as_ptr() as *mut GstMemory;
         let mut drm: GstVideoInfoDmaDrm = unsafe { std::mem::zeroed() };
         unsafe {
-            gst_video_info_set_format(
-                &mut drm.vinfo,
-                VideoFormat::Nv12.into_glib(),
-                l.width,
-                l.height,
-            );
+            gst_video_info_set_format(&mut drm.vinfo, l.format.into_glib(), l.width, l.height);
         }
         drm.vinfo.stride[0] = l.y_stride;
         drm.vinfo.stride[1] = l.uv_stride;

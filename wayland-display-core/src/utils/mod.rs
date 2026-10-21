@@ -1,4 +1,5 @@
 pub mod allocator;
+pub mod color;
 pub mod device;
 pub mod renderer;
 pub mod va_query;

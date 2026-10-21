@@ -88,3 +88,9 @@ wayland_display_vk_linear_layout (GstMemory *memory, gsize *offsets, gint *strid
   }
   return TRUE;
 }
+
+VkQueue
+wayland_display_vk_queue_handle (GstVulkanQueue *queue)
+{
+  return queue->queue;
+}

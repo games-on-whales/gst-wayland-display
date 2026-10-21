@@ -678,9 +678,12 @@ dependencies = [
  "gstreamer-video",
  "input-event-codes-sys",
  "once_cell",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
  "wayland-display-core",
+ "wayland-protocols",
 ]
 
 [[package]]

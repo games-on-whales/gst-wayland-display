@@ -635,6 +635,7 @@ mod tests {
                 &libinput_context,
                 event_loop.handle(),
                 false,
+                crate::utils::vulkan_nv12::ConversionOptions::default().hdr_peak_nits,
             );
 
             TestState { state }

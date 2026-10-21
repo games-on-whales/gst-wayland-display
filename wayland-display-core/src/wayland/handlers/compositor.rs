@@ -58,28 +58,36 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
     });
 }
 
-/// The fourcc of the dmabuf the client just committed to `surface`, or `None` for an SHM /
-/// non-dmabuf / no buffer commit. Used by the dynamic-HDR per-frame PQ-passthrough decision.
-fn committed_dmabuf_fourcc(surface: &WlSurface) -> Option<Fourcc> {
-    with_states(surface, |states| {
-        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-        match &attrs.current().buffer {
-            Some(BufferAssignment::NewBuffer(buffer)) => {
-                get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.format().code)
-            }
-            _ => None,
+impl State {
+    /// Size a new toplevel to the output (fullscreen, unless it declared a max size),
+    /// activate it and send its initial configure. Requires an output.
+    pub(crate) fn send_initial_configure(
+        &self,
+        window: &smithay::desktop::Window,
+        max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) {
+        let (Some(toplevel), Some(output)) = (window.toplevel(), self.output.as_ref()) else {
+            return;
+        };
+        if max_size.w == 0 && max_size.h == 0 {
+            toplevel.with_pending_state(|state| {
+                state.size = Some(
+                    output
+                        .current_mode()
+                        .unwrap()
+                        .size
+                        .to_f64()
+                        .to_logical(output.current_scale().fractional_scale())
+                        .to_i32_round(),
+                );
+                state.states.set(XdgState::Fullscreen);
+            });
         }
-    })
-}
-
-/// True for the 10-bit packed RGB fourccs gamescope emits for already-PQ BT.2020 HDR output
-/// (XB30/AB30/XR30/AR30). Such a frame is already PQ-encoded, so the converter must take the
-/// matrix-only passthrough path rather than re-applying the PQ tone-map.
-fn is_pq_fourcc(fourcc: Fourcc) -> bool {
-    matches!(
-        fourcc,
-        Fourcc::Xbgr2101010 | Fourcc::Abgr2101010 | Fourcc::Xrgb2101010 | Fourcc::Argb2101010
-    )
+        toplevel.with_pending_state(|state| {
+            state.states.set(XdgState::Activated);
+        });
+        toplevel.send_configure();
+    }
 }
 
 impl BufferHandler for State {
@@ -97,6 +105,9 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            if state.hdr_cm {
+                crate::wayland::handlers::color_management::stage_legacy_hdr_buffer(surface);
+            }
             let mut acquire_point = None;
             let maybe_dmabuf = with_states(surface, |surface_data| {
                 acquire_point.clone_from(
@@ -157,24 +168,10 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        // Dynamic HDR: read the just-committed dmabuf fourcc ONCE, here, BEFORE the
-        // window/popup commits below advance the surface's double-buffered state (which would
-        // consume current().buffer and make a later read return None -- that was the bug). One
-        // read drives both the diagnostic log and the per-frame PQ-passthrough decision.
-        // gamescope presents ONE composited output surface whose buffer fourcc flips 8-bit
-        // (Steam UI -> SDR) <-> 10-bit (HDR game -> already-PQ); the converter uses
-        // current_input_is_pq to pick the matrix-only passthrough vs the SDR->PQ tone-map.
-        // Off (no-op) unless dynamic HDR is enabled. Cursors here are MemoryRenderBuffers, not
-        // client dmabufs, so they don't perturb this.
+        // Color state was applied with the buffer by Smithay. Log before the window
+        // and popup handlers consume current().buffer.
         if self.hdr_cm {
             log_client_buffer_fourcc(surface);
-            if let Some(fourcc) = committed_dmabuf_fourcc(surface) {
-                let pq = is_pq_fourcc(fourcc);
-                if self.current_input_is_pq != pq {
-                    self.current_input_is_pq = pq;
-                    tracing::info!("pq_passthrough -> {pq} (fourcc={fourcc:?})");
-                }
-            }
         }
 
         if let Some(window) = self
@@ -194,7 +191,6 @@ impl CompositorHandler for State {
         {
             let window = self.pending_windows.swap_remove(idx);
 
-            let toplevel = window.toplevel().unwrap();
             let (initial_configure_sent, max_size) = with_states(surface, |states| {
                 let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap();
                 let attributes_guard = attributes.lock().unwrap();
@@ -210,36 +206,14 @@ impl CompositorHandler for State {
             });
 
             if self.output.is_none() {
+                // No output to size it against yet: keep it pending. The first
+                // apply_video_info sends its initial configure.
+                self.pending_windows.push(window);
                 return;
             }
 
             if !initial_configure_sent {
-                if max_size.w == 0 && max_size.h == 0 {
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some(
-                            self.output
-                                .as_ref()
-                                .unwrap()
-                                .current_mode()
-                                .unwrap()
-                                .size
-                                .to_f64()
-                                .to_logical(
-                                    self.output
-                                        .as_ref()
-                                        .unwrap()
-                                        .current_scale()
-                                        .fractional_scale(),
-                                )
-                                .to_i32_round(),
-                        );
-                        state.states.set(XdgState::Fullscreen);
-                    });
-                }
-                toplevel.with_pending_state(|state| {
-                    state.states.set(XdgState::Activated);
-                });
-                toplevel.send_configure();
+                self.send_initial_configure(&window, max_size);
                 self.pending_windows.push(window);
             } else {
                 let loc = (0, 0);

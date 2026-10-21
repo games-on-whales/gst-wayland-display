@@ -218,6 +218,11 @@ impl State {
             }
         }
 
+        // Dynamic HDR: the committed output state + the active surface's content transfer
+        // pick the converter shader (ignored unless dynamic HDR built those pipelines).
+        // Read before bind(), whose target borrows the state for the rest of the frame.
+        let color = self.frame_color();
+
         let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
 
         // Capture the RGBA render-target fourcc BEFORE bind() borrows `output_buffer` (the
@@ -267,14 +272,10 @@ impl State {
             }
         }
 
-        // Dynamic HDR: per-frame PQ-passthrough flag (true when the active surface's last
-        // committed buffer was a 10-bit, already-PQ BT.2020 client buffer). Always false unless
-        // it is enabled, so the converter behaves identically to before by default.
-        let pq_passthrough = self.current_input_is_pq;
         match self.output_buffer.clone().unwrap().to_gs_buffer(
             &mut target,
             &mut self.renderer,
-            pq_passthrough,
+            color,
         ) {
             Ok(buffer) => Ok((buffer, render_output_result)),
             Err(e) => {
