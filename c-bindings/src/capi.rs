@@ -49,16 +49,24 @@ unsafe fn display_ref<'a>(
     display
 }
 
+/// Installs the trace callbacks. Passing NULL for either one turns tracing off: `Option` of a
+/// function pointer has the same ABI as the bare pointer, with NULL as `None`.
 #[no_mangle]
 pub unsafe extern "C" fn display_set_trace_fn(
     wd: *mut WaylandDisplay,
-    trace_start: extern "C" fn(*const c_char) -> *mut c_void,
-    trace_end: extern "C" fn(*mut c_void),
+    trace_start: Option<extern "C" fn(*const c_char) -> *mut c_void>,
+    trace_end: Option<extern "C" fn(*mut c_void)>,
 ) {
     let Some(display) = (unsafe { display_ref(wd, "display_set_trace_fn") }) else {
         return;
     };
-    display.tracer = Some(Tracer::new(trace_start, trace_end));
+    display.tracer = match (trace_start, trace_end) {
+        (Some(trace_start), Some(trace_end)) => Some(Tracer::new(trace_start, trace_end)),
+        _ => {
+            tracing::warn!("NULL trace callback; tracing disabled.");
+            None
+        }
+    };
 }
 
 #[no_mangle]
@@ -330,6 +338,30 @@ mod tests {
         assert_eq!(write_c_strings(&list(), ptr::null_mut(), 0), 0);
     }
 
+    extern "C" fn trace_start(_name: *const c_char) -> *mut c_void {
+        ptr::null_mut()
+    }
+
+    extern "C" fn trace_end(_ctx: *mut c_void) {}
+
+    // A C caller passing NULL callbacks must turn tracing off, not store a NULL function pointer
+    // that the next frame would call.
+    #[test]
+    fn null_trace_callbacks_disable_tracing() {
+        unsafe {
+            let dpy = display_init(c"software".as_ptr());
+            assert!(!dpy.is_null());
+            display_set_trace_fn(dpy, Some(trace_start), Some(trace_end));
+            assert!((*dpy).tracer.is_some());
+            display_set_trace_fn(dpy, Some(trace_start), None);
+            assert!((*dpy).tracer.is_none());
+            display_set_trace_fn(dpy, Some(trace_start), Some(trace_end));
+            display_set_trace_fn(dpy, None, Some(trace_end));
+            assert!((*dpy).tracer.is_none());
+            display_finish(dpy);
+        }
+    }
+
     #[test]
     fn null_display_is_ignored() {
         let dpy = ptr::null_mut();
@@ -342,6 +374,7 @@ mod tests {
             assert!(display_get_frame(dpy).is_null());
             display_keyboard_input(dpy, 30, true);
             display_add_input_device(dpy, c"/dev/input/event0".as_ptr());
+            display_set_trace_fn(dpy, None, None);
             display_finish(dpy);
         }
         assert!(buf.iter().all(|p| p.is_null()));
