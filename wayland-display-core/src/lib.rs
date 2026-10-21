@@ -13,7 +13,8 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -113,6 +114,9 @@ impl Drop for Trace {
 /// bound would kill healthy streams.
 const COMPOSITOR_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often [`PendingFrame::wait_unless`] checks whether its wait was cancelled.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
@@ -133,21 +137,50 @@ pub struct WaylandDisplay {
 
 pub enum MaybeRecv<T: Clone> {
     Rx(Receiver<T>),
+    /// A wait already ran out: the compositor is wedged, so later calls don't wait again.
+    TimedOut(Receiver<T>),
     Value(T),
 }
 
 impl<T: Clone> MaybeRecv<T> {
     /// Waits up to `timeout` for the compositor to publish the value. Errs if the compositor
     /// thread exited before sending it (e.g. its renderer failed to initialize) or is wedged and
-    /// never sends it; after a timeout a later call waits again.
+    /// never sends it. After one timeout, later calls only take a value that has arrived since
+    /// and never wait again, so callers asking several times don't stack full timeouts.
     pub fn get(&mut self, timeout: Duration) -> Result<&T, RecvTimeoutError> {
-        if let MaybeRecv::Rx(recv) = self {
-            *self = MaybeRecv::Value(recv.recv_timeout(timeout)?);
+        let received = match self {
+            MaybeRecv::Rx(recv) => Some(recv.recv_timeout(timeout)),
+            MaybeRecv::TimedOut(recv) => Some(recv.try_recv().map_err(|err| match err {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })),
+            MaybeRecv::Value(_) => None,
+        };
+        match received {
+            Some(Ok(val)) => *self = MaybeRecv::Value(val),
+            Some(Err(err)) => {
+                if err == RecvTimeoutError::Timeout {
+                    if let MaybeRecv::Rx(_) = self {
+                        let MaybeRecv::Rx(recv) =
+                            std::mem::replace(self, MaybeRecv::TimedOut(mpsc::channel().1))
+                        else {
+                            unreachable!()
+                        };
+                        *self = MaybeRecv::TimedOut(recv);
+                    }
+                }
+                return Err(err);
+            }
+            None => {}
         }
         match self {
             MaybeRecv::Value(val) => Ok(val),
-            MaybeRecv::Rx(_) => unreachable!(),
+            MaybeRecv::Rx(_) | MaybeRecv::TimedOut(_) => unreachable!(),
         }
+    }
+
+    fn timed_out(&self) -> bool {
+        matches!(self, MaybeRecv::TimedOut(_))
     }
 }
 
@@ -331,7 +364,9 @@ impl WaylandDisplay {
     /// Asks the compositor for the next frame without waiting for it, so a caller holding a lock
     /// around the display can release it before blocking in [`PendingFrame::wait`].
     pub fn request_frame(&self) -> Result<PendingFrame, gst::FlowError> {
-        let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+        // Room for the one reply: the compositor must not block handing over a frame whose
+        // waiter was cancelled (PendingFrame::wait_unless) and will only pick it up later.
+        let (buffer_tx, buffer_rx) = mpsc::sync_channel(1);
         if let Err(err) = self
             .command_tx
             .send(Command::Buffer(buffer_tx, self.tracer.clone()))
@@ -401,7 +436,29 @@ pub struct PendingFrame {
 
 impl PendingFrame {
     pub fn wait(self) -> Result<gst::Buffer, gst::FlowError> {
-        match self.buffer_rx.recv_timeout(self.timeout) {
+        self.wait_unless(&AtomicBool::new(false))
+    }
+
+    /// Like [`PendingFrame::wait`], but gives up with `FlowError::Flushing` soon after `cancel`
+    /// is set, so a streaming thread can be unblocked (GstBaseSrc `unlock()`) without waiting
+    /// out the reply timeout. Keep the frame after a cancel and wait on it again later: dropping
+    /// it makes the compositor fail to deliver the frame, and it shuts down when that happens.
+    pub fn wait_unless(&self, cancel: &AtomicBool) -> Result<gst::Buffer, gst::FlowError> {
+        let deadline = Instant::now() + self.timeout;
+        let result = loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(gst::FlowError::Flushing);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self
+                .buffer_rx
+                .recv_timeout(remaining.min(CANCEL_POLL_INTERVAL))
+            {
+                Err(RecvTimeoutError::Timeout) if remaining > CANCEL_POLL_INTERVAL => continue,
+                result => break result,
+            }
+        };
+        match result {
             Ok(Ok(buffer)) => Ok(buffer),
             Ok(Err(err)) => match err {
                 SwapBuffersError::AlreadySwapped => unreachable!(),
@@ -438,6 +495,11 @@ impl Drop for WaylandDisplay {
         // A wedged compositor never acts on Quit; joining it unbounded would move the hang into
         // pipeline teardown (stop() → drop). Give up after the reply timeout and detach it.
         let thread_handle = self.thread_handle.take().unwrap();
+        // Init already timed out: don't stack a second full timeout on top of the first.
+        if self.envs.timed_out() || self.devices.timed_out() {
+            tracing::error!("Compositor never finished initializing; detaching it");
+            return;
+        }
         let deadline = Instant::now() + self.reply_timeout;
         while !thread_handle.is_finished() {
             if Instant::now() >= deadline {

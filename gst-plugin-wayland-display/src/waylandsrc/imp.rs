@@ -27,8 +27,8 @@ use waylanddisplaycore::utils::allocator::{
 use waylanddisplaycore::utils::video_info::CUDAParams;
 use waylanddisplaycore::utils::video_info::VulkanCodec;
 use waylanddisplaycore::{
-    ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, Sender,
-    WaylandDisplay, channel, utils::device::PCIVendor,
+    ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, PendingFrame,
+    Sender, WaylandDisplay, channel, utils::device::PCIVendor,
 };
 
 pub struct WaylandDisplaySrc {
@@ -60,6 +60,14 @@ pub struct WaylandDisplaySrc {
     vulkan_share: Arc<waylanddisplaycore::utils::vulkan_share::VulkanShare>,
     /// VA display owner shared only with this source's compositor and output ring.
     va_share: Arc<waylanddisplaycore::utils::va_share::VaShare>,
+    // Set by unlock(): create() stops waiting for its frame so GstBaseSrc can join the streaming
+    // thread before stop() instead of waiting out the compositor reply timeout.
+    flushing: AtomicBool,
+    // Set while change_state() runs PLAYING->PAUSED; see there.
+    pausing: AtomicBool,
+    // A frame whose wait unlock() cut short; the next create() waits on it instead of requesting
+    // another, since dropping it would shut the compositor down.
+    pending_frame: Mutex<Option<PendingFrame>>,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -74,6 +82,9 @@ impl Default for WaylandDisplaySrc {
             hdr_meta: Mutex::new((None, None)),
             va_share: Arc::new(Default::default()),
             vulkan_share: waylanddisplaycore::utils::vulkan_share::VulkanShare::new(),
+            flushing: AtomicBool::new(false),
+            pausing: AtomicBool::new(false),
+            pending_frame: Mutex::new(None),
         }
     }
 }
@@ -87,6 +98,16 @@ impl WaylandDisplaySrc {
     fn new_command_channel(&self) -> Channel<Command> {
         let (command_tx, command_rx) = channel();
         *self.command_tx.lock().unwrap() = command_tx;
+        command_rx
+    }
+
+    /// Installs a fresh command channel with the devices a new display starts with already
+    /// queued on it, and returns its receiver.
+    fn new_startup_channel(&self, settings: &Settings) -> Channel<Command> {
+        let command_rx = self.new_command_channel();
+        for path in settings.startup_input_devices() {
+            self.send_command(Command::InputDevice(path));
+        }
         command_rx
     }
 }
@@ -743,7 +764,15 @@ impl ElementImpl for WaylandDisplaySrc {
         &self,
         transition: gst::StateChange,
     ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+        // GstBaseSrc unlock()s a live source on pause, but a create() cancelled by it can return
+        // FLUSHING after a quick resume already restarted the streaming task, which then stops
+        // for good. A pause doesn't join the task, so let unlock() ignore it.
+        let pausing = transition == gst::StateChange::PlayingToPaused;
+        self.pausing.store(pausing, Ordering::Release);
         let res = self.parent_change_state(transition);
+        if pausing {
+            self.pausing.store(false, Ordering::Release);
+        }
         match res {
             Ok(gst::StateChangeSuccess::Success) => {
                 if transition.next() == gst::State::Paused {
@@ -1460,23 +1489,18 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         // The channel is swapped under the settings lock so a concurrent VirtualDevicesReady lands
-        // either in this snapshot or on the new channel, never both or neither.
-        let (render_node, input_devices, command_rx, command_tx) = {
+        // either in the queued startup devices or after them, never both or neither.
+        let (render_node, command_rx, command_tx) = {
             let settings = self.settings.lock().unwrap();
-            let input_devices = settings.startup_input_devices();
-            let command_rx = self.new_command_channel();
+            let command_rx = self.new_startup_channel(&settings);
             let command_tx = self.command_tx.lock().unwrap().clone();
-            (
-                settings.render_node.clone(),
-                input_devices,
-                command_rx,
-                command_tx,
-            )
+            (settings.render_node.clone(), command_rx, command_tx)
         };
         // A new compositor starts SDR and only reports HDR changes, so a previous run's dynamic-HDR
         // state must not carry over into this one.
         self.hdr_active.store(false, Ordering::Relaxed);
         *self.hdr_meta.lock().unwrap() = (None, None);
+        self.flushing.store(false, Ordering::Release);
         #[cfg(feature = "cuda")]
         let have_cuda_context = self.settings.lock().unwrap().cuda_context.is_some();
 
@@ -1549,10 +1573,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             None => {}
         }
 
-        for path in input_devices {
-            display.add_input_device(path);
-        }
-
         let mut structure = Structure::builder("wayland.src");
         let reply_timeout = display.reply_timeout();
         let env_vars = match display.env_vars() {
@@ -1592,11 +1612,26 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let subscriber = Registry::default().with(GstLayer);
             tracing::subscriber::with_default(subscriber, || drop(state.display));
         }
+        // Only after the display: dropping a frame the compositor still owes makes it exit, and
+        // Drop must still be able to send Quit and join it.
+        self.pending_frame.lock().unwrap().take();
         Ok(())
     }
 
     fn is_seekable(&self) -> bool {
         false
+    }
+
+    fn unlock(&self) -> Result<(), gst::ErrorMessage> {
+        if !self.pausing.load(Ordering::Acquire) {
+            self.flushing.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
+        self.flushing.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1611,11 +1646,24 @@ impl PushSrcImpl for WaylandDisplaySrc {
             let buffer = tracing::subscriber::with_default(subscriber, || {
                 // Only the request is made under the state lock: waiting for the frame under it
                 // would stall caps queries and stop() for up to the compositor reply timeout.
-                let pending = match self.state.lock().unwrap().as_ref() {
-                    Some(state) => state.display.request_frame()?,
-                    None => return Err(gst::FlowError::Eos),
+                if self.flushing.load(Ordering::Acquire) {
+                    return Err(gst::FlowError::Flushing);
+                }
+                let stashed = self.pending_frame.lock().unwrap().take();
+                let pending = match stashed {
+                    Some(pending) => pending,
+                    None => match self.state.lock().unwrap().as_ref() {
+                        Some(state) => state.display.request_frame()?,
+                        None => return Err(gst::FlowError::Eos),
+                    },
                 };
-                pending.wait()
+                match pending.wait_unless(&self.flushing) {
+                    Err(gst::FlowError::Flushing) => {
+                        *self.pending_frame.lock().unwrap() = Some(pending);
+                        Err(gst::FlowError::Flushing)
+                    }
+                    frame => frame,
+                }
             })?;
             // dynamic-hdr: drained AFTER the frame. The compositor signals a change right
             // before it renders the first frame in the new state, so this is exactly the
@@ -2135,9 +2183,61 @@ mod tests {
     use waylanddisplaycore::DrmFormat;
     use waylanddisplaycore::utils::tests::INIT;
 
+    /// Paths the compositor logged as "Adding input device.", across all tests in this binary.
+    static ADDED_INPUT_DEVICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Records the paths of the compositor's "Adding input device." events.
+    struct AddedInputDevices;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AddedInputDevices {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Fields {
+                message: String,
+                path: Option<String>,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "path" {
+                        self.path = Some(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+            }
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if let (true, Some(path)) = (fields.message == "Adding input device.", fields.path) {
+                ADDED_INPUT_DEVICES.lock().unwrap().push(path);
+            }
+        }
+    }
+
     fn test_init() -> () {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
         INIT.call_once(|| {
-            tracing_subscriber::fmt::try_init().ok();
+            // Global, so the compositor threads' events reach AddedInputDevices too.
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                )
+                .with(AddedInputDevices)
+                .try_init()
+                .ok();
             gst::init().expect("Failed to initialize GStreamer");
         });
     }
@@ -2439,6 +2539,397 @@ mod tests {
         assert!(
             state_free,
             "create() held the state lock while waiting for the frame"
+        );
+    }
+
+    // start() must hand a new display the configured devices and the announced ones;
+    // nothing caught dropping that hand-off.
+    #[test]
+    fn startup_channel_carries_configured_and_announced_devices() {
+        use super::EventHandler;
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("keyboard", "/dev/input/event1")
+            .property("mouse", "/dev/input/event2")
+            .build();
+        let imp = src.imp();
+        assert!(
+            imp.handle_event(&gst::event::CustomUpstream::new(
+                gst::Structure::builder("VirtualDevicesReady")
+                    .field("path", "/dev/input/event3")
+                    .build(),
+            ))
+        );
+
+        let command_rx = imp.new_startup_channel(&imp.settings.lock().unwrap());
+        let mut queued = Vec::new();
+        while let Ok(command) = command_rx.try_recv() {
+            if let Command::InputDevice(path) = command {
+                queued.push(path);
+            }
+        }
+        // The builder sets properties in no particular order.
+        queued.sort();
+        assert_eq!(
+            queued,
+            [
+                "/dev/input/event1",
+                "/dev/input/event2",
+                "/dev/input/event3"
+            ]
+        );
+    }
+
+    /// Puts a display in `src`'s state whose commands go to the returned channel, which only the
+    /// test reads; the compositor runs on the returned sender's channel. Pass both to
+    /// `drop_unserviced_display` when done.
+    fn unserviced_display(
+        src: &super::super::WaylandDisplaySrc,
+    ) -> (
+        waylanddisplaycore::Channel<waylanddisplaycore::Command>,
+        waylanddisplaycore::Sender<waylanddisplaycore::Command>,
+    ) {
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::{Command, WaylandDisplay, channel};
+
+        let (command_tx, unserviced) = channel::<Command>();
+        let (compositor_tx, compositor_rx) = channel::<Command>();
+        let display = WaylandDisplay::new_with_channel(
+            Some("software".into()),
+            command_tx,
+            compositor_rx,
+            std::sync::Arc::clone(&src.imp().vulkan_share),
+            std::sync::Arc::clone(&src.imp().va_share),
+        )
+        .unwrap();
+        *src.imp().state.lock().unwrap() = Some(super::State { display });
+        (unserviced, compositor_tx)
+    }
+
+    fn drop_unserviced_display(
+        src: &super::super::WaylandDisplaySrc,
+        unserviced: waylanddisplaycore::Channel<waylanddisplaycore::Command>,
+        compositor_tx: waylanddisplaycore::Sender<waylanddisplaycore::Command>,
+    ) {
+        use gst::subclass::prelude::*;
+        compositor_tx
+            .send(waylanddisplaycore::Command::Quit)
+            .unwrap();
+        // Drop the display while `unserviced` still exists: its own Quit must send for Drop to
+        // join the compositor thread, or the thread outlives the test and races process exit.
+        src.imp().state.lock().unwrap().take();
+        drop(unserviced);
+    }
+
+    /// Waits for the display to send a command matching `matches` to `unserviced`.
+    fn next_command(
+        unserviced: &waylanddisplaycore::Channel<waylanddisplaycore::Command>,
+        matches: impl Fn(&waylanddisplaycore::Command) -> bool,
+    ) -> waylanddisplaycore::Command {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(command) = unserviced.try_recv() {
+                if matches(&command) {
+                    return command;
+                }
+            }
+            assert!(Instant::now() < deadline, "the expected command never came");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // A caps query the compositor fails to answer must post an element error and fail the query,
+    // not report caps without DMA formats.
+    #[test]
+    fn caps_fails_when_compositor_does_not_report_dma_formats() {
+        use gst::prelude::*;
+        use gst_base::subclass::prelude::*;
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add(&src).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let (unserviced, compositor_tx) = unserviced_display(&src);
+
+        let querying = src.clone();
+        let caps = std::thread::spawn(move || BaseSrcImpl::caps(querying.imp(), None));
+        // Dropping the request unanswered is what a compositor that dies mid-query does.
+        drop(next_command(&unserviced, |command| {
+            matches!(command, Command::GetSupportedDmaFormats(_))
+        }));
+        assert!(caps.join().unwrap().is_none());
+        let error = bus
+            .timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Error])
+            .expect("no element error posted");
+        let gst::MessageView::Error(error) = error.view() else {
+            unreachable!()
+        };
+        assert!(
+            error.error().matches(gst::ResourceError::Failed),
+            "{:?}",
+            error.error()
+        );
+
+        drop_unserviced_display(&src, unserviced, compositor_tx);
+    }
+
+    // GstBaseSrc joins the streaming thread before stop(), after calling unlock(); a
+    // create() still waiting on a wedged compositor held that up for the full reply timeout.
+    #[test]
+    fn unlock_ends_create_waiting_for_frame() {
+        use gst_base::subclass::prelude::*;
+        use std::time::{Duration, Instant};
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let (unserviced, compositor_tx) = unserviced_display(&src);
+
+        let creating = src.clone();
+        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).err());
+        // Held, never answered: the frame request stays pending like on a wedged compositor.
+        let pending_frame = next_command(&unserviced, |command| {
+            matches!(command, Command::Buffer(..))
+        });
+
+        let unlocked = Instant::now();
+        BaseSrcImpl::unlock(src.imp()).unwrap();
+        assert_eq!(create.join().unwrap(), Some(gst::FlowError::Flushing));
+        assert!(unlocked.elapsed() < Duration::from_secs(1));
+        // Still flushing: a create() racing in after unlock() must not start a new wait.
+        assert_eq!(
+            PushSrcImpl::create(src.imp(), None).err(),
+            Some(gst::FlowError::Flushing)
+        );
+        // unlock_stop() resumes waiting on the same frame: dropping it would make the compositor
+        // fail to deliver it and shut down.
+        BaseSrcImpl::unlock_stop(src.imp()).unwrap();
+        let creating = src.clone();
+        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).is_ok());
+        let Command::Buffer(buffer_tx, _) = pending_frame else {
+            unreachable!()
+        };
+        buffer_tx.send(Ok(gst::Buffer::new())).unwrap();
+        assert!(create.join().unwrap(), "the kept frame was not delivered");
+        assert!(
+            unserviced.try_recv().is_err(),
+            "requested another frame instead of waiting on the kept one"
+        );
+        drop_unserviced_display(&src, unserviced, compositor_tx);
+    }
+
+    /// A software-rendered live pipeline whose sink counts the frames it receives.
+    fn counting_pipeline() -> (
+        gst::Pipeline,
+        gst::Element,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use gst::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build()
+            .upcast::<gst::Element>();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("width", 320)
+                    .field("height", 240)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("signal-handoffs", true)
+            .property("sync", false)
+            .build()
+            .unwrap();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counter = frames.clone();
+        sink.connect("handoff", false, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &caps, &sink]).unwrap();
+        gst::Element::link_many([&src, &caps, &sink]).unwrap();
+        (pipeline, src, frames)
+    }
+
+    /// Asserts frames keep flowing: the count grows within a few seconds.
+    fn assert_frames_flow(frames: &std::sync::atomic::AtomicUsize, what: &str) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let start = frames.load(Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames.load(Ordering::SeqCst) < start + 3 {
+            assert!(Instant::now() < deadline, "no frames after {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // unlock() on a flush dropped the frame create() was waiting for, the compositor
+    // shut down when it could not deliver it, and the stream died.
+    #[test]
+    fn frames_flow_after_flushes() {
+        use gst::prelude::*;
+        test_init();
+
+        let (pipeline, src, frames) = counting_pipeline();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert_frames_flow(&frames, "start");
+        for run in 0..10 {
+            assert!(src.send_event(gst::event::FlushStart::new()));
+            assert!(src.send_event(gst::event::FlushStop::new(true)));
+            assert_frames_flow(&frames, &format!("flush {run}"));
+        }
+        let bus = pipeline.bus().unwrap();
+        assert!(
+            bus.pop_filtered(&[gst::MessageType::Error]).is_none(),
+            "flushing posted an error"
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // a create() cancelled by a live pause's unlock() could return FLUSHING after a
+    // quick resume had restarted the streaming task, leaving it stopped for good.
+    #[test]
+    fn frames_flow_after_quick_pause_resume() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        test_init();
+
+        let (pipeline, src, frames) = counting_pipeline();
+        let imp = src
+            .downcast_ref::<super::super::WaylandDisplaySrc>()
+            .unwrap()
+            .imp();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert_frames_flow(&frames, "start");
+        for run in 0..100 {
+            pipeline.set_state(gst::State::Paused).unwrap();
+            // Left set, it would stop a later flush or stop from cancelling the frame wait.
+            assert!(!imp.pausing.load(std::sync::atomic::Ordering::Acquire));
+            pipeline.set_state(gst::State::Playing).unwrap();
+            assert_frames_flow(&frames, &format!("resume {run}"));
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // start() must give the display it creates the configured devices; a start() that installed
+    // a plain command channel instead passed every other test.
+    #[test]
+    fn started_display_adds_configured_devices() {
+        use gst::prelude::*;
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let path = "/nonexistent/input/started-display-keyboard";
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .property("keyboard", path)
+            .build()
+            .upcast::<gst::Element>();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ADDED_INPUT_DEVICES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|added| added == path)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the compositor never added the configured device"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // A pipeline stop must unlock() a create() whose frame the compositor never sends, going
+    // through change_state() like a real stop, not only when unlock() is called directly.
+    #[test]
+    fn stop_does_not_wait_for_an_unanswered_frame() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::time::{Duration, Instant};
+        use waylanddisplaycore::{Command, FormatSet};
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        // start() keeps a display that is already there, so the pipeline runs on this one.
+        let (unserviced, compositor_tx) = unserviced_display(&src);
+        // Answers caps queries but never sends a frame, like a compositor that wedges mid-stream.
+        let (frame_requested_tx, frame_requested) = std::sync::mpsc::channel();
+        let wedge = std::thread::spawn(move || {
+            let mut owed_frames = Vec::new();
+            loop {
+                match unserviced.try_recv() {
+                    Ok(Command::GetSupportedDmaFormats(reply)) => {
+                        let _ = reply.send(FormatSet::default());
+                    }
+                    Ok(command @ Command::Buffer(..)) => {
+                        owed_frames.push(command);
+                        let _ = frame_requested_tx.send(());
+                    }
+                    // stop() is dropping the display: let the real compositor quit so Drop can
+                    // join it.
+                    Ok(Command::Quit) => {
+                        compositor_tx.send(Command::Quit).unwrap();
+                        return (unserviced, owed_frames);
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("width", 320)
+                    .field("height", 240)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([src.upcast_ref(), &caps, &sink]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &caps, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        frame_requested
+            .recv_timeout(Duration::from_secs(5))
+            .expect("create() never requested a frame");
+
+        let stopping = Instant::now();
+        pipeline.set_state(gst::State::Null).unwrap();
+        let stop_took = stopping.elapsed();
+
+        let (unserviced, owed_frames) = wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+        assert!(
+            stop_took < Duration::from_secs(5),
+            "stop waited {stop_took:?} behind an unanswered frame"
         );
     }
 }
