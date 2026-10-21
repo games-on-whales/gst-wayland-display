@@ -2912,20 +2912,25 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
-    // A pipeline stop must unlock() a create() whose frame the compositor never sends, going
-    // through change_state() like a real stop, not only when unlock() is called directly.
-    #[test]
-    fn stop_does_not_wait_for_an_unanswered_frame() {
+    /// A playing pipeline whose source waits on a frame its compositor never sends, like one
+    /// that wedges mid-stream. Join the returned thread after stopping the pipeline.
+    fn wedged_pipeline() -> (
+        super::super::WaylandDisplaySrc,
+        gst::Pipeline,
+        gst::Element,
+        std::thread::JoinHandle<(
+            waylanddisplaycore::Channel<waylanddisplaycore::Command>,
+            Vec<waylanddisplaycore::Command>,
+        )>,
+    ) {
         use gst::prelude::*;
-        use gst::subclass::prelude::*;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         use waylanddisplaycore::{Command, FormatSet};
-        test_init();
 
         let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
         // start() keeps a display that is already there, so the pipeline runs on this one.
         let (unserviced, compositor_tx) = unserviced_display(&src);
-        // Answers caps queries but never sends a frame, like a compositor that wedges mid-stream.
+        // Answers caps queries but never sends a frame.
         let (frame_requested_tx, frame_requested) = std::sync::mpsc::channel();
         let wedge = std::thread::spawn(move || {
             let mut owed_frames = Vec::new();
@@ -2969,6 +2974,111 @@ mod tests {
         frame_requested
             .recv_timeout(Duration::from_secs(5))
             .expect("create() never requested a frame");
+        (src, pipeline, sink, wedge)
+    }
+
+    // On a real pipeline the base class handles a pad flush only once the pause releases its live
+    // lock, so event() must cancel the frame wait before chaining up, not after.
+    #[test]
+    fn pad_flush_cancels_frame_wait_before_pause_finishes() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let (src, pipeline, sink, wedge) = wedged_pipeline();
+        // Hold PLAYING->PAUSED inside GstBaseSrc's live-lock section, after its unlock().
+        let hold = Duration::from_secs(2);
+        let held = Arc::new(AtomicBool::new(false));
+        let src_addr = src.as_ptr() as usize;
+        let holding = held.clone();
+        // Process-wide: undone on drop, panic included, so later tests don't print basesrc
+        // debug output or run a hook keyed on a freed element.
+        struct HoldGuard(
+            gst::DebugCategory,
+            gst::DebugLevel,
+            Option<gst::log::DebugLogFunction>,
+        );
+        impl Drop for HoldGuard {
+            fn drop(&mut self) {
+                if let Some(hook) = self.2.take() {
+                    gst::log::remove_log_function(hook);
+                }
+                self.0.set_threshold(self.1);
+            }
+        }
+        let basesrc = gst::DebugCategory::get("basesrc").unwrap();
+        let mut guard = HoldGuard(basesrc, basesrc.threshold(), None);
+        basesrc.set_threshold(gst::DebugLevel::Debug);
+        guard.2 = Some(gst::log::add_log_function(
+            move |_, _, _, _, _, object, message| {
+                if object.map(|o| o.as_ptr() as usize) == Some(src_addr)
+                    && message
+                        .get()
+                        .is_some_and(|m| m.starts_with("live running 0"))
+                    && !holding.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::sleep(hold);
+                }
+            },
+        ));
+
+        let pausing = {
+            let pipeline = pipeline.clone();
+            std::thread::spawn(move || pipeline.set_state(gst::State::Paused).unwrap())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !held.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the pause never reached the hold"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let flushed = Instant::now();
+        let flushing = {
+            let sinkpad = sink.static_pad("sink").unwrap();
+            std::thread::spawn(move || sinkpad.push_event(gst::event::FlushStart::new()))
+        };
+        // create() stashes the frame it was waiting on once it is cancelled.
+        while src.imp().pending_frame.lock().unwrap().is_none() {
+            assert!(
+                Instant::now() < flushed + hold * 3,
+                "the flush never cancelled create()"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancel_took = flushed.elapsed();
+
+        pausing.join().unwrap();
+        assert!(flushing.join().unwrap());
+        drop(guard);
+        assert!(
+            sink.static_pad("sink")
+                .unwrap()
+                .push_event(gst::event::FlushStop::new(true))
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        let (unserviced, owed_frames) = wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+        assert!(
+            cancel_took < hold / 2,
+            "the flush waited {cancel_took:?} for the pause to finish"
+        );
+    }
+
+    // A pipeline stop must unlock() a create() whose frame the compositor never sends, going
+    // through change_state() like a real stop, not only when unlock() is called directly.
+    #[test]
+    fn stop_does_not_wait_for_an_unanswered_frame() {
+        use gst::prelude::*;
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let (_src, pipeline, _sink, wedge) = wedged_pipeline();
 
         let stopping = Instant::now();
         pipeline.set_state(gst::State::Null).unwrap();
