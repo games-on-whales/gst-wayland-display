@@ -1307,6 +1307,12 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         if self.handle_event(&event) {
             return true;
         }
+        // A pad-level flush doesn't take the state lock, so it can arrive mid-pause, where the
+        // unlock() it triggers is ignored; cancel the frame wait here instead. Before chaining up:
+        // the parent blocks on the live lock until the pause finishes.
+        if let gst::EventView::FlushStart(_) = event.view() {
+            self.flushing.store(true, Ordering::Release);
+        }
         self.parent_event(event)
     }
 
@@ -2575,6 +2581,50 @@ mod tests {
         assert!(
             unserviced.try_recv().is_err(),
             "requested another frame instead of waiting on the kept one"
+        );
+        drop_unserviced_display(&src, unserviced, compositor_tx);
+    }
+
+    // a pad-level flush doesn't take the state lock, so it can land inside a
+    // PLAYING->PAUSED change_state(), where unlock() ignores the call; flush_stop then blocked
+    // for the compositor reply timeout behind the create() it failed to cancel.
+    #[test]
+    fn pad_flush_during_pause_ends_create_waiting_for_frame() {
+        use gst_base::subclass::prelude::*;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let (unserviced, compositor_tx) = unserviced_display(&src);
+
+        let creating = src.clone();
+        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).err());
+        let pending_frame = next_command(&unserviced, |command| {
+            matches!(command, Command::Buffer(..))
+        });
+
+        // As if change_state(PLAYING->PAUSED) were still running.
+        src.imp().pausing.store(true, Ordering::Release);
+        let flushed = Instant::now();
+        // What the src pad's event handler calls; the pad itself drops events while inactive.
+        BaseSrcImpl::event(src.imp(), &gst::event::FlushStart::new());
+        assert_eq!(create.join().unwrap(), Some(gst::FlowError::Flushing));
+        assert!(flushed.elapsed() < Duration::from_secs(1));
+        src.imp().pausing.store(false, Ordering::Release);
+
+        // The flush's stop must lift it, or create() would return FLUSHING for good.
+        BaseSrcImpl::event(src.imp(), &gst::event::FlushStop::new(true));
+        let creating = src.clone();
+        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).is_ok());
+        let Command::Buffer(buffer_tx, _) = pending_frame else {
+            unreachable!()
+        };
+        buffer_tx.send(Ok(gst::Buffer::new())).unwrap();
+        assert!(
+            create.join().unwrap(),
+            "create() failed after the flush stopped"
         );
         drop_unserviced_display(&src, unserviced, compositor_tx);
     }
