@@ -9,6 +9,8 @@ pub mod vulkan_nv12;
 pub mod vulkan_share;
 
 mod target;
+#[cfg(any(test, feature = "test-uinput"))]
+pub mod uinput;
 
 pub use self::target::*;
 
