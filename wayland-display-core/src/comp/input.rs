@@ -491,8 +491,29 @@ impl State {
         touch.frame(self);
     }
 
+    /// Adds the device at `path`, replacing the handle an earlier announcement of the same path
+    /// left: libinput doesn't de-duplicate paths, and a second handle doubles every event. A
+    /// reconnected device can reuse its path while libinput still holds the old handle.
+    pub fn add_input_device(&mut self, path: &str) {
+        if let Some(old) = self.input_devices.remove(path) {
+            // A no-op if libinput already removed it after ENODEV.
+            self.input_context.path_remove_device(old);
+        }
+        match self.input_context.path_add_device(path) {
+            Some(device) => {
+                self.input_devices.insert(path.to_owned(), device);
+            }
+            None => tracing::warn!(path, "libinput could not add the input device."),
+        }
+    }
+
+    pub(crate) fn input_device_removed(&mut self, device: &smithay::reexports::input::Device) {
+        self.input_devices.retain(|_, added| added != device);
+    }
+
     pub fn process_input_event(&mut self, event: InputEvent<LibinputInputBackend>) {
         match event {
+            InputEvent::DeviceRemoved { device } => self.input_device_removed(&device),
             InputEvent::Keyboard { event, .. } => {
                 self.keyboard_input(event.time_msec(), event.key_code(), event.state());
             }

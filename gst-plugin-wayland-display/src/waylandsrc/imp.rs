@@ -12,6 +12,7 @@ use gst_base::subclass::prelude::*;
 use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -157,18 +158,64 @@ impl Settings {
     fn startup_input_devices(&self) -> Vec<String> {
         self.input_devices
             .iter()
-            .chain(&self.virtual_input_devices)
             .cloned()
+            .chain(
+                self.virtual_input_devices
+                    .iter()
+                    .map(|device| device.path.clone()),
+            )
             .collect()
     }
+
+    /// Forgets announced devices that are gone or whose path now belongs to another device, so
+    /// start() doesn't hand the display an input it was never given.
+    fn prune_virtual_input_devices(&mut self) {
+        self.virtual_input_devices.retain(|device| {
+            let unchanged =
+                device.identity.is_none() || input_device_identity(&device.path) == device.identity;
+            if !unchanged {
+                tracing::info!(
+                    path = device.path,
+                    "Dropping a virtual input device that is gone."
+                );
+            }
+            unchanged
+        });
+    }
+}
+
+/// A device announced with VirtualDevicesReady.
+#[derive(Debug)]
+struct VirtualDevice {
+    path: String,
+    /// What the path pointed at when announced; None if it couldn't be told, which keeps it.
+    identity: Option<PathBuf>,
+}
+
+/// The kernel input device behind an evdev node: its sysfs `inputN` directory. Unlike
+/// /dev/input/eventN numbers, `inputN` numbers are never handed out twice.
+fn input_device_identity(path: &str) -> Option<PathBuf> {
+    let node = std::fs::canonicalize(path).ok()?;
+    let name = node.file_name()?.to_str()?;
+    std::fs::canonicalize(sysfs_root().join("class/input").join(name).join("device")).ok()
+}
+
+#[cfg(not(test))]
+fn sysfs_root() -> PathBuf {
+    PathBuf::from("/sys")
+}
+
+#[cfg(test)]
+fn sysfs_root() -> PathBuf {
+    tests::SYSFS_ROOT.with(|root| root.borrow().clone())
 }
 
 #[derive(Debug, Default)]
 pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
-    // Devices announced with VirtualDevicesReady; re-added on every start().
-    virtual_input_devices: Vec<String>,
+    // Devices announced with VirtualDevicesReady; re-added on every start() while unchanged.
+    virtual_input_devices: Vec<VirtualDevice>,
     disable_intel_workaround: bool,
     nv12: bool,
     /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
@@ -232,8 +279,17 @@ impl EventHandler for WaylandDisplaySrc {
                     // channel: the path is either in start()'s snapshot or sent to the new display.
                     let mut settings = self.settings.lock().unwrap();
                     // Always forward: a reconnected device can reuse its old /dev/input path.
-                    if !settings.virtual_input_devices.contains(&path) {
-                        settings.virtual_input_devices.push(path.clone());
+                    let identity = input_device_identity(&path);
+                    match settings
+                        .virtual_input_devices
+                        .iter_mut()
+                        .find(|device| device.path == path)
+                    {
+                        Some(device) => device.identity = identity,
+                        None => settings.virtual_input_devices.push(VirtualDevice {
+                            path: path.clone(),
+                            identity,
+                        }),
                     }
                     self.send_command(Command::InputDevice(path));
                     return true;
@@ -1554,7 +1610,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // The channel is swapped under the settings lock so a concurrent VirtualDevicesReady lands
         // either in the queued startup devices or after them, never both or neither.
         let (render_node, command_rx, command_tx) = {
-            let settings = self.settings.lock().unwrap();
+            let mut settings = self.settings.lock().unwrap();
+            settings.prune_virtual_input_devices();
             let command_rx = self.new_startup_channel(&settings);
             let command_tx = self.command_tx.lock().unwrap().clone();
             (settings.render_node.clone(), command_rx, command_tx)
@@ -2047,6 +2104,13 @@ mod tests {
     /// Paths the compositor logged as "Adding input device.", across all tests in this binary.
     static ADDED_INPUT_DEVICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+    thread_local! {
+        /// Where input_device_identity() looks devices up. Per thread, as start() and event
+        /// handling run on the test's thread, so a fake tree doesn't leak into other tests.
+        pub(super) static SYSFS_ROOT: std::cell::RefCell<std::path::PathBuf> =
+            std::cell::RefCell::new("/sys".into());
+    }
+
     /// Records the paths of the compositor's "Adding input device." events.
     struct AddedInputDevices;
 
@@ -2340,6 +2404,167 @@ mod tests {
         assert_eq!(
             imp.settings.lock().unwrap().startup_input_devices(),
             ["/dev/input/event7"]
+        );
+    }
+
+    // start() re-added every announced path, including unplugged devices and event
+    // numbers the kernel had since given to another device.
+    #[test]
+    #[ignore = "needs /dev/uinput and udev; run with --ignored"]
+    fn restart_drops_virtual_devices_that_changed() {
+        use super::EventHandler;
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::utils::uinput::UinputKeyboard;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let imp = src.imp();
+        let _command_rx = imp.new_command_channel();
+        let announce = |path: &str| {
+            assert!(
+                imp.handle_event(&gst::event::CustomUpstream::new(
+                    gst::Structure::builder("VirtualDevicesReady")
+                        .field("path", path)
+                        .build(),
+                ))
+            );
+        };
+        let startup_devices = || {
+            let mut settings = imp.settings.lock().unwrap();
+            settings.prune_virtual_input_devices();
+            settings.startup_input_devices()
+        };
+
+        let kept = UinputKeyboard::new();
+        let unplugged = UinputKeyboard::new();
+        let unplugged_path = unplugged.path.clone();
+        announce(&kept.path);
+        announce(&unplugged_path);
+        drop(unplugged);
+        assert_eq!(startup_devices(), [kept.path.clone()]);
+
+        // The kernel hands out the lowest free event number, so this takes the dropped one.
+        let other = UinputKeyboard::new();
+        announce(&other.path);
+        drop(other);
+        let reused = UinputKeyboard::new();
+        assert_eq!(
+            startup_devices(),
+            [kept.path.clone()],
+            "re-added {} (now another device: {})",
+            reused.path,
+            reused.path == unplugged_path
+        );
+
+        // Announcing the device that now owns the path keeps it again.
+        announce(&reused.path);
+        assert_eq!(startup_devices(), [kept.path.clone(), reused.path.clone()]);
+    }
+
+    // start() re-added every announced path, including unplugged devices and event
+    // numbers since given to another device. Runs without hardware on a fake sysfs tree.
+    #[test]
+    fn restart_skips_virtual_devices_that_are_gone_or_reassigned() {
+        use gst::prelude::*;
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let root = std::env::temp_dir().join(format!("wlsrc-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let node = |n: u32| root.join(format!("dev/event{n}"));
+        let link = |n: u32| root.join(format!("sys/class/input/event{n}/device"));
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        for n in 4..=7 {
+            std::fs::write(node(n), "").unwrap();
+            std::fs::create_dir_all(root.join(format!("sys/devices/input{n}"))).unwrap();
+            std::fs::create_dir_all(link(n).parent().unwrap()).unwrap();
+            symlink(root.join(format!("sys/devices/input{n}")), link(n)).unwrap();
+        }
+        SYSFS_ROOT.with(|sysfs| *sysfs.borrow_mut() = root.join("sys"));
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build()
+            .upcast::<gst::Element>();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        let path = |n: u32| node(n).to_str().unwrap().to_owned();
+        let adds = |n: u32| {
+            ADDED_INPUT_DEVICES
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|added| **added == path(n))
+                .count()
+        };
+        let wait_for_adds = |n: u32, count: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while adds(n) < count {
+                assert!(Instant::now() < deadline, "event{n} was not added");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let announce = |path: &str| {
+            assert!(
+                src.send_event(gst::event::CustomUpstream::new(
+                    gst::Structure::builder("VirtualDevicesReady")
+                        .field("path", path)
+                        .build(),
+                ))
+            );
+        };
+        let reassign = |n: u32, to: u32| {
+            std::fs::create_dir_all(root.join(format!("sys/devices/input{to}"))).unwrap();
+            std::fs::remove_file(link(n)).unwrap();
+            symlink(root.join(format!("sys/devices/input{to}")), link(n)).unwrap();
+        };
+        // No sysfs entry, so its identity is unknown: kept, as before.
+        let unknown = root.join("dev/unknown").to_str().unwrap().to_owned();
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        // Unplugged, silently reassigned, reconnected, unknown, kept: added in this order.
+        for n in [6, 4, 7] {
+            announce(&path(n));
+        }
+        announce(&unknown);
+        announce(&path(5));
+        wait_for_adds(5, 1);
+        // event7 reconnects on its old path while streaming and is announced again.
+        reassign(7, 17);
+        announce(&path(7));
+        wait_for_adds(7, 2);
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        std::fs::remove_file(node(6)).unwrap();
+        reassign(4, 14);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        wait_for_adds(5, 2);
+        pipeline.set_state(gst::State::Null).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let unknown_adds = ADDED_INPUT_DEVICES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|added| **added == unknown)
+            .count();
+        assert_eq!(adds(6), 1, "re-added an unplugged device");
+        assert_eq!(
+            adds(4),
+            1,
+            "re-added a path now belonging to another device"
+        );
+        assert_eq!(
+            adds(7),
+            3,
+            "dropped a device announced again on its old path"
+        );
+        assert_eq!(
+            unknown_adds, 2,
+            "dropped a device whose identity was unknown"
         );
     }
 
