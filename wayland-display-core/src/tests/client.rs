@@ -238,15 +238,54 @@ impl WaylandClient {
     }
 
     pub fn create_window(&mut self) {
-        self.state.create_window();
+        self.state.create_window_uncommitted();
+        self.state.windows.last().unwrap().commit();
+    }
+
+    /// Create a toplevel but hold back its initial commit (see `commit_window`).
+    pub fn create_window_uncommitted(&mut self) {
+        self.state.create_window_uncommitted();
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
-        let window = self.state.windows.last_mut().unwrap();
+        self.setup_window_at(self.state.windows.len() - 1, width, height);
+    }
+
+    /// Map window `idx`: attach a buffer, ack its last configure and commit.
+    pub fn setup_window_at(&self, idx: usize, width: u16, height: u16) {
+        let window = &self.state.windows[idx];
         window.set_title("Hello World!");
         window.attach_new_buffer(self.state.buffer.as_ref().unwrap());
         window.set_size(width, height);
         window.ack_last_and_commit();
+    }
+
+    /// The most recent toplevel `configure` received on the first window.
+    pub fn last_configure(&self) -> Option<&Configure> {
+        self.state
+            .windows
+            .first()
+            .and_then(|w| w.configures_received.last())
+            .map(|(_, c)| c)
+    }
+
+    /// The toplevel `configure` events received so far on window `idx`, oldest first.
+    pub fn configures_of(&self, idx: usize) -> &[(u32, Configure)] {
+        &self.state.windows[idx].configures_received
+    }
+
+    /// Destroy the most recently created window (toplevel, xdg_surface, then surface).
+    pub fn destroy_window(&mut self) {
+        self.destroy_window_at(self.state.windows.len() - 1);
+    }
+
+    /// Destroy window `idx` (toplevel, xdg_surface, then surface) and forget it, so later
+    /// windows shift down one index.
+    pub fn destroy_window_at(&mut self, idx: usize) {
+        let window = self.state.windows.remove(idx);
+        window.xdg_toplevel.destroy();
+        window.xdg_surface.destroy();
+        window.surface.destroy();
     }
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
@@ -284,6 +323,11 @@ impl WaylandClient {
         let surface = &self.state.windows[idx].surface;
         let cm_surface = manager.get_surface(surface, &self.qh, ());
         cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
+    }
+
+    /// Ack window `idx`'s last configure without committing.
+    pub fn ack_window(&self, idx: usize) {
+        self.state.windows[idx].ack_last();
     }
 
     /// Commit window `idx`'s surface.
@@ -390,7 +434,8 @@ impl WaylandClient {
 }
 
 impl State {
-    pub fn create_window(&mut self) {
+    /// Create a toplevel without its initial commit.
+    pub fn create_window_uncommitted(&mut self) {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.wm_base.as_ref().unwrap();
         let viewporter = self.viewporter.as_ref().unwrap();
@@ -400,7 +445,7 @@ impl State {
         let xdg_toplevel = xdg_surface.get_toplevel(&self.qh, ());
         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
 
-        let window = Window {
+        self.windows.push(Window {
             surface,
             xdg_surface,
             xdg_toplevel,
@@ -408,11 +453,7 @@ impl State {
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
-        };
-
-        window.commit();
-
-        self.windows.push(window);
+        });
     }
 }
 

@@ -59,8 +59,15 @@ fn log_client_buffer_fourcc(surface: &WlSurface) {
 }
 
 impl State {
-    /// Size a new toplevel to the output (fullscreen, unless it declared a max size),
-    /// activate it and send its initial configure. Requires an output.
+    /// Size a toplevel to the output (fullscreen, unless it declared a max size), activate
+    /// it and configure it. Requires an output.
+    ///
+    /// The configure goes out through Smithay's `send_pending_configure`, which sends only
+    /// when the pending state differs from the last state sent to the client (the newest
+    /// unacked configure, else the last acked one). The initial configure always goes out,
+    /// since Smithay counts a toplevel that hasn't had one as having pending changes; a
+    /// re-send to a window that was already configured with this size and these states is
+    /// dropped instead of reaching the client as a redundant configure.
     pub(crate) fn send_initial_configure(
         &self,
         window: &smithay::desktop::Window,
@@ -86,7 +93,7 @@ impl State {
         toplevel.with_pending_state(|state| {
             state.states.set(XdgState::Activated);
         });
-        toplevel.send_configure();
+        toplevel.send_pending_configure();
     }
 }
 
@@ -206,9 +213,9 @@ impl CompositorHandler for State {
             });
 
             if self.output.is_none() {
-                // No output to size it against yet: keep it pending. The first
-                // apply_video_info sends its initial configure.
-                self.pending_windows.push(window);
+                // No output to size it against yet: hold it apart from the toplevels that
+                // haven't committed. apply_video_info sends its initial configure.
+                self.windows_awaiting_output.push(window);
                 return;
             }
 
