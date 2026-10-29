@@ -66,7 +66,7 @@ use smithay::{
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::CString,
     sync::{Arc, mpsc::Sender},
     time::{Duration, Instant},
@@ -87,7 +87,6 @@ use crate::utils::allocator::{
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
 };
 use crate::utils::color::FrameColor;
-use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
 use crate::wayland::handlers::color_management::{SurfaceHdrColor, surface_hdr_color};
@@ -145,6 +144,8 @@ pub struct State {
     /// initial configure (and move to `pending_windows`) once `apply_video_info` runs.
     pub windows_awaiting_output: Vec<Window>,
     input_context: Libinput,
+    /// libinput handle of each device added by path, so a re-announced path replaces its handle.
+    input_devices: HashMap<String, smithay::reexports::input::Device>,
 
     // wayland state
     pub dh: DisplayHandle,
@@ -462,6 +463,7 @@ impl State {
             pending_windows: Vec::new(),
             windows_awaiting_output: Vec::new(),
             input_context: input_context.clone(),
+            input_devices: HashMap::new(),
 
             dh: dh.clone(),
             compositor_state,
@@ -973,7 +975,7 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
-                    state.input_context.path_add_device(&path);
+                    state.add_input_device(&path);
                 }
                 Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
                     let wait = if let Some(last_render) = state.last_render {
@@ -1198,25 +1200,6 @@ pub(crate) fn init(
                     };
                     debug!("Supported dma formats: {:?}", supported_formats);
                     let _ = sender.send(supported_formats);
-                }
-                Event::Msg(Command::GetRenderDevice(sender)) => {
-                    let render_device: Option<GPUDevice> = match &state.render_node {
-                        Some(node) => {
-                            let result = GPUDevice::try_from(*node);
-                            match result {
-                                Ok(device) => Some(device),
-                                Err(err) => {
-                                    tracing::warn!("Error during GetRenderDevice: {}", err);
-                                    None
-                                }
-                            }
-                        }
-                        None => None,
-                    };
-                    debug!("Render device requested: {:?}", render_device);
-                    if let Err(err) = sender.send(render_device) {
-                        tracing::warn!(?err, "Failed to send render device.");
-                    }
                 }
                 Event::Msg(Command::TouchDown(id, rel_position)) => {
                     let time: Duration = state.clock.now().into();

@@ -37,6 +37,7 @@ input-event-codes-sys = "0.1.0"
 wayland-client = "0.31.10"
 wayland-protocols = { version = "0.32.8", features = ["client", "staging"] }
 tempfile = "3.20.0"
+wayland-display-core = { path = "../wayland-display-core", features = ["test-uinput"] }
 
 [build-dependencies]
 gst-plugin-version-helper = "0.7.5"

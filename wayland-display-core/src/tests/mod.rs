@@ -1,7 +1,12 @@
 pub(crate) mod client;
 mod device;
 pub(crate) mod fixture;
+mod test_detached_compositor;
 mod test_early_window;
+mod test_failed_init;
 mod test_hdr;
+mod test_input_devices;
 mod test_pointer;
+mod test_render_device;
 mod test_resolution;
+mod test_unanswered_compositor;
