@@ -248,7 +248,12 @@ impl WaylandClient {
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
-        let window = self.state.windows.last_mut().unwrap();
+        self.setup_window_at(self.state.windows.len() - 1, width, height);
+    }
+
+    /// Map window `idx`: attach a buffer, ack its last configure and commit.
+    pub fn setup_window_at(&self, idx: usize, width: u16, height: u16) {
+        let window = &self.state.windows[idx];
         window.set_title("Hello World!");
         window.attach_new_buffer(self.state.buffer.as_ref().unwrap());
         window.set_size(width, height);
@@ -264,9 +269,20 @@ impl WaylandClient {
             .map(|(_, c)| c)
     }
 
+    /// The toplevel `configure` events received so far on window `idx`, oldest first.
+    pub fn configures_of(&self, idx: usize) -> &[(u32, Configure)] {
+        &self.state.windows[idx].configures_received
+    }
+
     /// Destroy the most recently created window (toplevel, xdg_surface, then surface).
     pub fn destroy_window(&mut self) {
-        let window = self.state.windows.pop().unwrap();
+        self.destroy_window_at(self.state.windows.len() - 1);
+    }
+
+    /// Destroy window `idx` (toplevel, xdg_surface, then surface) and forget it, so later
+    /// windows shift down one index.
+    pub fn destroy_window_at(&mut self, idx: usize) {
+        let window = self.state.windows.remove(idx);
         window.xdg_toplevel.destroy();
         window.xdg_surface.destroy();
         window.surface.destroy();
@@ -307,6 +323,11 @@ impl WaylandClient {
         let surface = &self.state.windows[idx].surface;
         let cm_surface = manager.get_surface(surface, &self.qh, ());
         cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
+    }
+
+    /// Ack window `idx`'s last configure without committing.
+    pub fn ack_window(&self, idx: usize) {
+        self.state.windows[idx].ack_last();
     }
 
     /// Commit window `idx`'s surface.

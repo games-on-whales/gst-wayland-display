@@ -885,6 +885,8 @@ pub(crate) fn apply_video_info(
     };
 
     // Toplevels already configured but not yet mapped would otherwise keep the old size.
+    // send_initial_configure skips the configure when the size and states are unchanged,
+    // so a renegotiation that keeps the resolution doesn't re-configure them.
     for window in &state.pending_windows {
         let Some(toplevel) = window.toplevel() else {
             continue;
