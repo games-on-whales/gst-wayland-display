@@ -185,52 +185,22 @@ impl<T: Clone> MaybeRecv<T> {
 }
 
 impl WaylandDisplay {
+    /// A display with its own command channel and Vulkan/VA shares, for callers without a gst
+    /// element (the C API). Returns without waiting on the compositor thread; like the element's
+    /// start(), wait for [`WaylandDisplay::env_vars`] (bounded by the reply timeout) to know it
+    /// came up.
     pub fn new(render_node: Option<String>) -> Result<WaylandDisplay, CreateDrmNodeError> {
-        let (channel_tx, channel_rx) = std::sync::mpsc::sync_channel(0);
-        let (devices_tx, devices_rx) = std::sync::mpsc::channel();
-        let (envs_tx, envs_rx) = std::sync::mpsc::channel();
-        // Reverse channel (compositor -> element) for HDR-state notifications.
-        let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = channel();
         // This constructor has no gst element to answer context queries, so nothing outside
-        // the compositor thread mints on it -- but comp::init needs one, and making it
-        // per-instance keeps the process-global slots gone on this path too.
-        let vulkan_share = VulkanShare::new();
-        let compositor_vulkan_share = Arc::clone(&vulkan_share);
-        let render_target = RenderTarget::from_str(
-            &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
-        )?;
-        let render_device = render_device(&render_target);
-
-        let thread_handle = std::thread::spawn(move || {
-            if let Err(err) = std::panic::catch_unwind(|| {
-                // calloops channel is not "UnwindSafe", but the std channel is... *sigh* lets workaround it creatively
-                let (command_tx, command_src) = smithay::reexports::calloop::channel::channel();
-                channel_tx.send(command_tx).unwrap();
-                comp::init(
-                    command_src,
-                    render_target,
-                    devices_tx,
-                    envs_tx,
-                    hdr_state_tx,
-                    compositor_vulkan_share,
-                    Arc::new(Default::default()),
-                );
-            }) {
-                tracing::error!(?err, "Compositor thread panic'ed!");
-            }
-        });
-        let command_tx = channel_rx.recv().unwrap();
-
-        Ok(WaylandDisplay {
-            thread_handle: Some(thread_handle),
+        // the compositor thread mints on the shares -- but comp::init needs them, and making
+        // them per-instance keeps the process-global slots gone on this path too.
+        Self::new_with_channel(
+            render_node,
             command_tx,
-            hdr_state_rx,
-            reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
-            render_device,
-            tracer: None,
-            devices: MaybeRecv::Rx(devices_rx),
-            envs: MaybeRecv::Rx(envs_rx),
-        })
+            command_rx,
+            VulkanShare::new(),
+            Arc::new(Default::default()),
+        )
     }
 
     pub fn new_with_channel(
@@ -254,15 +224,21 @@ impl WaylandDisplay {
         let render_device = render_device(&render_target);
 
         let thread_handle = std::thread::spawn(move || {
-            comp::init(
-                commands_rx,
-                render_target,
-                devices_tx,
-                envs_tx,
-                hdr_state_tx,
-                compositor_vulkan_share,
-                va_share,
-            );
+            // The default hook has already printed the panic; this tags it as the compositor's.
+            // Unwinding drops the senders above, so waiting callers get Disconnected.
+            if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                comp::init(
+                    commands_rx,
+                    render_target,
+                    devices_tx,
+                    envs_tx,
+                    hdr_state_tx,
+                    compositor_vulkan_share,
+                    va_share,
+                )
+            })) {
+                tracing::error!(?err, "Compositor thread panic'ed!");
+            }
         });
 
         Ok(WaylandDisplay {

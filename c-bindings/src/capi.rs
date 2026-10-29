@@ -28,13 +28,20 @@ pub unsafe extern "C" fn display_init(render_node: *const c_char) -> *mut Waylan
 
     tracing_subscriber::fmt::try_init().ok();
 
-    match WaylandDisplay::new(render_node) {
-        Ok(dpy) => Box::into_raw(Box::new(dpy)),
+    let mut dpy = match WaylandDisplay::new(render_node) {
+        Ok(dpy) => dpy,
         Err(err) => {
             tracing::error!(?err, "Failed to create wayland display.");
-            ptr::null_mut()
+            return ptr::null_mut();
         }
+    };
+    // Like the gst element's start(): only hand out a display whose compositor came up, waiting
+    // at most the reply timeout. Dropping one that didn't won't wait out a second timeout.
+    if let Err(err) = dpy.env_vars() {
+        tracing::error!(?err, "The compositor did not finish initializing.");
+        return ptr::null_mut();
     }
+    Box::into_raw(Box::new(dpy))
 }
 
 /// Borrows the display behind `dpy`, or logs and returns None for NULL.
@@ -358,6 +365,22 @@ mod tests {
             display_set_trace_fn(dpy, Some(trace_start), Some(trace_end));
             display_set_trace_fn(dpy, None, Some(trace_end));
             assert!((*dpy).tracer.is_none());
+            display_finish(dpy);
+        }
+    }
+
+    // display_init must report a compositor that can't start as NULL, not a display whose every
+    // call then fails, and a started one as usable right away.
+    #[test]
+    fn display_init_returns_a_started_display_or_null() {
+        unsafe {
+            assert!(display_init(c"/nonexistent/renderD128".as_ptr()).is_null());
+            let dpy = display_init(c"software".as_ptr());
+            assert!(!dpy.is_null());
+            let mut envs = [ptr::null::<c_char>(); 4];
+            assert_eq!(display_get_envvars(dpy, envs.as_mut_ptr(), 4), 1);
+            let env = CStr::from_ptr(envs[0]).to_str().unwrap();
+            assert!(env.starts_with("WAYLAND_DISPLAY="), "{env}");
             display_finish(dpy);
         }
     }
