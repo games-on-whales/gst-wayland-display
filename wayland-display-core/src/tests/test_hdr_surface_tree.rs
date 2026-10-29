@@ -2,6 +2,7 @@ use super::fixture::Fixture;
 use crate::wayland::handlers::color_management::{
     MasteringDisplayInfo, SurfaceHdrColor, set_surface_hdr_color,
 };
+use smithay::wayland::seat::WaylandFocus;
 
 #[test]
 fn pq_child_survives_sdr_root_and_returns_to_sdr_when_cleared() {
