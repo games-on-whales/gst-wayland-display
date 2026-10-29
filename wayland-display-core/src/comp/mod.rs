@@ -57,7 +57,7 @@ use smithay::{
         presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::{SurfaceCachedState, XdgShellState, XdgToplevelSurfaceData},
+        shell::xdg::{SurfaceCachedState, ToplevelSurface, XdgShellState, XdgToplevelSurfaceData},
         shm::ShmState,
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
@@ -140,6 +140,9 @@ pub struct State {
     pub cursor_state: CursorImageStatus,
     surpressed_keys: HashSet<u32>,
     pub pending_windows: Vec<Window>,
+    /// Toplevels whose initial commit arrived before the output existed; they get their
+    /// initial configure (and move to `pending_windows`) once `apply_video_info` runs.
+    pub windows_awaiting_output: Vec<Window>,
     input_context: Libinput,
     /// libinput handle of each device added by path, so a re-announced path replaces its handle.
     input_devices: HashMap<String, smithay::reexports::input::Device>,
@@ -458,6 +461,7 @@ impl State {
             cursor_event_count: 0,
             surpressed_keys: HashSet::new(),
             pending_windows: Vec::new(),
+            windows_awaiting_output: Vec::new(),
             input_context: input_context.clone(),
             input_devices: HashMap::new(),
 
@@ -866,30 +870,45 @@ pub(crate) fn apply_video_info(
         toplevel.send_configure();
     }
 
-    if !output_already_running {
-        // Toplevels that committed before there was an output are still waiting for their
-        // initial configure; they won't commit again until they get it.
-        for window in &state.pending_windows {
-            let Some(toplevel) = window.toplevel() else {
-                continue;
-            };
-            let (sent, max_size) = with_states(toplevel.wl_surface(), |states| {
-                (
-                    states
-                        .data_map
-                        .get::<XdgToplevelSurfaceData>()
-                        .is_some_and(|d| d.lock().unwrap().initial_configure_sent),
-                    states
-                        .cached_state
-                        .get::<SurfaceCachedState>()
-                        .current()
-                        .max_size,
-                )
-            });
-            if !sent {
-                state.send_initial_configure(window, max_size);
-            }
+    let toplevel_state = |toplevel: &ToplevelSurface| {
+        with_states(toplevel.wl_surface(), |states| {
+            (
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .is_some_and(|d| d.lock().unwrap().initial_configure_sent),
+                states
+                    .cached_state
+                    .get::<SurfaceCachedState>()
+                    .current()
+                    .max_size,
+            )
+        })
+    };
+
+    // Toplevels already configured but not yet mapped would otherwise keep the old size.
+    // send_initial_configure skips the configure when the size and states are unchanged,
+    // so a renegotiation that keeps the resolution doesn't re-configure them.
+    for window in &state.pending_windows {
+        let Some(toplevel) = window.toplevel() else {
+            continue;
+        };
+        let (sent, max_size) = toplevel_state(toplevel);
+        if sent {
+            state.send_initial_configure(window, max_size);
         }
+    }
+
+    // Toplevels that committed before the output existed couldn't be sized; configure
+    // them now and hand them to the normal commit path, which maps them on their next commit.
+    // Toplevels that haven't committed yet stay in pending_windows unconfigured: xdg-shell's
+    // initial configure answers the initial commit.
+    for window in std::mem::take(&mut state.windows_awaiting_output) {
+        if let Some(toplevel) = window.toplevel() {
+            let (_, max_size) = toplevel_state(toplevel);
+            state.send_initial_configure(&window, max_size);
+        }
+        state.pending_windows.push(window);
     }
 }
 

@@ -1,6 +1,7 @@
 pub(crate) mod client;
 mod device;
 pub(crate) mod fixture;
+mod test_early_window;
 mod test_failed_init;
 mod test_hdr;
 mod test_input_devices;
