@@ -128,15 +128,18 @@ impl Settings {
     }
 
     /// Forgets announced devices that are gone or whose path now belongs to another device, so
-    /// start() doesn't hand the display an input it was never given.
+    /// start() doesn't hand the display an input it was never given. A device whose identity
+    /// couldn't be told when it was announced is forgotten too: whether its path still refers to
+    /// it can't be checked, and re-adding a path the kernel gave to another device (possibly
+    /// another session's) is worse than waiting for the application to announce it again.
     fn prune_virtual_input_devices(&mut self) {
         self.virtual_input_devices.retain(|device| {
             let unchanged =
-                device.identity.is_none() || input_device_identity(&device.path) == device.identity;
+                device.identity.is_some() && input_device_identity(&device.path) == device.identity;
             if !unchanged {
                 tracing::info!(
                     path = device.path,
-                    "Dropping a virtual input device that is gone."
+                    "Dropping a virtual input device that is gone or can't be identified."
                 );
             }
             unchanged
@@ -148,7 +151,8 @@ impl Settings {
 #[derive(Debug)]
 struct VirtualDevice {
     path: String,
-    /// What the path pointed at when announced; None if it couldn't be told, which keeps it.
+    /// What the path pointed at when announced; None if it couldn't be told (no such node, or no
+    /// sysfs entry for it), in which case the device is not re-added on the next start().
     identity: Option<PathBuf>,
 }
 
@@ -2667,15 +2671,33 @@ mod tests {
             std::fs::remove_file(link(n)).unwrap();
             symlink(root.join(format!("sys/devices/input{to}")), link(n)).unwrap();
         };
-        // No sysfs entry, so its identity is unknown: kept, as before.
-        let unknown = root.join("dev/unknown").to_str().unwrap().to_owned();
+        let adds_of = |path: &str| {
+            ADDED_INPUT_DEVICES
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|added| **added == path)
+                .count()
+        };
+        // Identity unknown at announcement, so never re-added: one path that never exists, one that
+        // exists but has no sysfs entry, and one that only appears (as some device) later.
+        let unknown_gone = root.join("dev/unknown-gone").to_str().unwrap().to_owned();
+        let unknown_no_sysfs = root
+            .join("dev/unknown-no-sysfs")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        std::fs::write(&unknown_no_sysfs, "").unwrap();
+        let unknown_late = root.join("dev/unknown-late").to_str().unwrap().to_owned();
 
         pipeline.set_state(gst::State::Playing).unwrap();
         // Unplugged, silently reassigned, reconnected, unknown, kept: added in this order.
         for n in [6, 4, 7] {
             announce(&path(n));
         }
-        announce(&unknown);
+        for unknown in [&unknown_gone, &unknown_no_sysfs, &unknown_late] {
+            announce(unknown);
+        }
         announce(&path(5));
         wait_for_adds(5, 1);
         // event7 reconnects on its old path while streaming and is announced again.
@@ -2686,16 +2708,33 @@ mod tests {
 
         std::fs::remove_file(node(6)).unwrap();
         reassign(4, 14);
+        // The late path now exists and belongs to some device, which may not be the one announced.
+        std::fs::write(&unknown_late, "").unwrap();
+        std::fs::create_dir_all(root.join("sys/devices/input9")).unwrap();
+        std::fs::create_dir_all(root.join("sys/class/input/unknown-late")).unwrap();
+        symlink(
+            root.join("sys/devices/input9"),
+            root.join("sys/class/input/unknown-late/device"),
+        )
+        .unwrap();
         pipeline.set_state(gst::State::Playing).unwrap();
         wait_for_adds(5, 2);
+        // Announced again now that it can be identified: from here on it is kept.
+        announce(&unknown_late);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while adds_of(&unknown_late) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the re-announced device was not added"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        wait_for_adds(5, 3);
         pipeline.set_state(gst::State::Null).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        let unknown_adds = ADDED_INPUT_DEVICES
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|added| **added == unknown)
-            .count();
         assert_eq!(adds(6), 1, "re-added an unplugged device");
         assert_eq!(
             adds(4),
@@ -2704,12 +2743,23 @@ mod tests {
         );
         assert_eq!(
             adds(7),
-            3,
+            4,
             "dropped a device announced again on its old path"
         );
         assert_eq!(
-            unknown_adds, 2,
-            "dropped a device whose identity was unknown"
+            adds_of(&unknown_gone),
+            1,
+            "re-added a device that never existed"
+        );
+        assert_eq!(
+            adds_of(&unknown_no_sysfs),
+            1,
+            "re-added a device whose identity couldn't be checked"
+        );
+        assert_eq!(
+            adds_of(&unknown_late),
+            3,
+            "re-added a path that appeared after it was announced, or dropped it once identified"
         );
     }
 
