@@ -55,6 +55,7 @@ meson setup "$BUILD" "$SRC" \
   -Drtsp_server=disabled -Ddevtools=disabled -Dpython=disabled -Dsharp=disabled \
   -Dgst-plugins-base:app=enabled -Dgst-plugins-base:videotestsrc=enabled \
   -Dgst-plugins-bad:vulkan=enabled -Dgst-plugins-bad:vulkan-video=enabled \
+  -Dgst-plugins-bad:nvcodec=enabled \
   -Dgst-plugins-bad:videoparsers=enabled \
   -Dorc=disabled -Ddoc=disabled -Dintrospection=disabled -Dexamples=disabled \
   -Dnls=disabled -Dgst-examples=disabled -Drs=disabled -Dlibnice=disabled \
@@ -65,6 +66,12 @@ meson setup "$BUILD" "$SRC" \
 if ! grep -q 'GST_VULKAN_HAVE_VIDEO_EXTENSIONS 1' \
     "$BUILD"/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkconfig.h; then
   echo "error: Vulkan video extensions not enabled (Vulkan headers >= 1.4.317 needed)" >&2
+  exit 1
+fi
+
+echo "==> require CUDA converter compilation"
+if ! grep -q 'gstcudaconverter.cpp' "$BUILD/compile_commands.json"; then
+  echo "error: CUDA converter was not selected for compilation" >&2
   exit 1
 fi
 
@@ -82,3 +89,6 @@ TESTS=(
 )
 echo "==> test: ${TESTS[*]}"
 meson test -C "$BUILD" --no-rebuild --print-errorlogs "${TESTS[@]}"
+
+# Metadata/decision/numerical tests use real GStreamer buffers and run without a GPU.
+meson devenv -C "$BUILD" python3 "$ROOT/tests/cuda-frame-color.py" "$SRC"

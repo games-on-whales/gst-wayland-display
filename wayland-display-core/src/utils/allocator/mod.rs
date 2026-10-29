@@ -504,7 +504,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         renderer: &mut GlesRenderer,
         pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
-        match self {
+        let output: Result<GstBuffer, Box<dyn std::error::Error>> = match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer.copy_framebuffer(
                     target,
@@ -631,7 +631,17 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     buffer_pool.as_ref(),
                 )?)
             }
+        };
+        let mut output = output?;
+        // NV12 and VulkanImage branches already converted the source pixels.
+        // Raw outputs carry the frame's interpretation to downstream converters.
+        if matches!(
+            self,
+            GsBufferType::RAW(_) | GsBufferType::DMA(_) | GsBufferType::CUDA(_)
+        ) {
+            crate::utils::source_color::add_source_color_meta(&mut output, pq_passthrough)?;
         }
+        Ok(output)
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -641,7 +651,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         renderer: &mut GlesRenderer,
         pq_passthrough: bool,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
-        match self {
+        let output: Result<GstBuffer, Box<dyn std::error::Error>> = match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer.copy_framebuffer(
                     target,
@@ -753,7 +763,14 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 v.convert(&buffer.rgba, pq_passthrough)?;
                 v.to_gst_buffer()
             }
+        };
+        let mut output = output?;
+        // NV12 and VulkanImage branches already converted the source pixels.
+        // Raw outputs carry the frame's interpretation to downstream converters.
+        if matches!(self, GsBufferType::RAW(_) | GsBufferType::DMA(_)) {
+            crate::utils::source_color::add_source_color_meta(&mut output, pq_passthrough)?;
         }
+        Ok(output)
     }
 
     fn get_video_info(&self) -> VideoInfoTypes {

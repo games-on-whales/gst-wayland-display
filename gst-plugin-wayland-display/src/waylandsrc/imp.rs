@@ -96,6 +96,8 @@ pub struct Settings {
     /// pipeline (the Wayland globals are created at start). Must be per element -- not an
     /// env var -- so one process can stream an HDR client and an SDR client side by side.
     hdr_cm: bool,
+    /// Carry source color per frame; keep the negotiated transport caps fixed.
+    stable_color_transport: bool,
     /// Manual override of the HDR mastering-display-info caps string (gst format:
     /// "Rx:Ry:Gx:Gy:Bx:By:Wx:Wy:maxLum:minLum"). `None` => the hardcoded BT.2020/1000-nit
     /// default, or the game's real metadata under dynamic HDR.
@@ -372,6 +374,9 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .default_value(false)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecBoolean::builder("stable-color-transport")
+                    .blurb("Keep transport color caps fixed at the hdr setting; raw RGB frames carry per-frame source color metadata for a compatible converter. Requires dynamic-hdr for live client color management.")
+                    .default_value(false).mutable_ready().build(),
                 glib::ParamSpecString::builder("mastering-display-info")
                     .blurb(
                         "Override the HDR mastering-display-info caps string \
@@ -418,6 +423,9 @@ impl ObjectImpl for WaylandDisplaySrc {
                 self.vulkan_share.set_conversion_options(options);
             }
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile = value.get().unwrap(),
+            "stable-color-transport" => {
+                self.settings.lock().unwrap().stable_color_transport = value.get().unwrap();
+            }
             "dynamic-hdr" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.hdr_cm = value.get::<bool>().expect("Type checked upstream");
@@ -527,6 +535,12 @@ impl ObjectImpl for WaylandDisplaySrc {
                 .sdr_reference_white
                 .to_value(),
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile.to_value(),
+            "stable-color-transport" => self
+                .settings
+                .lock()
+                .unwrap()
+                .stable_color_transport
+                .to_value(),
             "dynamic-hdr" => self.settings.lock().unwrap().hdr_cm.to_value(),
             "mastering-display-info" => self
                 .settings
@@ -1058,18 +1072,21 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // dynamic-hdr: TRUE dynamic HDR. The stream stays P010/Main-10 always, but its
         // colorimetry flips mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR
         // content) following the live compositor HDR state (`hdr_active`, driven per-frame
-        // by `poll_hdr_state()` in `create()`). When the flag is unset this is byte-identical
+        // by `poll_hdr_state()` in `create()`). Opting into stable-color-transport instead
+        // keeps these output fields governed by hdr; source color travels with each raw frame.
+        // When dynamic-hdr is unset this is byte-identical
         // to the previous behaviour: the static `hdr` property alone governs the P010 caps.
-        let (hdr_cm, static_hdr, hdr_mastering_override, hdr_cll_override) = {
+        let (hdr_cm, stable_color_transport, static_hdr, hdr_mastering_override, hdr_cll_override) = {
             let settings = self.settings.lock().unwrap();
             (
                 settings.hdr_cm,
+                settings.stable_color_transport,
                 settings.hdr,
                 settings.mastering_display_info.clone(),
                 settings.content_light_level.clone(),
             )
         };
-        let hdr = if hdr_cm {
+        let hdr = if hdr_cm && !stable_color_transport {
             self.hdr_active.load(Ordering::Relaxed)
         } else {
             static_hdr
@@ -1082,15 +1099,16 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // wp_color_management/sway) -- so the "HDR Luminance" slider actually flows through to
         // the encoder's mastering/CLL SEI -- falling back to the hardcoded defaults when the
         // game provided none. The static `hdr` property path keeps using the defaults verbatim.
-        let (mut hdr_mastering, mut hdr_cll): (String, String) = if hdr_cm {
-            let meta = self.hdr_meta.lock().unwrap();
-            (
-                meta.0.clone().unwrap_or_else(|| HDR_MASTERING.to_string()),
-                meta.1.clone().unwrap_or_else(|| HDR_CLL.to_string()),
-            )
-        } else {
-            (HDR_MASTERING.to_string(), HDR_CLL.to_string())
-        };
+        let (mut hdr_mastering, mut hdr_cll): (String, String) =
+            if hdr_cm && !stable_color_transport {
+                let meta = self.hdr_meta.lock().unwrap();
+                (
+                    meta.0.clone().unwrap_or_else(|| HDR_MASTERING.to_string()),
+                    meta.1.clone().unwrap_or_else(|| HDR_CLL.to_string()),
+                )
+            } else {
+                (HDR_MASTERING.to_string(), HDR_CLL.to_string())
+            };
         // Manual override of the static HDR metadata via the mastering-display-info /
         // content-light-level element properties (per element, so an HDR session and an SDR
         // session in one process can each carry their own metadata). `None`/empty => leave
@@ -1587,7 +1605,10 @@ impl PushSrcImpl for WaylandDisplaySrc {
                 // negotiate -> `caps()`/`fixate()`/`set_caps`, producing the new colorimetry
                 // (BT.2100 PQ <-> BT.709) and pushing a fresh CAPS event downstream. The
                 // downstream encoder re-emits its VUI + HDR SEI at the next IDR.
-                if self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr {
+                let changed = self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr;
+                // Frame metadata drives source interpretation in stable transport mode.
+                // Keep the existing event/caps mode unchanged unless explicitly opted in.
+                if changed && !self.settings.lock().unwrap().stable_color_transport {
                     gst::info!(
                         CAT,
                         "dynamic-hdr: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
@@ -2012,5 +2033,56 @@ mod tests {
             ),
             Some("RA24:0x0300000000000013".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod color_transport_tests {
+    use super::*;
+    use gst::subclass::prelude::ObjectSubclassIsExt;
+
+    #[test]
+    fn stable_transport_keeps_p010_caps_across_source_color_changes() {
+        gst::init().unwrap();
+        let src: super::super::WaylandDisplaySrc = glib::Object::builder()
+            .property("dynamic-hdr", true)
+            .property("vulkan", true)
+            .property("nv12", true)
+            .property("stable-color-transport", true)
+            .property("hdr", true)
+            .build();
+        let imp = src.imp();
+        let initial = BaseSrcImpl::caps(imp, None).unwrap();
+        for active in [false, true, false, true, false] {
+            imp.hdr_active.store(active, Ordering::Relaxed);
+            let caps = BaseSrcImpl::caps(imp, None).unwrap();
+            assert_eq!(caps, initial);
+            assert!(caps.iter().any(|s| {
+                s.get::<String>("colorimetry")
+                    .is_ok_and(|v| v == "bt2100-pq")
+            }));
+        }
+        src.set_property("hdr", false);
+        assert!(!BaseSrcImpl::caps(imp, None).unwrap().iter().any(|s| {
+            s.get::<String>("colorimetry")
+                .is_ok_and(|v| v == "bt2100-pq")
+        }));
+    }
+
+    #[test]
+    fn existing_dynamic_caps_mode_is_unchanged_by_default() {
+        gst::init().unwrap();
+        let src: super::super::WaylandDisplaySrc = glib::Object::builder()
+            .property("dynamic-hdr", true)
+            .property("vulkan", true)
+            .property("nv12", true)
+            .property("hdr", true)
+            .build();
+        assert!(!src.property::<bool>("stable-color-transport"));
+        let imp = src.imp();
+        imp.hdr_active.store(false, Ordering::Relaxed);
+        let sdr = BaseSrcImpl::caps(imp, None).unwrap();
+        imp.hdr_active.store(true, Ordering::Relaxed);
+        assert_ne!(BaseSrcImpl::caps(imp, None).unwrap(), sdr);
     }
 }

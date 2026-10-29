@@ -5,3 +5,4 @@ vulkanh265enc.patch
 vkh264enc-rc-fix.patch
 gstreamer-vulkan-rc-retarget-no-reset.patch
 vulkanav1enc.patch
+gstreamer-cuda-frame-color.patch

@@ -9,11 +9,13 @@ on:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
+      - "tests/cuda-frame-color.py"
       - ".github/workflows/gst-patches.yml"
   pull_request:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
+      - "tests/cuda-frame-color.py"
       - ".github/workflows/gst-patches.yml"
 
 concurrency:
