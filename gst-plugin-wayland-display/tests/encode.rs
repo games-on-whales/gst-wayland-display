@@ -856,6 +856,109 @@ fn nvidia_cuda_encode_to_eos() {
     }
 }
 
+/// The CUDA context the source answers a context query with right now, if any.
+#[cfg(feature = "cuda")]
+fn source_cuda_context(src: &gst::Element) -> Option<gst::Context> {
+    let mut query = gst::query::Context::new("gst.cuda.context");
+    if !src.static_pad("src").unwrap().query(&mut query) {
+        return None;
+    }
+    query.context_owned()
+}
+
+/// Identity of the `GstCudaContext` inside a "gst.cuda.context" context.
+#[cfg(feature = "cuda")]
+fn cuda_context_ptr(context: &gst::Context) -> usize {
+    context
+        .structure()
+        .get::<gst::Object>("gst.cuda.context")
+        .expect("no GstCudaContext in the context")
+        .as_ptr() as usize
+}
+
+/// Runs `src` (num-buffers set) into `encoder` in a new pipeline to EOS, stops it and takes the
+/// source back out. Returns the CUDA context the source held while streaming.
+#[cfg(feature = "cuda")]
+fn run_cuda_source(src: &gst::Element, encoder: &str) -> gst::Context {
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            "video/x-raw(memory:CUDAMemory),width=1280,height=720,framerate=60/1"
+                .parse::<gst::Caps>()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let encoder = gst::ElementFactory::make(encoder).build().unwrap();
+    let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+    let pipeline = gst::Pipeline::new();
+    pipeline.add_many([src, &caps, &encoder, &sink]).unwrap();
+    gst::Element::link_many([src, &caps, &encoder, &sink]).unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let bus = pipeline.bus().unwrap();
+    let msg = bus
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .expect("timed out before EOS");
+    if let gst::MessageView::Error(err) = msg.view() {
+        panic!("{}: {:?}", err.error(), err.debug());
+    }
+    let context = source_cuda_context(src).expect("no CUDA context while streaming");
+    pipeline.set_state(gst::State::Null).unwrap();
+    pipeline.remove(src).unwrap();
+    context
+}
+
+/// A CUDA context the source acquired from its pipeline (here nvh26xenc's, via the context
+/// query) belongs to that run: it is released at stop, and the restarted source, now in another
+/// pipeline with another encoder, acquires one again. One the application set before start is
+/// kept across restarts and used by every run.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an NVIDIA GPU with nvh264enc and nvh265enc; run via ci/harness.sh gpu"]
+fn nvidia_cuda_context_ownership_across_restarts() {
+    init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no NVIDIA render node")
+    };
+    if !have("nvh264enc") || !have("nvh265enc") {
+        skip!("no nvh264enc / nvh265enc");
+    }
+    let src = gst::ElementFactory::make("waylanddisplaysrc")
+        .property("render-node", &node)
+        .property("num-buffers", 30i32)
+        .build()
+        .unwrap();
+
+    let acquired = run_cuda_source(&src, "nvh265enc");
+    assert!(
+        source_cuda_context(&src).is_none(),
+        "kept the pipeline's CUDA context after stop"
+    );
+    run_cuda_source(&src, "nvh264enc");
+    assert!(
+        source_cuda_context(&src).is_none(),
+        "kept the second pipeline's CUDA context after stop"
+    );
+
+    // As an application would: set a context on the stopped source.
+    let app = cuda_context_ptr(&acquired);
+    src.set_context(&acquired);
+    drop(acquired);
+    for encoder in ["nvh264enc", "nvh265enc"] {
+        let used = run_cuda_source(&src, encoder);
+        assert_eq!(
+            cuda_context_ptr(&used),
+            app,
+            "{encoder}: not the application's context"
+        );
+        let kept = source_cuda_context(&src).expect("dropped the application's context at stop");
+        assert_eq!(cuda_context_ptr(&kept), app);
+    }
+}
+
 /// P010 dmabuf into the VA H.265 encoder (`vah265enc`, or Intel's low-power
 /// `vah265lpenc`; Main-10) for longer than the encoder's surface pool lasts
 /// without surface reuse: P010 exports must be VA-allocator buffers like NV12, or every frame

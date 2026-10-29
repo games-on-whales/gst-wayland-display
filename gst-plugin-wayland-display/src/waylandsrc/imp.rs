@@ -213,6 +213,40 @@ pub struct Settings {
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
     cuda_raw_ptr: AtomicPtr<cuda::GstCudaContext>,
+    /// Whether `cuda_context` came from the pipeline during the current run (start()'s context
+    /// query, or a set_context while running) rather than from configuration (the
+    /// `cuda-device-id` property, or a set_context before start()). Only a configured context
+    /// outlives its run: a restarted element may be in another pipeline, with another encoder
+    /// or render node, so it acquires one again.
+    #[cfg(feature = "cuda")]
+    cuda_context_per_run: bool,
+    /// `Some` while a run is active: whether `cuda_raw_ptr` was already filled when it began.
+    /// A slot the run filled is emptied when the run ends.
+    #[cfg(feature = "cuda")]
+    cuda_slot_preset: Option<bool>,
+}
+
+#[cfg(feature = "cuda")]
+impl Settings {
+    /// Starts a run: CUDA contexts acquired from now until [`Settings::end_cuda_run`] are its own.
+    fn begin_cuda_run(&mut self) {
+        self.cuda_slot_preset = Some(!self.cuda_raw_ptr.get_mut().is_null());
+    }
+
+    /// Ends the current run, if any, releasing the CUDA context it acquired from its pipeline.
+    /// Safe however the context is still used: the compositor's output buffers and downstream
+    /// pools hold references of their own (see `CUDAContext::from_slot`).
+    fn end_cuda_run(&mut self) {
+        let Some(slot_preset) = self.cuda_slot_preset.take() else {
+            return;
+        };
+        if std::mem::take(&mut self.cuda_context_per_run) {
+            self.cuda_context = None;
+        }
+        if !slot_preset {
+            unsafe { CUDAContext::release_slot(self.cuda_raw_ptr.as_ptr()) };
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -613,6 +647,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                 } else {
                     None
                 };
+                settings.cuda_context_per_run = false;
             }
             "mouse" => {
                 let actual_val = value
@@ -887,6 +922,7 @@ impl ElementImpl for WaylandDisplaySrc {
                     let mut settings = self.settings.lock().unwrap();
                     if settings.cuda_context.is_none() {
                         settings.cuda_context = Some(Arc::new(Mutex::new(ctx)));
+                        settings.cuda_context_per_run = settings.cuda_slot_preset.is_some();
                     }
                 }
                 Err(e) => {
@@ -1568,8 +1604,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         self.hdr_active.store(false, Ordering::Relaxed);
         *self.hdr_meta.lock().unwrap() = (None, None);
         self.flushing.store(false, Ordering::Release);
-        #[cfg(feature = "cuda")]
-        let have_cuda_context = self.settings.lock().unwrap().cuda_context.is_some();
 
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
         let subscriber = Registry::default().with(GstLayer);
@@ -1611,6 +1645,12 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         #[cfg(feature = "cuda")]
+        let have_cuda_context = {
+            let mut settings = self.settings.lock().unwrap();
+            settings.begin_cuda_run();
+            settings.cuda_context.is_some()
+        };
+        #[cfg(feature = "cuda")]
         match display.get_render_device() {
             Some(render_device) => {
                 if *render_device.pci_vendor() == PCIVendor::NVIDIA && !have_cuda_context {
@@ -1627,6 +1667,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                             if settings.cuda_context.is_none() {
                                 tracing::info!("Acquired a CudaContext via new_from_gstreamer");
                                 settings.cuda_context = Some(Arc::new(Mutex::new(cuda_context)));
+                                settings.cuda_context_per_run = true;
                             } else {
                                 tracing::info!("Acquired a CudaContext via set_context");
                             }
@@ -1645,6 +1686,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let env_vars = match display.env_vars() {
             Ok(env_vars) => env_vars,
             Err(RecvTimeoutError::Timeout) => {
+                // GstBaseSrc doesn't stop() after a failed start().
+                #[cfg(feature = "cuda")]
+                self.settings.lock().unwrap().end_cuda_run();
                 return Err(gst::error_msg!(
                     LibraryError::Init,
                     (
@@ -1654,6 +1698,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 ));
             }
             Err(RecvTimeoutError::Disconnected) => {
+                #[cfg(feature = "cuda")]
+                self.settings.lock().unwrap().end_cuda_run();
                 return Err(gst::error_msg!(
                     LibraryError::Init,
                     ("The compositor exited during initialization (its panic message is on stderr); check `render-node`, or set `render-node=software` for software rendering.")
@@ -1682,6 +1728,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // Only after the display: dropping a frame the compositor still owes makes it exit, and
         // Drop must still be able to send Quit and join it.
         self.pending_frame.lock().unwrap().take();
+        #[cfg(feature = "cuda")]
+        self.settings.lock().unwrap().end_cuda_run();
         Ok(())
     }
 

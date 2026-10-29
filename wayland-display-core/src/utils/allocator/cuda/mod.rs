@@ -461,8 +461,8 @@ impl CUDAContext {
         }
     }
 
-    /// Release the reference a `gst_cuda_*` helper transferred into `cuda_raw_ptr`, if any.
-    /// Call once, when the slot's owner goes away; wrappers keep their own references.
+    /// Release the reference a `gst_cuda_*` helper transferred into `cuda_raw_ptr`, if any, and
+    /// empty the slot so the helpers fill it again. Wrappers keep their own references.
     ///
     /// # Safety
     /// `cuda_raw_ptr` must be a valid slot that only the `gst_cuda_*` helpers have filled.
