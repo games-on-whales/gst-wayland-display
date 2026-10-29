@@ -139,16 +139,26 @@ fn untracked_display_terminated_elsewhere_still_starts_renderers() {
         usable(&mut next),
         "renderer created after the terminate can't start"
     );
-    drop(live);
-    assert!(
-        usable(&mut next),
-        "dropping the older renderer terminated the display"
-    );
-    drop(next);
+    // The terminate freed `live`'s context, and the driver may hand its handle to `next`:
+    // dropping `live` would then destroy `next`'s context, which says nothing about the
+    // display. Only check that the older renderer's drop leaves the display alone when the
+    // two contexts are distinct.
+    let reused = live.egl_context().get_context_handle() == next.egl_context().get_context_handle();
+    if reused {
+        drop(next);
+        drop(live);
+    } else {
+        drop(live);
+        assert!(
+            usable(&mut next),
+            "dropping the older renderer terminated the display"
+        );
+        drop(next);
+    }
     assert!(!initialized(display), "display outlived its last renderer");
 }
 
-/// A render node driven by the `nvidia` kernel driver, with its EGL device.
+/// A render node driven by the `nvidia` kernel driver, with NVIDIA's EGL device for it.
 fn nvidia_render_node() -> Option<(DrmNode, EGLDevice)> {
     std::fs::read_dir("/dev/dri")
         .ok()?
@@ -163,9 +173,19 @@ fn nvidia_render_node() -> Option<(DrmNode, EGLDevice)> {
                 return None;
             }
             let node = DrmNode::from_path(entry.path()).ok()?;
+            // The EGL device setup_renderer picks for the node is the first one listed for it.
+            // Only run if that is NVIDIA's own: another vendor's library (Mesa) can list one for
+            // the same node first, which would not exercise the NVIDIA driver.
             let device = EGLDevice::enumerate()
                 .ok()?
                 .find(|d| d.try_get_render_node().ok().flatten() == Some(node))?;
+            if !device
+                .extensions()
+                .iter()
+                .any(|e| e == "EGL_NV_device_cuda")
+            {
+                return None;
+            }
             Some((node, device))
         })
 }
@@ -236,7 +256,7 @@ fn vulkan_teardown_on(entry: &ash::Entry, node: &DrmNode) -> bool {
 fn nvidia_vulkan_teardown_keeps_the_shared_display() {
     let _serial = serial();
     let Some((node, device)) = nvidia_render_node() else {
-        skip!("no render node driven by nvidia with an EGL device");
+        skip!("no nvidia render node whose first EGL device is NVIDIA's");
     };
     let Ok(entry) = (unsafe { ash::Entry::load() }) else {
         skip!("no Vulkan loader");
