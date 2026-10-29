@@ -47,7 +47,7 @@ use smithay::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
         },
     },
-    utils::{Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
+    utils::{Clock, DeviceFd, Logical, Monotonic, Physical, Point, Size, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
@@ -841,27 +841,27 @@ pub(crate) fn apply_video_info(
         .to_i32_round();
     for window in state.space.elements() {
         let toplevel = window.toplevel().unwrap();
-        let max_size = Rectangle::from_size(
-            with_states(toplevel.wl_surface(), |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .map(|_attrs| {
-                        states
-                            .cached_state
-                            .get::<SurfaceCachedState>()
-                            .current()
-                            .max_size
-                    })
-            })
-            .unwrap_or(new_size),
-        );
+        let max_size = with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .map(|_attrs| {
+                    states
+                        .cached_state
+                        .get::<SurfaceCachedState>()
+                        .current()
+                        .max_size
+                })
+        })
+        .unwrap_or(new_size);
 
-        let new_size = max_size
-            .intersection(Rectangle::from_size(new_size))
-            .map(|rect| rect.size);
+        // xdg-shell: a max_size of 0 in a dimension means no limit in it, and most clients
+        // set none. Clamp only the dimensions that have a limit, so an unset max_size gets
+        // the output size rather than an empty size (a fullscreen configure at 0x0).
+        let clamp = |max: i32, output: i32| if max > 0 { max.min(output) } else { output };
+        let new_size = Size::from((clamp(max_size.w, new_size.w), clamp(max_size.h, new_size.h)));
         toplevel.with_pending_state(|state| {
-            state.size = new_size;
+            state.size = Some(new_size);
             state.states.set(XdgState::Fullscreen);
             state.states.set(XdgState::Activated);
         });
