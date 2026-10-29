@@ -3006,24 +3006,28 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use gst::prelude::*;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
             .property("render-node", "software")
             .build()
             .upcast::<gst::Element>();
-        let caps = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    .field("width", 320)
-                    .field("height", 240)
-                    .field("framerate", gst::Fraction::new(30, 1))
-                    .build(),
-            )
-            .build()
-            .unwrap();
+        counting_pipeline_with(src, true)
+    }
+
+    /// `src` (optionally through a 320x240@30 raw video capsfilter) into a fakesink that counts
+    /// the buffers it receives. The sink doesn't sync: a flush-stop resets the running time, and a
+    /// syncing sink on a live pipeline then waits on the clock instead of counting.
+    fn counting_pipeline_with(
+        src: gst::Element,
+        video_caps: bool,
+    ) -> (
+        gst::Pipeline,
+        gst::Element,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use gst::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let sink = gst::ElementFactory::make("fakesink")
             .property("signal-handoffs", true)
             .property("sync", false)
@@ -3036,9 +3040,80 @@ mod tests {
             None
         });
         let pipeline = gst::Pipeline::new();
-        pipeline.add_many([&src, &caps, &sink]).unwrap();
-        gst::Element::link_many([&src, &caps, &sink]).unwrap();
+        let mut chain = vec![src.clone()];
+        if video_caps {
+            chain.push(
+                gst::ElementFactory::make("capsfilter")
+                    .property(
+                        "caps",
+                        gst::Caps::builder("video/x-raw")
+                            .field("width", 320)
+                            .field("height", 240)
+                            .field("framerate", gst::Fraction::new(30, 1))
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            );
+        }
+        chain.push(sink);
+        pipeline.add_many(&chain).unwrap();
+        gst::Element::link_many(&chain).unwrap();
         (pipeline, src, frames)
+    }
+
+    /// Flushes a playing counting pipeline both ways an application can, the source element's
+    /// send_event and the pipeline's (which forwards flushes to its sources), and asserts frames
+    /// flow again after each flush and nothing posted an error.
+    fn assert_flushes_recover(
+        pipeline: &gst::Pipeline,
+        src: &gst::Element,
+        frames: &std::sync::atomic::AtomicUsize,
+    ) {
+        use gst::prelude::*;
+        assert_frames_flow(frames, "start");
+        for run in 0..10 {
+            let target: &gst::Element = if run % 2 == 0 {
+                src
+            } else {
+                pipeline.upcast_ref()
+            };
+            assert!(target.send_event(gst::event::FlushStart::new()));
+            assert!(target.send_event(gst::event::FlushStop::new(true)));
+            assert_frames_flow(frames, &format!("flush {run} via {}", target.name()));
+        }
+        let bus = pipeline.bus().unwrap();
+        assert!(
+            bus.pop_filtered(&[gst::MessageType::Error]).is_none(),
+            "flushing posted an error"
+        );
+    }
+
+    // Checks the flush oracle itself on core/base live sources, so a waylanddisplaysrc failure
+    // under it is the element's and not the harness's. Only element- and pipeline-level flushes
+    // restart a paused push-mode GstBaseSrc task; a bare upstream flush from a downstream pad
+    // leaves it paused on any GstBaseSrc (videotestsrc included), so it is no oracle.
+    #[test]
+    fn flush_oracle_recovers_reference_live_sources() {
+        use gst::prelude::*;
+        test_init();
+
+        let mut checked = 0;
+        for (factory, video_caps) in [("fakesrc", false), ("videotestsrc", true)] {
+            let Ok(src) = gst::ElementFactory::make(factory)
+                .property("is-live", true)
+                .build()
+            else {
+                eprintln!("skip: no {factory}");
+                continue;
+            };
+            let (pipeline, src, frames) = counting_pipeline_with(src, video_caps);
+            pipeline.set_state(gst::State::Playing).unwrap();
+            assert_flushes_recover(&pipeline, &src, &frames);
+            pipeline.set_state(gst::State::Null).unwrap();
+            checked += 1;
+        }
+        assert!(checked > 0, "no reference live source to validate against");
     }
 
     /// Asserts frames keep flowing: the count grows within a few seconds.
@@ -3062,16 +3137,34 @@ mod tests {
 
         let (pipeline, src, frames) = counting_pipeline();
         pipeline.set_state(gst::State::Playing).unwrap();
+        assert_flushes_recover(&pipeline, &src, &frames);
+        // The flushed pipeline still tears down and starts again.
+        pipeline.set_state(gst::State::Null).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert_frames_flow(&frames, "restart after flushes");
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // The source is not seekable: a flushing seek must be refused without flushing or stalling
+    // the stream.
+    #[test]
+    fn flushing_seek_is_refused_and_frames_keep_flowing() {
+        use gst::prelude::*;
+        test_init();
+
+        let (pipeline, _src, frames) = counting_pipeline();
+        pipeline.set_state(gst::State::Playing).unwrap();
         assert_frames_flow(&frames, "start");
-        for run in 0..10 {
-            assert!(src.send_event(gst::event::FlushStart::new()));
-            assert!(src.send_event(gst::event::FlushStop::new(true)));
-            assert_frames_flow(&frames, &format!("flush {run}"));
-        }
+        assert!(
+            pipeline
+                .seek_simple(gst::SeekFlags::FLUSH, gst::ClockTime::ZERO)
+                .is_err()
+        );
+        assert_frames_flow(&frames, "the refused seek");
         let bus = pipeline.bus().unwrap();
         assert!(
             bus.pop_filtered(&[gst::MessageType::Error]).is_none(),
-            "flushing posted an error"
+            "the seek posted an error"
         );
         pipeline.set_state(gst::State::Null).unwrap();
     }
@@ -3137,26 +3230,40 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
-    /// A playing pipeline whose source waits on a frame its compositor never sends, like one
-    /// that wedges mid-stream. Join the returned thread after stopping the pipeline.
-    fn wedged_pipeline() -> (
-        super::super::WaylandDisplaySrc,
-        gst::Pipeline,
-        gst::Element,
-        std::thread::JoinHandle<(
+    /// A playing pipeline whose source waits on frames its compositor sends only when told to,
+    /// like one that wedges mid-stream.
+    struct Wedged {
+        src: super::super::WaylandDisplaySrc,
+        pipeline: gst::Pipeline,
+        sink: gst::Element,
+        /// Buffers the sink received.
+        frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Frames create() asked the compositor for.
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Each send answers the oldest owed frame with an empty buffer.
+        deliver: std::sync::mpsc::Sender<()>,
+        /// Join after stopping the pipeline.
+        wedge: std::thread::JoinHandle<(
             waylanddisplaycore::Channel<waylanddisplaycore::Command>,
             Vec<waylanddisplaycore::Command>,
         )>,
-    ) {
+    }
+
+    fn wedged_pipeline() -> Wedged {
         use gst::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         use waylanddisplaycore::{Command, FormatSet};
 
         let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
         // start() keeps a display that is already there, so the pipeline runs on this one.
         let (unserviced, compositor_tx) = unserviced_display(&src);
-        // Answers caps queries but never sends a frame.
+        // Answers caps queries, but frames only when told to.
         let (frame_requested_tx, frame_requested) = std::sync::mpsc::channel();
+        let (deliver, deliver_rx) = std::sync::mpsc::channel::<()>();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requested = requests.clone();
         let wedge = std::thread::spawn(move || {
             let mut owed_frames = Vec::new();
             loop {
@@ -3166,6 +3273,7 @@ mod tests {
                     }
                     Ok(command @ Command::Buffer(..)) => {
                         owed_frames.push(command);
+                        requested.fetch_add(1, Ordering::SeqCst);
                         let _ = frame_requested_tx.send(());
                     }
                     // stop() is dropping the display: let the real compositor quit so Drop can
@@ -3175,31 +3283,33 @@ mod tests {
                         return (unserviced, owed_frames);
                     }
                     Ok(_) => {}
-                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => {
+                        if !owed_frames.is_empty() && deliver_rx.try_recv().is_ok() {
+                            if let Command::Buffer(reply, _) = owed_frames.remove(0) {
+                                let _ = reply.send(Ok(gst::Buffer::new()));
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
                 }
             }
         });
 
-        let caps = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    .field("width", 320)
-                    .field("height", 240)
-                    .field("framerate", gst::Fraction::new(30, 1))
-                    .build(),
-            )
-            .build()
-            .unwrap();
-        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
-        let pipeline = gst::Pipeline::new();
-        pipeline.add_many([src.upcast_ref(), &caps, &sink]).unwrap();
-        gst::Element::link_many([src.upcast_ref(), &caps, &sink]).unwrap();
+        let (pipeline, _, frames) = counting_pipeline_with(src.clone().upcast(), true);
+        let sink = pipeline.iterate_sinks().next().unwrap().unwrap();
         pipeline.set_state(gst::State::Playing).unwrap();
         frame_requested
             .recv_timeout(Duration::from_secs(5))
             .expect("create() never requested a frame");
-        (src, pipeline, sink, wedge)
+        Wedged {
+            src,
+            pipeline,
+            sink,
+            frames,
+            requests,
+            deliver,
+            wedge,
+        }
     }
 
     // On a real pipeline the base class handles a pad flush only once the pause releases its live
@@ -3213,7 +3323,13 @@ mod tests {
         use std::time::{Duration, Instant};
         test_init();
 
-        let (src, pipeline, sink, wedge) = wedged_pipeline();
+        let Wedged {
+            src,
+            pipeline,
+            sink,
+            wedge,
+            ..
+        } = wedged_pipeline();
         // Hold PLAYING->PAUSED inside GstBaseSrc's live-lock section, after its unlock().
         let hold = Duration::from_secs(2);
         let held = Arc::new(AtomicBool::new(false));
@@ -3303,7 +3419,12 @@ mod tests {
         use std::time::{Duration, Instant};
         test_init();
 
-        let (_src, pipeline, _sink, wedge) = wedged_pipeline();
+        let Wedged {
+            src: _src,
+            pipeline,
+            wedge,
+            ..
+        } = wedged_pipeline();
 
         let stopping = Instant::now();
         pipeline.set_state(gst::State::Null).unwrap();
@@ -3316,5 +3437,101 @@ mod tests {
             stop_took < Duration::from_secs(5),
             "stop waited {stop_took:?} behind an unanswered frame"
         );
+    }
+
+    /// Waits up to 5 s for `done`.
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // On a real pipeline: a flush cancels create()'s frame wait and keeps that frame, the task the
+    // flush-stop restarts waits on the kept frame rather than requesting another, the frame reaches
+    // the sink once the compositor delivers it, and streaming then carries on.
+    #[test]
+    fn flush_keeps_the_cancelled_frame_and_delivers_it_after() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        test_init();
+
+        let w = wedged_pipeline();
+        assert!(w.src.send_event(gst::event::FlushStart::new()));
+        wait_for("create() to keep its cancelled frame", || {
+            w.src.imp().pending_frame.lock().unwrap().is_some()
+        });
+        assert!(w.src.send_event(gst::event::FlushStop::new(true)));
+        wait_for("the restarted task to take the kept frame", || {
+            w.src.imp().pending_frame.lock().unwrap().is_none()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            w.requests.load(Ordering::SeqCst),
+            1,
+            "requested another frame instead of waiting on the kept one"
+        );
+        assert_eq!(w.frames.load(Ordering::SeqCst), 0);
+
+        w.deliver.send(()).unwrap();
+        wait_for("the kept frame to reach the sink", || {
+            w.frames.load(Ordering::SeqCst) == 1
+        });
+        wait_for("the next frame request", || {
+            w.requests.load(Ordering::SeqCst) == 2
+        });
+        w.deliver.send(()).unwrap();
+        wait_for("the next frame to reach the sink", || {
+            w.frames.load(Ordering::SeqCst) == 2
+        });
+
+        let bus = w.pipeline.bus().unwrap();
+        assert!(
+            bus.pop_filtered(&[gst::MessageType::Error]).is_none(),
+            "the flush posted an error"
+        );
+        w.pipeline.set_state(gst::State::Null).unwrap();
+        let (unserviced, owed_frames) = w.wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+    }
+
+    // A pipeline stopped right after a flush cancelled create(), before any flush-stop, must tear
+    // down promptly, drop the kept frame with the display, and start cleanly again.
+    #[test]
+    fn teardown_right_after_a_cancelled_frame_then_restart() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let w = wedged_pipeline();
+        assert!(w.src.send_event(gst::event::FlushStart::new()));
+        wait_for("create() to keep its cancelled frame", || {
+            w.src.imp().pending_frame.lock().unwrap().is_some()
+        });
+
+        let stopping = Instant::now();
+        w.pipeline.set_state(gst::State::Null).unwrap();
+        let stop_took = stopping.elapsed();
+        let (unserviced, owed_frames) = w.wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+        assert!(
+            stop_took < Duration::from_secs(5),
+            "stop took {stop_took:?} after a cancel"
+        );
+        assert!(w.src.imp().pending_frame.lock().unwrap().is_none());
+        assert!(w.src.imp().state.lock().unwrap().is_none());
+
+        // The next run gets a real compositor and streams.
+        w.src.set_property("render-node", "software");
+        w.pipeline.set_state(gst::State::Playing).unwrap();
+        assert_frames_flow(&w.frames, "restart after a cancelled teardown");
+        w.pipeline.set_state(gst::State::Null).unwrap();
     }
 }
