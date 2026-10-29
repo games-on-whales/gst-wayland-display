@@ -86,7 +86,7 @@ meson test -C "$BUILD" --no-rebuild --print-errorlogs "${TESTS[@]}"
 
 # Test the real VA policy and SPS serialization without requiring a VA device.
 # shellcheck disable=SC2016 # Positional arguments expand inside the child shell.
-meson devenv -C "$BUILD" -- bash -c '
+meson devenv -C "$BUILD" bash -c '
   set -euo pipefail
   cc -DGST_USE_UNSTABLE_API \
     -I"$1/subprojects/gst-plugins-bad/sys/va" \
