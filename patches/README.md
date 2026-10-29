@@ -134,3 +134,14 @@ request; `self->rc` is updated on the streaming thread. No caller relies on othe
 state remaining locked across this helper. Preserve the streaming-thread-only
 contract when rebasing the patch; the live-retarget test exercises concurrent
 property changes.
+
+## gstreamer-va-hevc-color.patch
+
+Preserves negotiated color primaries, transfer, matrix and range in the VA HEVC
+SPS VUI and declares Main10 for the Main10 VA profile. P010 describes storage; it
+does not identify PQ. Unknown colorimetry remains unspecified and no mastering
+metadata is invented. SDR input keeps its negotiated SDR declaration.
+
+`tests/va-h265-color.c` exercises SDR, PQ, range and unknown policy, then writes
+and parses an actual Main10 SPS to verify the serialized color fields without a
+GPU. `ci/gst-patches.sh` compiles the VA encoder and runs this regression.

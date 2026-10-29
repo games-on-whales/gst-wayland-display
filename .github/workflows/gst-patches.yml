@@ -9,11 +9,13 @@ on:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
+      - "tests/va-h265-color.c"
       - ".github/workflows/gst-patches.yml"
   pull_request:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
+      - "tests/va-h265-color.c"
       - ".github/workflows/gst-patches.yml"
 
 concurrency:
@@ -40,7 +42,7 @@ jobs:
           dnf builddep -y gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
           dnf install -y git gcc gcc-c++ meson ninja-build flex bison nasm \
             pkgconf-pkg-config glib2-devel libdrm-devel vulkan-headers \
-            vulkan-loader-devel wayland-devel wayland-protocols-devel
+            vulkan-loader-devel wayland-devel wayland-protocols-devel libva-devel
 
       - name: Build patched GStreamer and run the Vulkan tests
         run: bash ci/gst-patches.sh .gst-patches

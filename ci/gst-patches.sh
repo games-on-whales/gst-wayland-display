@@ -55,6 +55,7 @@ meson setup "$BUILD" "$SRC" \
   -Drtsp_server=disabled -Ddevtools=disabled -Dpython=disabled -Dsharp=disabled \
   -Dgst-plugins-base:app=enabled -Dgst-plugins-base:videotestsrc=enabled \
   -Dgst-plugins-bad:vulkan=enabled -Dgst-plugins-bad:vulkan-video=enabled \
+  -Dgst-plugins-bad:va=enabled \
   -Dgst-plugins-bad:videoparsers=enabled \
   -Dorc=disabled -Ddoc=disabled -Dintrospection=disabled -Dexamples=disabled \
   -Dnls=disabled -Dgst-examples=disabled -Drs=disabled -Dlibnice=disabled \
@@ -82,3 +83,17 @@ TESTS=(
 )
 echo "==> test: ${TESTS[*]}"
 meson test -C "$BUILD" --no-rebuild --print-errorlogs "${TESTS[@]}"
+
+# Test the real VA policy and SPS serialization without requiring a VA device.
+# shellcheck disable=SC2016 # Positional arguments expand inside the child shell.
+meson devenv -C "$BUILD" -- bash -c '
+  set -euo pipefail
+  cc -DGST_USE_UNSTABLE_API \
+    -I"$1/subprojects/gst-plugins-bad/sys/va" \
+    -I"$1/subprojects/gst-plugins-bad/gst-libs" \
+    "$2/tests/va-h265-color.c" \
+    $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-video-1.0 \
+      gstreamer-allocators-1.0 gstreamer-codecparsers-1.0) \
+    -o "$3/va-h265-color"
+  "$3/va-h265-color"
+' bash "$SRC" "$ROOT" "$WORK"
