@@ -157,6 +157,10 @@ impl State {
         assert!(self.video_info.is_some());
         assert!(self.output_buffer.is_some());
 
+        // Snapshot the active tree before render_output borrows the damage tracker.
+        // A PQ child can coexist with an sRGB root UI commit.
+        let pq_passthrough = self.output_hdr_state();
+
         let mut elements = if Instant::now().duration_since(self.last_pointer_movement)
             < Duration::from_secs(5)
         {
@@ -270,9 +274,6 @@ impl State {
         // Dynamic HDR: per-frame PQ-passthrough flag (true when the active surface's last
         // committed buffer was a 10-bit, already-PQ BT.2020 client buffer). Always false unless
         // it is enabled, so the converter behaves identically to before by default.
-        // A PQ video subsurface can coexist with an sRGB root UI commit.
-        // Use the same complete tree as output HDR signaling.
-        let pq_passthrough = self.output_hdr_state();
         match self.output_buffer.clone().unwrap().to_gs_buffer(
             &mut target,
             &mut self.renderer,
