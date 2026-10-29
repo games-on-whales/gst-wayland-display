@@ -959,6 +959,88 @@ fn nvidia_cuda_context_ownership_across_restarts() {
     }
 }
 
+/// An application that answers the source's NEED_CONTEXT with one CUDA context it keeps
+/// for every pipeline (Wolf does) gets it back with its reference count intact after each
+/// pipeline is torn down and the element finalized, i.e. through the element's real
+/// `Settings::drop`. The source used to drop one reference per pipeline here, until the
+/// application's context was finalized under a live pipeline (`GST_IS_CUDA_CONTEXT`
+/// CRITICALs, then a SIGSEGV in `cuStreamDestroy`). A leak shows up as a count that grows.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an NVIDIA GPU; run via ci/harness.sh gpu"]
+fn nvidia_application_cuda_context_survives_pipelines() {
+    use waylanddisplaycore::utils::allocator::cuda::{GstCudaContext, init_cuda};
+
+    unsafe extern "C" {
+        fn gst_cuda_context_new(device_id: std::ffi::c_int) -> *mut GstCudaContext;
+        fn gst_context_new_cuda_context(cuda_ctx: *mut GstCudaContext)
+        -> *mut gst::ffi::GstContext;
+    }
+    fn ref_count(ctx: *mut GstCudaContext) -> u32 {
+        unsafe { (*(ctx as *mut gst::glib::gobject_ffi::GObject)).ref_count }
+    }
+
+    init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no NVIDIA render node")
+    };
+    init_cuda().expect("init CUDA");
+    let app_cuda = unsafe { gst_cuda_context_new(0) };
+    assert!(!app_cuda.is_null(), "create the application's CUDA context");
+    let app_context =
+        unsafe { gst::Context::from_glib_full(gst_context_new_cuda_context(app_cuda)) };
+    let baseline = ref_count(app_cuda);
+
+    for i in 0..6 {
+        let pipeline = gst::parse::launch(&format!(
+            "waylanddisplaysrc render-node={node} num-buffers=10 ! \
+             video/x-raw(memory:CUDAMemory),width=640,height=480,framerate=30/1 ! fakesink"
+        ))
+        .expect("parse")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+        let bus = pipeline.bus().expect("bus");
+        let answer = app_context.clone();
+        bus.set_sync_handler(move |_, msg| {
+            if let gst::MessageView::NeedContext(nc) = msg.view()
+                && nc.context_type() == "gst.cuda.context"
+                && let Some(el) = msg.src().and_then(|s| s.downcast_ref::<gst::Element>())
+            {
+                el.set_context(&answer);
+            }
+            gst::BusSyncReply::Pass
+        });
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("set Playing");
+        let mut saw_eos = false;
+        for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
+            match msg.view() {
+                gst::MessageView::Eos(..) => {
+                    saw_eos = true;
+                    break;
+                }
+                gst::MessageView::Error(err) => panic!("pipeline {i}: {}", err.error()),
+                _ => {}
+            }
+        }
+        assert!(saw_eos, "pipeline {i}: no EOS");
+        pipeline.set_state(gst::State::Null).expect("set Null");
+        bus.unset_sync_handler();
+        // Finalize the element: its Settings::drop releases the context slot
+        drop(pipeline);
+        assert_eq!(
+            ref_count(app_cuda),
+            baseline,
+            "pipeline {i}: the application's context reference count changed"
+        );
+    }
+
+    drop(app_context);
+    unsafe { gst::ffi::gst_object_unref(app_cuda as *mut gst::ffi::GstObject) };
+}
+
 /// P010 dmabuf into the VA H.265 encoder (`vah265enc`, or Intel's low-power
 /// `vah265lpenc`; Main-10) for longer than the encoder's surface pool lasts
 /// without surface reuse: P010 exports must be VA-allocator buffers like NV12, or every frame

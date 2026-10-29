@@ -572,3 +572,120 @@ pub fn gst_cuda_handle_context_query_wrapped(
     };
     result == glib_ffi::GTRUE
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::tests::test_init;
+    use gst::prelude::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicPtr;
+
+    unsafe extern "C" {
+        fn gst_context_new_cuda_context(cuda_ctx: *mut GstCudaContext)
+        -> *mut gst::ffi::GstContext;
+    }
+
+    fn ref_count(ctx: *mut GstCudaContext) -> u32 {
+        unsafe { (*(ctx as *mut gst::glib::gobject_ffi::GObject)).ref_count }
+    }
+
+    /// An application that answers NEED_CONTEXT with one context it keeps for
+    /// every pipeline (Wolf does) gets it back with its reference count intact.
+    /// The answer re-enters the element while `new_from_gstreamer` is still in
+    /// `gst_cuda_ensure_element_context`, as `waylanddisplaysrc::set_context`
+    /// does: the slot is filled by the inner call and only found set by the outer
+    /// one.
+    #[test]
+    fn test_application_context_survives_pipelines() {
+        test_init();
+        init_cuda().expect("Failed to initialize CUDA");
+        let app_cuda = unsafe { ffi::gst_cuda_context_new(0) };
+        assert!(!app_cuda.is_null(), "Failed to create CUDA context");
+        let app_context: Context =
+            unsafe { gst::glib::translate::from_glib_full(gst_context_new_cuda_context(app_cuda)) };
+        let baseline = ref_count(app_cuda);
+
+        for _ in 0..3 {
+            let pipeline = gst::Pipeline::new();
+            let element = gst::ElementFactory::make("identity").build().unwrap();
+            pipeline.add(&element).unwrap();
+            let slot = AtomicPtr::<GstCudaContext>::new(std::ptr::null_mut());
+            let stored: Mutex<Option<CUDAContext>> = Mutex::new(None);
+
+            let bus = pipeline.bus().unwrap();
+            let handler_element = element.clone();
+            let handler_context = app_context.clone();
+            let slot_addr = slot.as_ptr() as usize;
+            let stored_addr = &stored as *const Mutex<Option<CUDAContext>> as usize;
+            bus.set_sync_handler(move |_, msg| {
+                if let gst::MessageView::NeedContext(_) = msg.view() {
+                    // Both outlive the pipeline run below.
+                    let stored = unsafe { &*(stored_addr as *const Mutex<Option<CUDAContext>>) };
+                    let ctx = CUDAContext::new_from_set_context(
+                        &handler_element,
+                        &handler_context,
+                        -1,
+                        slot_addr as *mut *mut GstCudaContext,
+                    )
+                    .unwrap();
+                    stored.lock().unwrap().get_or_insert(ctx);
+                }
+                gst::BusSyncReply::Drop
+            });
+
+            let outer = CUDAContext::new_from_gstreamer(&element, -1, slot.as_ptr()).unwrap();
+            assert_eq!(outer.as_ptr(), app_cuda);
+            assert!(
+                stored.lock().unwrap().is_some(),
+                "NEED_CONTEXT was not answered"
+            );
+            bus.unset_sync_handler();
+            drop(outer);
+            drop(stored);
+            unsafe { CUDAContext::release_slot(slot.as_ptr()) };
+            assert_eq!(ref_count(app_cuda), baseline);
+        }
+
+        drop(app_context);
+        unsafe { gst::ffi::gst_object_unref(app_cuda as *mut gst::ffi::GstObject) };
+    }
+
+    /// The slot is released (its element goes away) while a wrapper built from it
+    /// is still alive: the slot gives up its reference exactly once and the
+    /// wrapper keeps its own, so the context stays alive until the wrapper drops.
+    #[test]
+    fn test_slot_released_before_wrapper() {
+        test_init();
+        init_cuda().expect("Failed to initialize CUDA");
+        let app_cuda = unsafe { ffi::gst_cuda_context_new(0) };
+        assert!(!app_cuda.is_null(), "Failed to create CUDA context");
+        let app_context: Context =
+            unsafe { gst::glib::translate::from_glib_full(gst_context_new_cuda_context(app_cuda)) };
+        let element = gst::ElementFactory::make("identity").build().unwrap();
+        let baseline = ref_count(app_cuda);
+
+        let slot = AtomicPtr::<GstCudaContext>::new(std::ptr::null_mut());
+        let wrapper =
+            CUDAContext::new_from_set_context(&element, &app_context, -1, slot.as_ptr()).unwrap();
+        assert_eq!(wrapper.as_ptr(), app_cuda);
+        let with_both = ref_count(app_cuda);
+        assert!(
+            with_both >= baseline + 2,
+            "the slot and the wrapper each hold a reference"
+        );
+
+        unsafe { CUDAContext::release_slot(slot.as_ptr()) };
+        assert_eq!(
+            ref_count(app_cuda),
+            with_both - 1,
+            "releasing the slot drops exactly one reference"
+        );
+
+        drop(wrapper);
+        assert_eq!(ref_count(app_cuda), baseline);
+
+        drop(app_context);
+        unsafe { gst::ffi::gst_object_unref(app_cuda as *mut gst::ffi::GstObject) };
+    }
+}
