@@ -3,3 +3,4 @@ mod device;
 mod fixture;
 mod test_pointer;
 mod test_resolution;
+mod test_hdr_surface_tree;

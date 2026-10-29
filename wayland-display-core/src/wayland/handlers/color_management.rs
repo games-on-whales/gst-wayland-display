@@ -37,7 +37,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
     Weak as WlWeak, backend::ClientId, protocol::wl_surface::WlSurface,
 };
-use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::{SurfaceData, with_states};
 
 use crate::comp::State;
 
@@ -248,30 +248,40 @@ pub struct ParamsData(Mutex<ParamsBuilder>);
 #[derive(Default)]
 struct ColorSurfaceAttached(Cell<bool>);
 
+/// Read the HDR flag from surface data already borrowed by a Smithay tree traversal.
+///
+/// Callers inside `Window::with_surfaces` must use this form. Calling `with_states` again
+/// from that closure recursively locks Smithay's private surface tree and deadlocks the
+/// compositor immediately after the first window maps.
+pub fn surface_data_is_hdr(states: &SurfaceData) -> bool {
+    states
+        .data_map
+        .get::<RefCell<Option<SurfaceHdrColor>>>()
+        .map(|cell| cell.borrow().as_ref().is_some_and(|s| s.is_hdr()))
+        .unwrap_or(false)
+}
+
 /// Read the HDR flag a client set on `surface` (false if none / not color-managed).
 ///
 /// Protocol-agnostic detection entry point: `true` means EITHER protocol declared the
 /// surface PQ (`wp_color_management_v1`'s image description OR frog's transfer function).
 pub fn surface_is_hdr(surface: &WlSurface) -> bool {
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RefCell<Option<SurfaceHdrColor>>>()
-            .map(|cell| cell.borrow().as_ref().is_some_and(|s| s.is_hdr()))
-            .unwrap_or(false)
-    })
+    with_states(surface, surface_data_is_hdr)
+}
+
+/// Read mastering metadata from surface data already borrowed by a Smithay tree traversal.
+pub fn surface_data_mastering_caps(states: &SurfaceData) -> Option<(String, String)> {
+    states
+        .data_map
+        .get::<RefCell<Option<SurfaceHdrColor>>>()
+        .and_then(|cell| cell.borrow().as_ref().and_then(|s| s.mastering_caps()))
 }
 
 /// Read the `(mastering-display-info, content-light-level)` gst caps strings a client set
 /// on `surface`, from whichever protocol provided them. `None` when the surface carries no
 /// (or no mastering) colour state — the producer then keeps its hardcoded HDR defaults.
 pub fn surface_mastering_caps(surface: &WlSurface) -> Option<(String, String)> {
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RefCell<Option<SurfaceHdrColor>>>()
-            .and_then(|cell| cell.borrow().as_ref().and_then(|s| s.mastering_caps()))
-    })
+    with_states(surface, surface_data_mastering_caps)
 }
 
 /// Apply (`Some`) or clear (`None`) the shared [`SurfaceHdrColor`] stored in a surface's

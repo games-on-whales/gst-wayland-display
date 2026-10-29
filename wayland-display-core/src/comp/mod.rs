@@ -472,7 +472,7 @@ impl State {
         }
     }
 
-    /// Whether the active fullscreen surface is HDR (BT.2100 PQ / BT.2020, per
+    /// Whether the active fullscreen surface tree is HDR (BT.2100 PQ / BT.2020, per
     /// `wp_color_management_v1`). The compositor forces one fullscreen toplevel at a time,
     /// so the first mapped window in the space is the active one. `false` when no window is
     /// mapped or it carries no (or a non-HDR) image description.
@@ -486,26 +486,30 @@ impl State {
         if self.current_input_is_pq {
             return true;
         }
-        self.space
-            .elements()
-            .next()
-            .and_then(|window| window.wl_surface())
-            .map(|surface| crate::wayland::handlers::color_management::surface_is_hdr(&surface))
-            .unwrap_or(false)
+        self.space.elements().next().is_some_and(|window| {
+            let mut hdr = false;
+            window.with_surfaces(|_surface, states| {
+                hdr |= crate::wayland::handlers::color_management::surface_data_is_hdr(states);
+            });
+            hdr
+        })
     }
 
-    /// The active fullscreen surface's HDR mastering / content-light-level gst caps strings,
-    /// from whichever color-management protocol provided them (frog for gamescope,
-    /// `wp_color_management_v1` for sway). `None` when there is no surface or it carries no
-    /// mastering metadata -- the producer then keeps its hardcoded HDR defaults.
-    fn active_surface_mastering_caps(&self) -> Option<(String, String)> {
-        self.space
-            .elements()
-            .next()
-            .and_then(|window| window.wl_surface())
-            .and_then(|surface| {
-                crate::wayland::handlers::color_management::surface_mastering_caps(&surface)
-            })
+    /// Read metadata from an HDR surface in the active window's complete tree.
+    pub(crate) fn active_surface_mastering_caps(&self) -> Option<(String, String)> {
+        self.space.elements().next().and_then(|window| {
+            let mut caps = None;
+            window.with_surfaces(|_surface, states| {
+                if caps.is_none()
+                    && crate::wayland::handlers::color_management::surface_data_is_hdr(states)
+                {
+                    caps = crate::wayland::handlers::color_management::surface_data_mastering_caps(
+                        states,
+                    );
+                }
+            });
+            caps
+        })
     }
 
     /// Recompute the OUTPUT HDR state and, on an actual change, log it and signal the

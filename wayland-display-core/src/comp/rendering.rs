@@ -270,7 +270,9 @@ impl State {
         // Dynamic HDR: per-frame PQ-passthrough flag (true when the active surface's last
         // committed buffer was a 10-bit, already-PQ BT.2020 client buffer). Always false unless
         // it is enabled, so the converter behaves identically to before by default.
-        let pq_passthrough = self.current_input_is_pq;
+        // A PQ video subsurface can coexist with an sRGB root UI commit.
+        // Use the same complete tree as output HDR signaling.
+        let pq_passthrough = self.output_hdr_state();
         match self.output_buffer.clone().unwrap().to_gs_buffer(
             &mut target,
             &mut self.renderer,

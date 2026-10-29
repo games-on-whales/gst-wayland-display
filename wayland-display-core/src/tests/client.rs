@@ -11,7 +11,7 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
 use wayland_protocols::{
@@ -48,6 +48,7 @@ struct State {
     qh: QueueHandle<State>,
 
     compositor: Option<wl_compositor::WlCompositor>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     buffer: Option<wl_buffer::WlBuffer>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     viewporter: Option<WpViewporter>,
@@ -93,6 +94,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         {
             tracing::trace!("{:?} {:?}", name, interface);
             match &interface[..] {
+                "wl_subcompositor" => {
+                    state.subcompositor = Some(registry.bind(name, version, qh, ()));
+                }
                 "wl_compositor" => {
                     let compositor =
                         registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, qh, ());
@@ -154,6 +158,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
 delegate_noop!(State: ignore wl_surface::WlSurface);
+delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
@@ -178,6 +184,7 @@ impl WaylandClient {
             qh: qh.clone(),
 
             compositor: None,
+            subcompositor: None,
             buffer: None,
             wm_base: None,
             viewporter: None,
@@ -223,6 +230,26 @@ impl WaylandClient {
 
     pub fn create_window(&mut self) {
         self.state.create_window();
+    }
+
+    pub fn create_subsurface(&mut self) -> (wl_surface::WlSurface, wl_subsurface::WlSubsurface) {
+        let root = &self.state.windows.last().unwrap().surface;
+        let surface = self
+            .state
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&self.qh, ());
+        let subsurface =
+            self.state
+                .subcompositor
+                .as_ref()
+                .unwrap()
+                .get_subsurface(&surface, root, &self.qh, ());
+        surface.attach(self.state.buffer.as_ref(), 0, 0);
+        surface.commit();
+        root.commit();
+        (surface, subsurface)
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
