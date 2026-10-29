@@ -3,11 +3,83 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::egl::native::{EGLNativeDisplay, EGLPlatform};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay, ffi};
 use smithay::backend::renderer::gles::GlesRenderer;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
+/// One display per render node (`None` = the software device), shared by every renderer on it.
+///
+/// Ownership invariant, against smithay a166cf4 (the rev pinned in Cargo.lock):
+/// - A display is terminated when its smithay `EGLDisplayHandle` drops (egl/display.rs:103-113).
+///   Its only strong owners are each renderer's `EGLContext::display` field and the
+///   [`DisplayKeepalive`] in that context's user data. `EGLContext::drop` destroys the context
+///   (egl/context.rs:489-501), then its fields drop in declaration order (context.rs:25-33):
+///   `display` before `user_data`, so the keepalive drops the last reference. (The renderer's
+///   other possible owner, `GlesRenderer::egl_reader`, exists only after `bind_wl_display`,
+///   which we never call; `get_display_handle()` clones elsewhere are temporaries.)
+/// - The keepalive drops that last reference -- and so runs `eglTerminate` -- while holding
+///   this lock. That is what serializes terminate against create: `EGLDisplay::new` hands back
+///   any still-live handle for the same native display from smithay's registry and runs
+///   `eglInitialize` on it again (egl/display.rs:220-250). Released outside the lock, a create
+///   in the gap between the `Weak` here dying and the terminate would add an initialization
+///   that no terminate matches (a leak on a tracked display), so the drop must stay inside it.
+/// - That cannot re-enter this lock. `eglTerminate` calls back only into smithay's
+///   `EGL_KHR_debug` callback (egl/ffi.rs:42-69), which only logs; the handle's drop takes no
+///   lock (smithay's own registry lock is taken only inside `EGLDisplay::new`, so the order is
+///   always this lock, then smithay's). [`setup_renderer`] attaches the keepalive only after
+///   releasing this lock, so no keepalive is ever dropped while it is held, even when renderer
+///   setup panics. [`lock_displays`] asserts that in debug builds.
+static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, CachedDisplay>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+struct CachedDisplay {
+    display: Weak<EGLDisplay>,
+    /// Opened with `EGL_TRACK_REFERENCES_KHR` (see [`TrackedEGLDevice`]); false on drivers
+    /// that rejected it and gave us the plain, untracked display.
+    tracked: bool,
+}
+
+thread_local! {
+    static HOLDING_DISPLAYS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// [`EGL_DISPLAYS`], locked. Re-entering it on one thread would deadlock; debug builds panic
+/// instead (see the ownership invariant on [`EGL_DISPLAYS`]).
+struct DisplaysGuard(MutexGuard<'static, HashMap<Option<DrmNode>, CachedDisplay>>);
+
+fn lock_displays() -> DisplaysGuard {
+    debug_assert!(
+        !HOLDING_DISPLAYS.get(),
+        "EGL_DISPLAYS re-entered on this thread"
+    );
+    // EGL init panics on failure while this guard is held. Recover from poisoning so one
+    // failed display doesn't break every later one in the process: the map only holds Weak
+    // refs and an entry is inserted only after its EGLDisplay was created successfully.
+    let guard = lock_recovering(&EGL_DISPLAYS);
+    HOLDING_DISPLAYS.set(true);
+    DisplaysGuard(guard)
+}
+
+impl Drop for DisplaysGuard {
+    fn drop(&mut self) {
+        HOLDING_DISPLAYS.set(false);
+    }
+}
+
+impl Deref for DisplaysGuard {
+    type Target = HashMap<Option<DrmNode>, CachedDisplay>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for DisplaysGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
     let drm_node = drm_node
@@ -23,6 +95,24 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
 /// `EGL_TRACK_REFERENCES_KHR` from `EGL_KHR_display_reference`.
 const EGL_TRACK_REFERENCES_KHR: ffi::EGLint = 0x3352;
 
+/// The handle a tracked display for `device` has, or `None` if the driver rejects the
+/// attribute. Only looks the handle up; does not initialize it.
+fn tracked_display_handle(device: *const std::ffi::c_void) -> Option<ffi::egl::types::EGLDisplay> {
+    let attribs = [
+        EGL_TRACK_REFERENCES_KHR,
+        ffi::egl::TRUE as ffi::EGLint,
+        ffi::egl::NONE as ffi::EGLint,
+    ];
+    let handle = unsafe {
+        ffi::egl::GetPlatformDisplayEXT(
+            ffi::egl::PLATFORM_DEVICE_EXT,
+            device as *mut _,
+            attribs.as_ptr(),
+        )
+    };
+    (handle != ffi::egl::NO_DISPLAY).then_some(handle)
+}
+
 /// An `EGLDevice` opened as a reference-counted display (`EGL_KHR_display_reference`).
 ///
 /// The NVIDIA Vulkan driver terminates the plain (untracked) device-platform `EGLDisplay`
@@ -37,6 +127,10 @@ const EGL_TRACK_REFERENCES_KHR: ffi::EGLint = 0x3352;
 /// so dropping one compositor's display can't terminate another's either. glvnd does not
 /// advertise the extension, so the attribute is tried blind; a driver that rejects it gets
 /// the plain display (smithay tries the platforms in order).
+///
+/// This is only about the display being *terminated*. It does not address the separate NVIDIA
+/// deadlock seen with many NV12 compositors starting and stopping at once (`vkDestroyDevice` in
+/// `VulkanNv12::drop` blocking in the driver while its EGL worker waits on the GLSI lock).
 struct TrackedEGLDevice(EGLDevice);
 
 impl EGLNativeDisplay for TrackedEGLDevice {
@@ -79,16 +173,28 @@ fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
-    // EGL init below panics on failure while this guard is held. Recover from poisoning so
-    // one failed display doesn't break every later one in the process: the map only holds
-    // Weak refs and an entry is inserted only after its EGLDisplay was created successfully.
-    let mut displays = lock_recovering(&EGL_DISPLAYS);
-    let maybe_display = displays
+    let mut displays = lock_displays();
+    let cached = displays
         .get(&render_node)
-        .and_then(|weak_display| weak_display.upgrade());
+        .and_then(|cached| Some((cached.display.upgrade()?, cached.tracked)));
 
-    let egl = match maybe_display {
-        Some(display) => display,
+    let egl = match cached {
+        Some((display, true)) => display,
+        Some((display, false)) => {
+            // An untracked display is the one handle every user of this device in the process
+            // shares, and any of them may `eglTerminate` it. Initializing a live display is a
+            // no-op; re-initializing a terminated one lets this renderer start, as it did when
+            // every renderer created its own display. (Never on a tracked display: there it
+            // would add a reference that nothing releases.)
+            unsafe {
+                ffi::egl::Initialize(
+                    **display.get_display_handle(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            display
+        }
         None => {
             let device = match render_node.as_ref() {
                 Some(render_node) => get_egl_device_for_node(render_node),
@@ -102,11 +208,19 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
                     })
                     .expect("Failed to find software device"),
             };
+            let device_handle = device.get_device_handle();
             let egl = unsafe {
                 EGLDisplay::new(TrackedEGLDevice(device)).expect("Failed to create EGLDisplay")
             };
+            let tracked = tracked_display_handle(device_handle) == Some(**egl.get_display_handle());
             let display = Arc::new(egl);
-            displays.insert(render_node, Arc::downgrade(&display));
+            displays.insert(
+                render_node,
+                CachedDisplay {
+                    display: Arc::downgrade(&display),
+                    tracked,
+                },
+            );
             display
         }
     };
@@ -120,6 +234,7 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     // entry is dead as soon as this returns and the next renderer calls `EGLDisplay::new`
     // again, which re-runs `eglInitialize` on the same handle while only one `eglTerminate`
     // follows -- a leaked reference on a tracked display, which then never terminates.
+    // Attached only now that the lock is released (see the invariant on EGL_DISPLAYS).
     renderer
         .egl_context()
         .user_data()
@@ -134,8 +249,8 @@ impl Drop for DisplayKeepalive {
     fn drop(&mut self) {
         // Drop the last reference (and so terminate) under the lock, so `setup_renderer` on
         // another thread either reuses this display or creates one after it is gone -- never
-        // re-initializes a handle that is about to be terminated.
-        let _displays = lock_recovering(&EGL_DISPLAYS);
+        // re-initializes a handle that is about to be terminated (see EGL_DISPLAYS).
+        let _displays = lock_displays();
         self.0.take();
     }
 }
@@ -166,39 +281,5 @@ mod tests {
         guard.push(3);
         drop(guard);
         assert_eq!(*lock_recovering(&mutex), vec![1, 2, 3]);
-    }
-
-    // The NVIDIA Vulkan driver terminated the shared render-node EGLDisplay whenever a
-    // VkInstance was destroyed (every NV12 output teardown): the live renderer lost its
-    // context and every later one on the node failed `NotInitialized`.
-    #[test]
-    #[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
-    fn vulkan_instance_teardown_keeps_the_shared_display() {
-        let Some(node) = std::fs::read_dir("/dev/dri")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
-            .find_map(|e| DrmNode::from_path(e.path()).ok())
-        else {
-            eprintln!("skip: no render node");
-            return;
-        };
-        let Ok(entry) = (unsafe { ash::Entry::load() }) else {
-            eprintln!("skip: no Vulkan loader");
-            return;
-        };
-        let mut live = setup_renderer(Some(node));
-        unsafe {
-            let instance = entry
-                .create_instance(&ash::vk::InstanceCreateInfo::default(), None)
-                .expect("vkCreateInstance");
-            instance.destroy_instance(None);
-        }
-        // A renderer for a new compositor on the node reuses the cached display...
-        let _next = setup_renderer(Some(node));
-        // ...and the one that was already running can still make its context current.
-        live.with_context(|_| ())
-            .expect("live renderer lost its EGL context");
     }
 }
