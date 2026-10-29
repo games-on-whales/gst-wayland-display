@@ -3,7 +3,7 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -19,11 +19,19 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
         .expect("Unable to find EGLDevice for drm-node")
 }
 
+/// Lock `mutex`, taking its data even if a thread panicked while holding it.
+///
+/// For data that a panic can't leave half-updated, where refusing every later caller
+/// would turn one failure into a permanent one.
+fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     // EGL init below panics on failure while this guard is held. Recover from poisoning so
     // one failed display doesn't break every later one in the process: the map only holds
     // Weak refs and an entry is inserted only after its EGLDisplay was created successfully.
-    let mut displays = EGL_DISPLAYS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut displays = lock_recovering(&EGL_DISPLAYS);
     let maybe_display = displays
         .get(&render_node)
         .and_then(|weak_display| weak_display.upgrade());
@@ -61,17 +69,27 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
 mod tests {
     use super::*;
 
-    // a panic during EGL init (e.g. an unusable render node) used to poison
-    // EGL_DISPLAYS, so every later display in the process panicked at `lock().unwrap()`.
+    // A panic during EGL init (e.g. an unusable render node) used to poison EGL_DISPLAYS,
+    // so every later display in the process panicked at `lock().unwrap()`. Tested on a
+    // local mutex, so the process-wide map is never poisoned for other tests.
     #[test]
-    fn setup_renderer_survives_poisoned_display_map() {
-        let _ = std::thread::spawn(|| {
-            let _guard = EGL_DISPLAYS.lock();
-            panic!("simulated EGL init failure while holding EGL_DISPLAYS");
-        })
-        .join();
-        assert!(EGL_DISPLAYS.is_poisoned());
+    fn lock_recovering_survives_a_poisoned_mutex() {
+        let mutex = Mutex::new(vec![1]);
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut guard = mutex.lock().unwrap();
+                    guard.push(2);
+                    panic!("simulated EGL init failure while holding the lock");
+                })
+                .join()
+        });
+        assert!(mutex.is_poisoned());
 
-        let _renderer = setup_renderer(None);
+        let mut guard = lock_recovering(&mutex);
+        assert_eq!(*guard, vec![1, 2]);
+        guard.push(3);
+        drop(guard);
+        assert_eq!(*lock_recovering(&mutex), vec![1, 2, 3]);
     }
 }
