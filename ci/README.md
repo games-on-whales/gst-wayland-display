@@ -37,8 +37,9 @@ ci/harness.sh -v              # stream sub-command output
 A vendor with no render node, or whose encoder element is missing, is skipped
 (reported, not failed). The Vulkan-encode row is vendor-agnostic — it runs
 wherever the GPU's Vulkan device has an H.264 encoder (an nvidia render node, or
-Intel with `ANV_VIDEO_ENCODE=1`); the `integration` phase prefers the nvidia
-node, or the `--node` one. On a multi-GPU host only the first Vulkan device's
+Intel with `ANV_DEBUG=video-encode` where Mesa exposes the codec extensions: Mesa
+26.2 on Alder Lake-N advertises encode operations without them, so no encoder
+registers); the `integration` phase prefers the nvidia node, or the `--node` one. On a multi-GPU host only the first Vulkan device's
 elements get the plain names; the others are `vulkanh264device1enc` and so on,
 and the harness and the encode tests pick the one on the GPU under test.
 

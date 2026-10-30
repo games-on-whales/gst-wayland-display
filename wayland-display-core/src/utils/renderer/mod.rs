@@ -20,14 +20,10 @@ static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, (EGLDisplay, bool)>>> =
 /// `EGL_TRACK_REFERENCES_KHR` from `EGL_KHR_display_reference`.
 const EGL_TRACK_REFERENCES_KHR: ffi::EGLint = 0x3352;
 
-/// The handle of the reference-tracked display for `device`, or `None` if the driver
-/// rejects the attribute. Only looks the handle up; does not initialize it.
-fn tracked_display_handle(device: *const std::ffi::c_void) -> Option<ffi::egl::types::EGLDisplay> {
-    let attribs = [
-        EGL_TRACK_REFERENCES_KHR,
-        ffi::egl::TRUE as ffi::EGLint,
-        ffi::egl::NONE as ffi::EGLint,
-    ];
+/// The handle of the plain (untracked) display for `device`. Only looks the handle up; does
+/// not initialize it.
+fn plain_display_handle(device: *const std::ffi::c_void) -> Option<ffi::egl::types::EGLDisplay> {
+    let attribs = [ffi::egl::NONE as ffi::EGLint];
     let handle = unsafe {
         ffi::egl::GetPlatformDisplayEXT(
             ffi::egl::PLATFORM_DEVICE_EXT,
@@ -45,8 +41,10 @@ fn tracked_display_handle(device: *const std::ffi::c_void) -> Option<ffi::egl::t
 /// driver does whenever it is unloaded (see [`keep_vulkan_drivers_loaded`]), and so can any
 /// other EGL user, such as GStreamer's GL elements. A display requested with
 /// `EGL_TRACK_REFERENCES_KHR` is a handle of its own that nobody else terminates. glvnd does
-/// not advertise the extension, so it is tried blind; a driver that rejects it (Mesa) gets the
-/// plain display, as smithay tries the platforms in order.
+/// not advertise the extension, so it can only be tried; it is tried on NVIDIA's devices, where
+/// the problem is and the attribute works. Mesa rejects it (and logs an EGL error each time),
+/// so other devices get the plain display directly; on NVIDIA a rejection falls back to it too,
+/// as smithay tries the platforms in order.
 struct TrackedEGLDevice(EGLDevice);
 
 impl EGLNativeDisplay for TrackedEGLDevice {
@@ -61,14 +59,22 @@ impl EGLNativeDisplay for TrackedEGLDevice {
                 &["EGL_EXT_platform_device"],
             )
         };
-        vec![
+        let nvidia = self
+            .0
+            .extensions()
+            .iter()
+            .any(|e| e == "EGL_NV_device_cuda");
+        let tracked = nvidia.then(|| {
             platform(vec![
                 EGL_TRACK_REFERENCES_KHR,
                 ffi::egl::TRUE as ffi::EGLint,
                 ffi::egl::NONE as ffi::EGLint,
-            ]),
-            platform(vec![ffi::egl::NONE as ffi::EGLint]),
-        ]
+            ])
+        });
+        tracked
+            .into_iter()
+            .chain([platform(vec![ffi::egl::NONE as ffi::EGLint])])
+            .collect()
     }
 
     fn surface_type(&self) -> ffi::EGLint {
@@ -169,7 +175,7 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
                 EGLDisplay::new(TrackedEGLDevice(device)).expect("Failed to create EGLDisplay")
             };
             let tracked =
-                tracked_display_handle(device_handle) == Some(egl.get_display_handle().handle);
+                plain_display_handle(device_handle) != Some(egl.get_display_handle().handle);
             tracing::debug!(tracked, "EGL display for {render_node:?}");
             displays.insert(render_node, (egl.clone(), tracked));
             (egl, tracked)
