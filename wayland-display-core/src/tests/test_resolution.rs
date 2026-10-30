@@ -83,10 +83,9 @@ fn apply_video_info_broadcasts_new_mode_to_client() {
         (1920, 1080),
         "client should observe the newly negotiated 1920x1080 mode",
     );
-    assert!(
-        mode.2 > 0,
-        "refresh rate should be non-zero, got {}",
-        mode.2
+    assert_eq!(
+        mode.2, 60_000,
+        "wl_output.mode refresh is in mHz: 60 fps must be 60000",
     );
 
     assert!(
@@ -149,10 +148,8 @@ fn framerate_only_change_updates_mode_refresh() {
     let after =
         latest_mode_dimensions(f.client.get_output_events()).expect("post-fps-change mode missing");
     assert_eq!((after.0, after.1), (1920, 1080));
-    assert_ne!(
-        after.2, baseline_refresh,
-        "refresh rate should change when fps changes",
-    );
+    assert_eq!(baseline_refresh, 60_000);
+    assert_eq!(after.2, 30_000, "refresh rate should follow the new fps");
 }
 
 #[test]

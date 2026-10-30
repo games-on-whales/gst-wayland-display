@@ -20,12 +20,24 @@ pub enum VulkanCodec {
 }
 
 impl VulkanCodec {
-    /// The codec of a gst Vulkan encoder element factory (`vulkanh264enc`, ...).
+    /// The codec of a gst Vulkan encoder element factory (`vulkanh264enc`, ...). On a
+    /// multi-GPU host only the first Vulkan device gets the plain name; the others register
+    /// as `vulkanh264device1enc` and so on.
     pub fn from_encoder_factory(name: &str) -> Option<Self> {
-        Some(match name {
-            "vulkanh264enc" => VulkanCodec::H264,
-            "vulkanh265enc" => VulkanCodec::H265,
-            "vulkanav1enc" => VulkanCodec::Av1,
+        let codec = name.strip_prefix("vulkan")?.strip_suffix("enc")?;
+        let codec = match codec.split_once("device") {
+            Some((codec, index))
+                if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                codec
+            }
+            Some(_) => return None,
+            None => codec,
+        };
+        Some(match codec {
+            "h264" => VulkanCodec::H264,
+            "h265" => VulkanCodec::H265,
+            "av1" => VulkanCodec::Av1,
             _ => return None,
         })
     }
@@ -145,6 +157,25 @@ impl From<GstVideoInfo> for VideoInfo {
 mod tests {
     use super::*;
     use crate::utils::tests::test_init;
+
+    #[test]
+    fn encoder_factories_on_every_vulkan_device_map_to_their_codec() {
+        for (name, codec) in [
+            ("vulkanh264enc", Some(VulkanCodec::H264)),
+            ("vulkanh265enc", Some(VulkanCodec::H265)),
+            ("vulkanav1enc", Some(VulkanCodec::Av1)),
+            ("vulkanh264device1enc", Some(VulkanCodec::H264)),
+            ("vulkanh265device1enc", Some(VulkanCodec::H265)),
+            ("vulkanav1device12enc", Some(VulkanCodec::Av1)),
+            ("vulkanh265dec", None),
+            ("vulkanh265device1dec", None),
+            ("vulkanh265deviceenc", None),
+            ("vulkanh265devicexenc", None),
+            ("vah265enc", None),
+        ] {
+            assert_eq!(VulkanCodec::from_encoder_factory(name), codec, "{name}");
+        }
+    }
 
     #[test]
     fn raw_video_info_round_trips() {

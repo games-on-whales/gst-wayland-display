@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use wayland_backend::client::Backend;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_display::WlDisplay;
-use wayland_client::protocol::{wl_callback, wl_output, wl_pointer, wl_region};
+use wayland_client::protocol::{
+    wl_callback, wl_output, wl_pointer, wl_region, wl_subcompositor, wl_subsurface,
+};
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop,
     protocol::{
@@ -30,6 +32,14 @@ use wayland_protocols::{
         relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         relative_pointer::zv1::client::zwp_relative_pointer_v1,
         relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
+        tablet::zv2::client::{
+            zwp_tablet_manager_v2::ZwpTabletManagerV2,
+            zwp_tablet_pad_v2::ZwpTabletPadV2,
+            zwp_tablet_seat_v2::{self, ZwpTabletSeatV2},
+            zwp_tablet_tool_v2::{self, ZwpTabletToolV2},
+            zwp_tablet_v2::ZwpTabletV2,
+        },
         viewporter::client::wp_viewport::WpViewport,
         viewporter::client::wp_viewporter::WpViewporter,
     },
@@ -50,6 +60,12 @@ pub enum MouseEvents {
     Relative(zwp_relative_pointer_v1::Event),
 }
 
+#[derive(Debug)]
+pub enum TabletEvents {
+    Seat(zwp_tablet_seat_v2::Event),
+    Tool(zwp_tablet_tool_v2::Event),
+}
+
 struct State {
     qh: QueueHandle<State>,
 
@@ -61,6 +77,16 @@ struct State {
     pointer_constraints: Option<ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
     color_manager: Option<WpColorManagerV1>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+    single_pixel: Option<WpSinglePixelBufferManagerV1>,
+    tablet_manager: Option<ZwpTabletManagerV2>,
+    tablet_seat: Option<ZwpTabletSeatV2>,
+    tablet_events: Vec<TabletEvents>,
+    subsurfaces: Vec<(
+        wl_surface::WlSurface,
+        wl_subsurface::WlSubsurface,
+        WpViewport,
+    )>,
 
     pointer: Option<wl_pointer::WlPointer>,
     pointer_confined: bool,
@@ -146,6 +172,27 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
                     );
                 }
+                "wp_single_pixel_buffer_manager_v1" => {
+                    state.single_pixel = Some(registry.bind::<WpSinglePixelBufferManagerV1, _, _>(
+                        name,
+                        version,
+                        qh,
+                        (),
+                    ));
+                }
+                "wl_subcompositor" => {
+                    state.subcompositor =
+                        Some(registry.bind::<wl_subcompositor::WlSubcompositor, _, _>(
+                            name,
+                            version,
+                            qh,
+                            (),
+                        ));
+                }
+                "zwp_tablet_manager_v2" => {
+                    state.tablet_manager =
+                        Some(registry.bind::<ZwpTabletManagerV2, _, _>(name, version, qh, ()));
+                }
                 "wp_color_manager_v1" => {
                     state.color_manager =
                         Some(registry.bind::<WpColorManagerV1, _, _>(name, version, qh, ()));
@@ -178,6 +225,46 @@ delegate_noop!(State: ignore WpColorManagerV1);
 delegate_noop!(State: WpImageDescriptionCreatorParamsV1);
 delegate_noop!(State: ignore WpImageDescriptionV1);
 delegate_noop!(State: WpColorManagementSurfaceV1);
+delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
+delegate_noop!(State: ignore WpSinglePixelBufferManagerV1);
+delegate_noop!(State: ignore ZwpTabletManagerV2);
+delegate_noop!(State: ignore ZwpTabletV2);
+delegate_noop!(State: ignore ZwpTabletPadV2);
+
+impl Dispatch<ZwpTabletSeatV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpTabletSeatV2,
+        event: zwp_tablet_seat_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        state.tablet_events.push(TabletEvents::Seat(event));
+    }
+
+    wayland_client::event_created_child!(State, ZwpTabletSeatV2, [
+        zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (ZwpTabletV2, ()),
+        zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (ZwpTabletToolV2, ()),
+        zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (ZwpTabletPadV2, ()),
+    ]);
+}
+
+impl Dispatch<ZwpTabletToolV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        state.tablet_events.push(TabletEvents::Tool(event));
+    }
+}
 
 impl WaylandClient {
     pub fn new(w_socket: UnixStream) -> Self {
@@ -200,6 +287,12 @@ impl WaylandClient {
             pointer_constraints: None,
             relative_pointer_manager: None,
             color_manager: None,
+            subcompositor: None,
+            single_pixel: None,
+            tablet_manager: None,
+            tablet_seat: None,
+            tablet_events: Vec::new(),
+            subsurfaces: Vec::new(),
 
             pointer: None,
             pointer_confined: false,
@@ -286,6 +379,85 @@ impl WaylandClient {
         window.xdg_toplevel.destroy();
         window.xdg_surface.destroy();
         window.surface.destroy();
+    }
+
+    /// Makes this client tablet-aware: it binds `zwp_tablet_seat_v2` and receives tablet-v2
+    /// events from now on. (Awareness is per client connection.)
+    pub fn enable_tablet(&mut self) {
+        let manager = self
+            .state
+            .tablet_manager
+            .as_ref()
+            .expect("compositor doesn't expose zwp_tablet_manager_v2");
+        let seat = self.state.seat.as_ref().expect("no wl_seat");
+        self.state.tablet_seat = Some(manager.get_tablet_seat(seat, &self.qh, ()));
+    }
+
+    pub fn get_tablet_events(&mut self) -> &mut Vec<TabletEvents> {
+        self.state.tablet_events.as_mut()
+    }
+
+    /// The surface of window `idx`.
+    pub fn window_surface(&self, idx: usize) -> &wl_surface::WlSurface {
+        &self.state.windows[idx].surface
+    }
+
+    /// Add a `w`x`h` subsurface at (`x`, `y`) in window `idx` (desync, so it maps on its own
+    /// commit) and return its surface.
+    pub fn create_subsurface(
+        &mut self,
+        idx: usize,
+        x: i32,
+        y: i32,
+        w: u16,
+        h: u16,
+    ) -> wl_surface::WlSurface {
+        let qh = self.qh.clone();
+        let surface = self
+            .state
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&qh, ());
+        let parent = &self.state.windows[idx].surface;
+        let subsurface = self
+            .state
+            .subcompositor
+            .as_ref()
+            .expect("wl_subcompositor")
+            .get_subsurface(&surface, parent, &qh, ());
+        subsurface.set_position(x, y);
+        subsurface.set_desync();
+        let viewport = self
+            .state
+            .viewporter
+            .as_ref()
+            .unwrap()
+            .get_viewport(&surface, &qh, ());
+        viewport.set_destination(i32::from(w), i32::from(h));
+        surface.attach(self.state.buffer.as_ref(), 0, 0);
+        surface.commit();
+        // The position is parent state: it applies with the parent's next commit.
+        parent.commit();
+        self.state
+            .subsurfaces
+            .push((surface.clone(), subsurface, viewport));
+        surface
+    }
+
+    /// Replace `surface`'s buffer with a single-pixel buffer of premultiplied `rgba` (each
+    /// channel 0..=u32::MAX) and commit it.
+    pub fn attach_single_pixel(&mut self, surface: &wl_surface::WlSurface, rgba: [u32; 4]) {
+        let qh = self.qh.clone();
+        let buffer = self
+            .state
+            .single_pixel
+            .as_ref()
+            .expect("wp_single_pixel_buffer_manager_v1")
+            .create_u32_rgba_buffer(rgba[0], rgba[1], rgba[2], rgba[3], &qh, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        surface.commit();
     }
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {

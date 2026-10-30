@@ -108,11 +108,18 @@ impl VaShare {
             })
     }
 
+    /// Take ownership of the helper's display reference. A different display replaces the
+    /// stored one: the encoder was rebuilt on another device, and surfaces on the old display
+    /// would be foreign to it (re-imported every frame). Buffers already built keep the old
+    /// display alive through their allocator.
     unsafe fn adopt(&self, ptr: *mut c_void) {
         if !ptr.is_null() {
             let object = unsafe { gst::Object::from_glib_full(ptr.cast()) };
             let mut slot = self.display.lock().unwrap();
-            if slot.is_none() {
+            if slot.as_ref() != Some(&object) {
+                if slot.is_some() {
+                    tracing::info!("va_share: downstream shared a different VA display; switching");
+                }
                 *slot = Some(object);
             }
         }

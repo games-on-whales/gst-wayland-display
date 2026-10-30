@@ -19,6 +19,9 @@ pub struct FrameColor {
     /// The committed output state the element tags this frame with: BT.2100 PQ when
     /// `true`, BT.709 when `false`.
     pub output_hdr: bool,
-    /// The transfer function of the content being sampled.
+    /// The transfer function of the composited frame. The renderer composites in the
+    /// output's transfer whenever PQ content is visible (SDR surfaces PQ-encoded on an HDR
+    /// output, PQ surfaces tone-mapped on an SDR one), so this is PQ only on an HDR output
+    /// showing PQ content.
     pub content: ContentTransfer,
 }

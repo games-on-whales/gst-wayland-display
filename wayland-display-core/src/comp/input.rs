@@ -4,17 +4,22 @@ use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::keyboard::Keysym;
 use smithay::reexports::input::event::pointer::PointerEventTrait;
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait, TabletToolHandle};
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputEvent, KeyState,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent,
-        TouchSlot,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
+        InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionEvent, ProximityState, TabletToolButtonEvent, TabletToolCapabilities,
+        TabletToolDescriptor, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
+        TabletToolTipState, TouchEvent, TouchSlot,
     },
+    desktop::WindowSurfaceType,
     input::{
         keyboard::{FilterResult, keysyms},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
     },
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     reexports::{
         input::LibinputInterface,
         rustix::fs::{Mode, OFlags, open},
@@ -22,7 +27,102 @@ use smithay::{
     utils::{Logical, Point, SERIAL_COUNTER, Serial},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
+use std::collections::{HashMap, HashSet};
 use std::{os::unix::io::OwnedFd, path::Path, time::Instant};
+
+// From linux/input-event-codes.h
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+const BTN_STYLUS: u32 = 0x14b;
+/// Stands for the tip in [`TabletInput::pointer_buttons`]: no physical button has this code.
+const TIP: u32 = u32::MAX;
+
+/// The tablet tool axes that changed in a given event (`None` = unchanged).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TabletToolAxes {
+    pub pressure: Option<f64>,
+    pub distance: Option<f64>,
+    pub tilt: Option<(f64, f64)>,
+    pub rotation: Option<f64>,
+    pub slider: Option<f64>,
+    pub wheel: Option<(f64, i32)>,
+}
+
+impl TabletToolAxes {
+    /// Every tablet tool event (axis, tip and proximity alike) carries the axes that changed
+    /// with it; dropping them on tip/proximity events would leave the client with a stale value.
+    pub fn from_event<B: smithay::backend::input::InputBackend, E: TabletToolEvent<B>>(
+        event: &E,
+    ) -> Self {
+        TabletToolAxes {
+            pressure: event.pressure_has_changed().then(|| event.pressure()),
+            distance: event.distance_has_changed().then(|| event.distance()),
+            tilt: event.tilt_has_changed().then(|| event.tilt()),
+            rotation: event.rotation_has_changed().then(|| event.rotation()),
+            slider: event.slider_has_changed().then(|| event.slider_position()),
+            wheel: event
+                .wheel_has_changed()
+                .then(|| (event.wheel_delta(), event.wheel_delta_discrete())),
+        }
+    }
+}
+
+/// How a tool's tip contact or one of its buttons is being delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// As `zwp_tablet_tool_v2` events to a tablet-aware client.
+    Native,
+    /// As this `wl_pointer` button, for a client that doesn't speak tablet-v2.
+    Emulated(u32),
+}
+
+/// Per-tool state. Each physical tool (and each end of a stylus: pen and eraser are separate
+/// libinput tools) is tracked on its own, so one tool never acts on another's contact,
+/// buttons or position -- and none of it is tied to where the mouse is.
+#[derive(Debug)]
+struct ToolState {
+    tablet: TabletDescriptor,
+    /// Where the pen is, in compositor coordinates (clamped to the output).
+    location: Point<f64, Logical>,
+    /// The surface receiving this tool's tablet-v2 events, with its origin; `None` while the
+    /// tool is over nothing tablet-aware (or emulating a pointer).
+    focus: Option<(WlSurface, Point<f64, Logical>)>,
+    /// The tip is down, and how that contact is delivered. A native contact holds an implicit
+    /// grab on `focus`: the stroke keeps going to that surface until the tip comes up.
+    contact: Option<Delivery>,
+    /// Physical button code -> how its press was delivered, so its release goes the same way.
+    buttons: HashMap<u32, Delivery>,
+}
+
+/// A tool on a particular tablet. Tools without a serial (serial 0: most non-Wacom and virtual
+/// tablets) are only told apart by their tablet. Smithay's own tablet-seat tool map is keyed by
+/// the tool descriptor alone, so two such pens still share one `zwp_tablet_tool_v2`; our
+/// contact, button and focus state is kept per tablet regardless.
+type ToolKey = (TabletDescriptor, TabletToolDescriptor);
+
+/// Who holds a `wl_pointer` button down.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ButtonOwner {
+    /// A pen's tip ([`TIP`]) or one of its physical stylus buttons, emulating the button.
+    Tool(ToolKey, u32),
+    /// The mouse.
+    Mouse,
+}
+
+/// The seat's tablet input state; see [`ToolState`].
+#[derive(Debug, Default)]
+pub(crate) struct TabletInput {
+    tools: HashMap<ToolKey, ToolState>,
+    /// Pointer button -> who holds it: the mouse and any pen emulating it. The pointer button
+    /// is pressed when its first owner presses and released only when its last owner lets go,
+    /// so two stylus buttons mapped to middle click, two pens, or a pen and the mouse can't
+    /// release each other's press.
+    pointer_buttons: HashMap<u32, HashSet<ButtonOwner>>,
+    /// The pointer's own cursor image while a tablet tool's image is shown instead; restored
+    /// by the next mouse motion (and when the pen goes back to emulating the pointer).
+    saved_pointer_image: Option<CursorImageStatus>,
+}
 
 pub struct NixInterface;
 
@@ -132,6 +232,24 @@ impl State {
         under: &Option<(FocusTarget, Point<f64, Logical>)>,
         target_position: Point<f64, Logical>,
     ) -> bool {
+        let should_motion = self.constraint_allows_move(under, target_position);
+        let new_under = self
+            .space
+            .element_under(target_position)
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        // If pointer is now in a constraint region, activate it
+        self.maybe_activate_pointer_constraint(&new_under, target_position);
+        should_motion
+    }
+
+    /// Whether an active pointer constraint on `under` (the surface under the pointer) lets
+    /// the pointer move to `target_position`. Unlike [`Self::can_pointer_move`] this activates
+    /// no constraint.
+    fn constraint_allows_move(
+        &self,
+        under: &Option<(FocusTarget, Point<f64, Logical>)>,
+        target_position: Point<f64, Logical>,
+    ) -> bool {
         let pointer = self.seat.get_pointer().unwrap();
         let mut should_motion = true;
 
@@ -185,45 +303,17 @@ impl State {
             });
         }
 
-        // If pointer is now in a constraint region, activate it
-        self.maybe_activate_pointer_constraint(&new_under, target_position);
-
         should_motion
     }
 
-    pub fn pointer_motion(
+    /// The pending edge-triggered refocus (see `pointer_motion`): force smithay's pointer
+    /// focus to None so the next motion re-emits `wl_pointer.enter`.
+    fn refocus_pointer_if_pending(
         &mut self,
-        event_time_msec: u32,
-        event_time_usec: u64,
-        delta: Point<f64, Logical>,
-        delta_unaccelerated: Point<f64, Logical>,
+        under: &Option<(FocusTarget, Point<f64, Logical>)>,
+        time: u32,
     ) {
-        self.last_pointer_movement = Instant::now();
         let pointer = self.seat.get_pointer().unwrap();
-        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
-            .space
-            .element_under(self.pointer_location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
-
-        // Edge-triggered pointer refocus.
-        //
-        // smithay only emits wl_pointer.enter on a focus TRANSITION, and broadcasts it to
-        // the wl_pointer resources that exist at that instant while recording the new focus
-        // unconditionally. This compositor resolves pointer focus once, via a synthetic
-        // zero-delta motion in the toplevel map handler. A client that calls
-        // wl_seat.get_pointer AFTER that instant loses the race: the enter reached zero
-        // resources, smithay's focus is already Some(surface), and every later motion takes
-        // smithay's same-target arm (wl_pointer.motion only) -- so the client never learns
-        // it has pointer focus and ignores all pointer input, forever. Rootful Xwayland
-        // (maps exactly once) fails deterministically; gamescope fails intermittently.
-        //
-        // Fix: on the first real motion after a map, force smithay's focus to None so the
-        // motion below takes the (focus, None) => enter arm and re-emits the enter.
-        //
-        // The flag is RETAINED (not consumed) when there is no surface under the pointer --
-        // there is nothing to refocus onto yet -- and while the pointer is grabbed, since
-        // smithay's default click grab is active for as long as a button is held and a
-        // forced leave mid-click-drag would break the drag.
         let refocus_target = under
             .as_ref()
             .filter(|_| self.pending_pointer_refocus && !pointer.is_grabbed());
@@ -250,11 +340,49 @@ impl State {
                     &MotionEvent {
                         location: self.pointer_location,
                         serial: SERIAL_COUNTER.next_serial(),
-                        time: event_time_msec,
+                        time,
                     },
                 );
             }
         }
+    }
+
+    pub fn pointer_motion(
+        &mut self,
+        event_time_msec: u32,
+        event_time_usec: u64,
+        delta: Point<f64, Logical>,
+        delta_unaccelerated: Point<f64, Logical>,
+    ) {
+        self.last_pointer_movement = Instant::now();
+        // The mouse moves: the cursor is the pointer's again, not a pen's.
+        self.restore_pointer_cursor_image();
+        let pointer = self.seat.get_pointer().unwrap();
+        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
+            .space
+            .element_under(self.pointer_location)
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+
+        // Edge-triggered pointer refocus.
+        //
+        // smithay only emits wl_pointer.enter on a focus TRANSITION, and broadcasts it to
+        // the wl_pointer resources that exist at that instant while recording the new focus
+        // unconditionally. This compositor resolves pointer focus once, via a synthetic
+        // zero-delta motion in the toplevel map handler. A client that calls
+        // wl_seat.get_pointer AFTER that instant loses the race: the enter reached zero
+        // resources, smithay's focus is already Some(surface), and every later motion takes
+        // smithay's same-target arm (wl_pointer.motion only) -- so the client never learns
+        // it has pointer focus and ignores all pointer input, forever. Rootful Xwayland
+        // (maps exactly once) fails deterministically; gamescope fails intermittently.
+        //
+        // Fix: on the first real motion after a map, force smithay's focus to None so the
+        // motion below takes the (focus, None) => enter arm and re-emits the enter.
+        //
+        // The flag is RETAINED (not consumed) when there is no surface under the pointer --
+        // there is nothing to refocus onto yet -- and while the pointer is grabbed, since
+        // smithay's default click grab is active for as long as a button is held and a
+        // forced leave mid-click-drag would break the drag.
+        self.refocus_pointer_if_pending(&under, event_time_msec);
 
         // Allocated AFTER the refocus block: the re-emitted wl_pointer.enter below must carry
         // a serial NEWER than the forced leave's, since clients echo enter serials back.
@@ -315,7 +443,42 @@ impl State {
         self.pointer_absolute_location = position;
     }
 
+    /// A mouse button. A button a pen already holds (an emulated drag) stays down until both
+    /// let go; see [`TabletInput::pointer_buttons`].
     pub fn pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
+        self.owned_button(event_time_msec, ButtonOwner::Mouse, button_code, state);
+    }
+
+    /// Records `owner`'s press or release of pointer `button`, and sends it to the pointer only
+    /// on the first press and the last release.
+    fn owned_button(&mut self, time: u32, owner: ButtonOwner, button: u32, state: ButtonState) {
+        match state {
+            ButtonState::Pressed => {
+                let owners = self.tablet.pointer_buttons.entry(button).or_default();
+                let first = owners.is_empty();
+                owners.insert(owner);
+                if first {
+                    self.send_pointer_button(time, button, state);
+                }
+            }
+            ButtonState::Released => match self.tablet.pointer_buttons.get_mut(&button) {
+                Some(owners) => {
+                    if owners.remove(&owner) && owners.is_empty() {
+                        self.tablet.pointer_buttons.remove(&button);
+                        self.send_pointer_button(time, button, state);
+                    }
+                }
+                // Not pressed through here (e.g. pressed before this compositor saw it):
+                // forward the mouse's release rather than leave the client's button stuck.
+                None if owner == ButtonOwner::Mouse => {
+                    self.send_pointer_button(time, button, state)
+                }
+                None => {}
+            },
+        }
+    }
+
+    fn send_pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
         self.last_pointer_movement = Instant::now();
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -513,7 +676,63 @@ impl State {
 
     pub fn process_input_event(&mut self, event: InputEvent<LibinputInputBackend>) {
         match event {
-            InputEvent::DeviceRemoved { device } => self.input_device_removed(&device),
+            InputEvent::DeviceAdded { device } => {
+                if Device::has_capability(&device, DeviceCapability::TabletTool) {
+                    self.tablet_added(&TabletDescriptor::from(&device));
+                }
+            }
+            InputEvent::DeviceRemoved { device } => {
+                if Device::has_capability(&device, DeviceCapability::TabletTool) {
+                    self.tablet_removed(&TabletDescriptor::from(&device));
+                }
+                self.input_device_removed(&device);
+            }
+            InputEvent::TabletToolProximity { event, .. } => {
+                if let Some(location) = self.touch_location_transformed(&event) {
+                    self.tablet_tool_proximity(
+                        event.time_msec(),
+                        &TabletDescriptor::from(&event.device()),
+                        &event.tool(),
+                        location,
+                        TabletToolAxes::from_event(&event),
+                        event.state() == ProximityState::In,
+                    );
+                }
+            }
+            InputEvent::TabletToolAxis { event, .. } => {
+                if let Some(location) = self.touch_location_transformed(&event) {
+                    self.tablet_tool_axis(
+                        event.time_msec(),
+                        &TabletDescriptor::from(&event.device()),
+                        &event.tool(),
+                        location,
+                        TabletToolAxes::from_event(&event),
+                    );
+                }
+            }
+            InputEvent::TabletToolTip { event, .. } => {
+                // A tip event carries the final axis values with it (libinput sends no separate
+                // axis event for them), so pressure returning to 0 on tip-up is only seen here.
+                if let Some(location) = self.touch_location_transformed(&event) {
+                    self.tablet_tool_tip(
+                        event.time_msec(),
+                        &TabletDescriptor::from(&event.device()),
+                        &event.tool(),
+                        location,
+                        TabletToolAxes::from_event(&event),
+                        TabletToolTipEvent::tip_state(&event) == TabletToolTipState::Down,
+                    );
+                }
+            }
+            InputEvent::TabletToolButton { event, .. } => {
+                self.tablet_tool_button(
+                    event.time_msec(),
+                    &TabletDescriptor::from(&event.device()),
+                    &event.tool(),
+                    TabletToolButtonEvent::button(&event),
+                    TabletToolButtonEvent::button_state(&event),
+                );
+            }
             InputEvent::Keyboard { event, .. } => {
                 self.keyboard_input(event.time_msec(), event.key_code(), event.state());
             }
@@ -589,6 +808,484 @@ impl State {
         }
     }
 
+    pub fn tablet_added(&mut self, tablet: &TabletDescriptor) {
+        tracing::info!(name = %tablet.name, "Tablet added");
+        self.seat.tablet_seat().add_tablet::<Self>(&self.dh, tablet);
+    }
+
+    /// A tablet went away: end every contact and release every button its tools hold, so
+    /// nothing stays pressed, and forget the tools.
+    pub fn tablet_removed(&mut self, tablet: &TabletDescriptor) {
+        tracing::info!(name = %tablet.name, "Tablet removed");
+        let tools: Vec<TabletToolDescriptor> = self
+            .tablet
+            .tools
+            .keys()
+            .filter(|(t, _)| t == tablet)
+            .map(|(_, tool)| tool.clone())
+            .collect();
+        let time = self.clock.now().as_millis();
+        for tool in &tools {
+            self.tablet_tool_leave(time, tablet, tool);
+            self.tablet.tools.remove(&(tablet.clone(), tool.clone()));
+        }
+        let tablet_seat = self.seat.tablet_seat();
+        tablet_seat.remove_tablet(tablet);
+        for tool in &tools {
+            // Smithay keys tools by descriptor alone: keep its tool while the same descriptor
+            // is still live on another tablet.
+            if !self.tablet.tools.keys().any(|(_, t)| t == tool) {
+                tablet_seat.remove_tool(tool);
+            }
+        }
+        // With no tablet left no tool can be in use.
+        if tablet_seat.count_tablets() == 0 {
+            tablet_seat.clear_tools();
+        }
+    }
+
+    /// Whether the client owning `surface` has bound the tablet protocol (`zwp_tablet_seat_v2`).
+    ///
+    /// Tablet support is detected per client connection: a nested compositor (gamescope, a
+    /// nested sway, Xwayland) is one client here, so its own clients only get tablet events if
+    /// it binds tablet-v2 and forwards them. Clients that don't (gamescope, most games, older
+    /// toolkits) would see the cursor follow the pen but never a click; for those the pen
+    /// emulates a pointer instead.
+    fn surface_accepts_tablet(&self, surface: &WlSurface) -> bool {
+        let Some(client) = surface.client() else {
+            return false;
+        };
+        let mut accepts = false;
+        let _ = self
+            .dh
+            .backend_handle()
+            .with_all_objects_for(client.id(), |id| {
+                accepts |= id.interface().name == "zwp_tablet_seat_v2";
+            });
+        accepts
+    }
+
+    /// The surface actually under `location` -- a popup or subsurface where there is one, not
+    /// just its window's root surface -- with its origin in compositor coordinates.
+    fn surface_under(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let (window, window_loc) = self.space.element_under(location)?;
+        window
+            .surface_under(location - window_loc.to_f64(), WindowSurfaceType::ALL)
+            .map(|(surface, loc)| (surface, (loc + window_loc).to_f64()))
+    }
+
+    /// Moves the cursor composited into the stream so it keeps following the pen, *without*
+    /// a wl_pointer event: the tablet-aware client gets zwp_tablet_tool_v2.motion instead, and
+    /// duplicating it as pointer motion makes drawing applications see every stroke twice.
+    ///
+    /// A pointer lock (or confinement) holds the cursor: moving it here would also move the
+    /// pointer the next mouse motion starts from, letting the mouse escape the lock.
+    fn tablet_cursor_only_motion(&mut self, location: Point<f64, Logical>) {
+        let current: Option<(FocusTarget, Point<f64, Logical>)> = self
+            .space
+            .element_under(self.pointer_location)
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        if !self.constraint_allows_move(&current, location) {
+            return;
+        }
+        self.last_pointer_movement = Instant::now();
+        self.set_pointer_location(location);
+    }
+
+    /// A tablet tool set its cursor image (smithay's `TabletSeatHandler`): show it in place
+    /// of the pointer's, which is kept to be restored.
+    pub(crate) fn set_tablet_cursor_image(&mut self, image: CursorImageStatus) {
+        let previous = std::mem::replace(&mut self.cursor_state, image);
+        self.tablet.saved_pointer_image.get_or_insert(previous);
+    }
+
+    /// The pointer's client set its cursor image. While a pen's image is shown, keep it for
+    /// when the cursor is the pointer's again.
+    pub(crate) fn set_pointer_cursor_image(&mut self, image: CursorImageStatus) {
+        match &mut self.tablet.saved_pointer_image {
+            Some(saved) => *saved = image,
+            None => self.cursor_state = image,
+        }
+    }
+
+    fn restore_pointer_cursor_image(&mut self) {
+        if let Some(saved) = self.tablet.saved_pointer_image.take() {
+            self.cursor_state = saved;
+        }
+    }
+
+    /// Forwards every axis that changed; smithay sends them with the next same-surface motion.
+    fn queue_tool_axes(tool_handle: &TabletToolHandle, axes: TabletToolAxes) {
+        if let Some(pressure) = axes.pressure {
+            tool_handle.pressure(pressure);
+        }
+        if let Some(distance) = axes.distance {
+            tool_handle.distance(distance);
+        }
+        if let Some(tilt) = axes.tilt {
+            tool_handle.tilt(tilt);
+        }
+        if let Some(rotation) = axes.rotation {
+            tool_handle.rotation(rotation);
+        }
+        if let Some(slider) = axes.slider {
+            tool_handle.slider_position(slider);
+        }
+        if let Some((degrees, clicks)) = axes.wheel {
+            tool_handle.wheel(degrees, clicks);
+        }
+    }
+
+    /// Whether `key`'s tool holds any emulated pointer button (its tip or a stylus button).
+    fn tool_emulates(&self, key: &ToolKey) -> bool {
+        self.tablet.pointer_buttons.values().any(|owners| {
+            owners
+                .iter()
+                .any(|owner| matches!(owner, ButtonOwner::Tool(k, _) if k == key))
+        })
+    }
+
+    /// Presses emulated pointer `button` on behalf of (`key`, `physical`); the pointer sees
+    /// the press only if nobody (no pen, not the mouse) held it yet.
+    fn emulated_press(&mut self, time: u32, key: &ToolKey, physical: u32, button: u32) {
+        let owner = ButtonOwner::Tool(key.clone(), physical);
+        self.owned_button(time, owner, button, ButtonState::Pressed);
+    }
+
+    /// Releases (`key`, `physical`)'s hold on emulated pointer `button`; the pointer sees the
+    /// release only when no other owner still holds it.
+    fn emulated_release(&mut self, time: u32, key: &ToolKey, physical: u32, button: u32) {
+        let owner = ButtonOwner::Tool(key.clone(), physical);
+        self.owned_button(time, owner, button, ButtonState::Released);
+    }
+
+    /// Moves `tool` to `location` and delivers the move: to the surface holding its native
+    /// contact (implicit grab), as pointer motion while it emulates a pointer button, else to
+    /// whatever is under it. Every axis that changed reaches the client with this move, also
+    /// when it changes the tool's focus (smithay would hold them back until the next motion).
+    fn tablet_tool_move(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+        location: Point<f64, Logical>,
+        axes: TabletToolAxes,
+    ) {
+        let location = self.clamp_coords(location);
+        let tablet_seat = self.seat.tablet_seat();
+        let dh = self.dh.clone();
+        tablet_seat.add_tool::<Self>(self, &dh, tool);
+        let key: ToolKey = (tablet.clone(), tool.clone());
+        let state = self.tablet.tools.entry(key.clone()).or_insert(ToolState {
+            tablet: tablet.clone(),
+            location,
+            focus: None,
+            contact: None,
+            buttons: HashMap::new(),
+        });
+        state.tablet = tablet.clone();
+        state.location = location;
+        let prev_focus = state.focus.clone();
+        let contact = state.contact;
+
+        // Where the tablet-v2 events go now.
+        let native_focus = match (contact, &prev_focus) {
+            // Keep a stroke on the surface it started on, even across windows, as long as
+            // that surface is alive.
+            (Some(Delivery::Native), Some((surface, origin))) if surface.is_alive() => {
+                Some((surface.clone(), *origin))
+            }
+            // An emulated press is a pointer drag: keep delivering pointer motion, even over a
+            // tablet-aware window (smithay's click grab keeps it on the pressed window).
+            _ if self.tool_emulates(&key) => None,
+            _ => self
+                .surface_under(location)
+                .filter(|(surface, _)| self.surface_accepts_tablet(surface)),
+        };
+
+        let (Some(tablet_handle), Some(tool_handle)) =
+            (tablet_seat.get_tablet(tablet), tablet_seat.get_tool(tool))
+        else {
+            return;
+        };
+        match native_focus {
+            Some(focus) => {
+                self.tablet_cursor_only_motion(location);
+                let refocused = prev_focus.as_ref().map(|(s, _)| s) != Some(&focus.0);
+                if refocused && contact == Some(Delivery::Native) {
+                    // Resets smithay's tip state, which its proximity_out leaves set when the
+                    // contact's surface is already gone (so the tip_down below would be
+                    // dropped). Only a destroyed surface loses a native contact (a live one
+                    // keeps the stroke), so there is nobody left to send zero pressure to.
+                    tool_handle.tip_up(time);
+                }
+                if refocused && prev_focus.is_some() {
+                    tool_handle.proximity_out(time);
+                }
+                if refocused {
+                    // proximity_in carries only the position; the axes follow with the motion.
+                    tool_handle.proximity_in(
+                        location,
+                        focus.clone(),
+                        &tablet_handle,
+                        SERIAL_COUNTER.next_serial(),
+                        time,
+                    );
+                }
+                Self::queue_tool_axes(&tool_handle, axes);
+                tool_handle.motion(
+                    location,
+                    Some(focus.clone()),
+                    &tablet_handle,
+                    SERIAL_COUNTER.next_serial(),
+                    time,
+                );
+                if refocused && contact == Some(Delivery::Native) {
+                    // The contact's surface went away mid-stroke: the stroke carries on in the
+                    // surface now under the pen, which has to learn the tip is down.
+                    tool_handle.tip_down(SERIAL_COUNTER.next_serial(), time);
+                }
+                if let Some(state) = self.tablet.tools.get_mut(&key) {
+                    state.focus = Some(focus);
+                }
+            }
+            None => {
+                if prev_focus.is_some() {
+                    tool_handle.proximity_out(time);
+                    if let Some(state) = self.tablet.tools.get_mut(&key) {
+                        state.focus = None;
+                        if state.contact == Some(Delivery::Native) {
+                            state.contact = None;
+                        }
+                    }
+                }
+                // The pen drives the pointer now, so the cursor is the pointer's.
+                self.restore_pointer_cursor_image();
+                self.tablet_pointer_warp(time, location);
+            }
+        }
+    }
+
+    /// Moves the pointer to the pen at `location`, resolving the pointer focus there (the
+    /// relative-motion path resolves it at the previous position, which would hand the pen's
+    /// next click to the window it just left).
+    fn tablet_pointer_warp(&mut self, time: u32, location: Point<f64, Logical>) {
+        self.last_pointer_movement = Instant::now();
+        let pointer = self.seat.get_pointer().unwrap();
+        let current: Option<(FocusTarget, Point<f64, Logical>)> = self
+            .space
+            .element_under(self.pointer_location)
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        // A locked (or confining) pointer constraint holds the pointer as it does for the
+        // mouse: the pen's emulated input then goes to the constrained surface.
+        if !self.can_pointer_move(&current, location) {
+            return;
+        }
+        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
+            .space
+            .element_under(location)
+            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        // Same late-`wl_pointer` refocus as mouse motion.
+        self.refocus_pointer_if_pending(&under, time);
+        self.set_pointer_location(location);
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    pub fn tablet_tool_proximity(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+        location: Point<f64, Logical>,
+        axes: TabletToolAxes,
+        is_in: bool,
+    ) {
+        if is_in {
+            self.tablet_tool_move(time, tablet, tool, location, axes);
+        } else {
+            self.tablet_tool_leave(time, tablet, tool);
+        }
+    }
+
+    /// The tool left proximity (or its tablet went away): lift its tip, release its buttons
+    /// and end its tablet-v2 focus. Only this tool's state is touched.
+    fn tablet_tool_leave(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+    ) {
+        let key: ToolKey = (tablet.clone(), tool.clone());
+        let Some(state) = self.tablet.tools.get_mut(&key) else {
+            return;
+        };
+        let had_focus = state.focus.take().is_some();
+        state.contact = None;
+        let buttons: Vec<(u32, Delivery)> = state.buttons.drain().collect();
+        let tool_handle = self.seat.tablet_seat().get_tool(tool);
+        for (physical, delivery) in buttons {
+            if let Delivery::Emulated(button) = delivery {
+                self.emulated_release(time, &key, physical, button);
+            }
+        }
+        self.emulated_release(time, &key, TIP, BTN_LEFT);
+        self.restore_pointer_cursor_image();
+        if had_focus {
+            if let Some(tool_handle) = tool_handle {
+                // Sends `up` first if the tip was down.
+                tool_handle.proximity_out(time);
+            }
+        }
+    }
+
+    pub fn tablet_tool_axis(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+        location: Point<f64, Logical>,
+        axes: TabletToolAxes,
+    ) {
+        self.tablet_tool_move(time, tablet, tool, location, axes);
+    }
+
+    pub fn tablet_tool_tip(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+        location: Point<f64, Logical>,
+        mut axes: TabletToolAxes,
+        is_down: bool,
+    ) {
+        if !is_down && tool.capabilities.contains(TabletToolCapabilities::PRESSURE) {
+            // No pressure may linger once the tip is up, whatever the device reported (none,
+            // or a small residue).
+            axes.pressure = Some(0.0);
+        }
+        // The tip event doubles as an axis event: position and the axes the tip went down /
+        // came up with reach the client before the down / up.
+        self.tablet_tool_move(time, tablet, tool, location, axes);
+        let key: ToolKey = (tablet.clone(), tool.clone());
+        let Some(state) = self.tablet.tools.get(&key) else {
+            return;
+        };
+        let native = state.focus.is_some();
+        let contact = state.contact;
+
+        if is_down {
+            if contact.is_some() {
+                return;
+            }
+            let serial = SERIAL_COUNTER.next_serial();
+            self.update_keyboard_focus(serial);
+            if native {
+                if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
+                    tool_handle.tip_down(serial, time);
+                }
+                self.tablet.tools.get_mut(&key).unwrap().contact = Some(Delivery::Native);
+            } else {
+                self.emulated_press(time, &key, TIP, BTN_LEFT);
+                self.tablet.tools.get_mut(&key).unwrap().contact =
+                    Some(Delivery::Emulated(BTN_LEFT));
+            }
+        } else {
+            match contact {
+                Some(Delivery::Native) => {
+                    if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
+                        tool_handle.tip_up(time);
+                    }
+                }
+                Some(Delivery::Emulated(button)) => self.emulated_release(time, &key, TIP, button),
+                None => {}
+            }
+            if let Some(state) = self.tablet.tools.get_mut(&key) {
+                state.contact = None;
+            }
+            // Contact ended: settle the focus on whatever is under the pen now.
+            if let Some(state) = self.tablet.tools.get(&key) {
+                let location = state.location;
+                self.tablet_tool_move(time, tablet, tool, location, Default::default());
+            }
+        }
+    }
+
+    pub fn tablet_tool_button(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+        button: u32,
+        state: ButtonState,
+    ) {
+        let key: ToolKey = (tablet.clone(), tool.clone());
+        let Some(tool_state) = self.tablet.tools.get(&key) else {
+            return;
+        };
+        match state {
+            ButtonState::Pressed => {
+                if tool_state.buttons.contains_key(&button) {
+                    return;
+                }
+                // Routed by where this pen is, never by the mouse.
+                let delivery = if tool_state.focus.is_some() {
+                    if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
+                        tool_handle.button(button, state, SERIAL_COUNTER.next_serial(), time);
+                    }
+                    Delivery::Native
+                } else {
+                    // BTN_STYLUS -> right click, BTN_STYLUS2 / BTN_STYLUS3 -> middle click.
+                    let emulated = if button == BTN_STYLUS {
+                        BTN_RIGHT
+                    } else {
+                        BTN_MIDDLE
+                    };
+                    // The mouse may have moved since the pen did: bring the pointer back to the
+                    // pen so the click lands in the application under the pen.
+                    let location = tool_state.location;
+                    if self.pointer_location != location {
+                        self.tablet_pointer_warp(time, location);
+                    }
+                    self.emulated_press(time, &key, button, emulated);
+                    Delivery::Emulated(emulated)
+                };
+                if let Some(tool_state) = self.tablet.tools.get_mut(&key) {
+                    tool_state.buttons.insert(button, delivery);
+                }
+            }
+            ButtonState::Released => {
+                let delivery = self
+                    .tablet
+                    .tools
+                    .get_mut(&key)
+                    .and_then(|t| t.buttons.remove(&button));
+                match delivery {
+                    Some(Delivery::Native) => {
+                        if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
+                            tool_handle.button(button, state, SERIAL_COUNTER.next_serial(), time);
+                        }
+                    }
+                    Some(Delivery::Emulated(emulated)) => {
+                        self.emulated_release(time, &key, button, emulated)
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
         if let Some(output) = self.output.as_ref() {
             if let Some(mode) = output.current_mode() {
@@ -625,6 +1322,17 @@ impl State {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl State {
+    /// Whether any pointer button is still held on behalf of a pen.
+    pub(crate) fn pen_holds_pointer_buttons(&self) -> bool {
+        self.tablet
+            .pointer_buttons
+            .values()
+            .any(|owners| owners.iter().any(|o| !matches!(o, ButtonOwner::Mouse)))
     }
 }
 

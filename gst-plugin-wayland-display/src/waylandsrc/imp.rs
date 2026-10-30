@@ -13,7 +13,7 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
@@ -67,8 +67,12 @@ pub struct WaylandDisplaySrc {
     // Set while change_state() runs PLAYING->PAUSED; see there.
     pausing: AtomicBool,
     // A frame whose wait unlock() cut short; the next create() waits on it instead of requesting
-    // another, since dropping it would shut the compositor down.
-    pending_frame: Mutex<Option<PendingFrame>>,
+    // another, since dropping it would shut the compositor down. Tagged with the
+    // `caps_generation` it was requested under.
+    pending_frame: Mutex<Option<(u64, PendingFrame)>>,
+    // Bumped by every set_caps(): a stashed frame from an older generation was rendered for
+    // the previous caps and must not be pushed under the new ones.
+    caps_generation: AtomicU64,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -86,6 +90,7 @@ impl Default for WaylandDisplaySrc {
             flushing: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
             pending_frame: Mutex::new(None),
+            caps_generation: AtomicU64::new(0),
         }
     }
 }
@@ -114,6 +119,11 @@ impl WaylandDisplaySrc {
 }
 
 impl Settings {
+    /// Whether the output colour caps are fixed while the source colour travels per frame.
+    fn stable_transport(&self) -> bool {
+        self.hdr_cm && self.stable_color_transport
+    }
+
     /// Devices a new display is given on start(): configured ones, then announced ones.
     fn startup_input_devices(&self) -> Vec<String> {
         self.input_devices
@@ -197,6 +207,10 @@ pub struct Settings {
     /// pipeline (the Wayland globals are created at start). Must be per element -- not an
     /// env var -- so one process can stream an HDR client and an SDR client side by side.
     hdr_cm: bool,
+    /// `stable-color-transport`: the P010 caps stay fixed at the static `hdr` setting while
+    /// the source's colour travels per frame (raw RGB buffers carry it as
+    /// `utils::source_color` meta); only meaningful with `hdr_cm`.
+    stable_color_transport: bool,
     /// Manual override of the HDR mastering-display-info caps string (gst format:
     /// "Rx:Ry:Gx:Gy:Bx:By:Wx:Wy:maxLum:minLum"). `None` => the hardcoded BT.2020/1000-nit
     /// default, or the game's real metadata under dynamic HDR.
@@ -503,7 +517,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .build(),
                 glib::ParamSpecUInt::builder("ring-depth")
                     .minimum(1).maximum(4).default_value(4)
-                    .blurb("Conversion ring depth; 4 recommended, smaller rings depend on downstream buffer retention")
+                    .blurb("Conversion ring depth; 4 recommended, smaller rings depend on downstream buffer retention. At least 2 slots are used: a slot is reused only once downstream released it")
                     .mutable_ready().build(),
                 glib::ParamSpecBoolean::builder("linear-encode-src")
                     .blurb("Prefer linear Vulkan encode input; retry optimal tiling if allocation fails")
@@ -527,6 +541,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                 glib::ParamSpecString::builder("vulkan-profile")
                     .blurb("Encode image profile, matching the downstream encoder: h264 high/main/baseline/constrained-baseline (NV12); h265 main (NV12) or main-10 (P010); av1 main (NV12)")
                     .mutable_ready().build(),
+                glib::ParamSpecBoolean::builder("stable-color-transport")
+                    .blurb(
+                        "With dynamic-hdr: keep the output colour caps fixed at the hdr setting \
+                         instead of retagging them on every SDR/HDR change. Frames are \
+                         converted for that fixed output, raw RGB frames carry per-frame \
+                         source colour metadata for a compatible converter, and \
+                         wolf-hdr-state still reports the source's state. Set before \
+                         starting the pipeline.",
+                    )
+                    .default_value(false)
+                    .mutable_ready()
+                    .build(),
                 glib::ParamSpecBoolean::builder("dynamic-hdr")
                     .blurb(
                         "Dynamic HDR color management: advertise wp_color_management_v1 + \
@@ -592,9 +618,41 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .unwrap()
                     .filter(|v| !v.trim().is_empty())
             }
-            "dynamic-hdr" => {
+            "stable-color-transport" => {
+                let stable = value.get::<bool>().expect("Type checked upstream");
+                // Snapshotted by the compositor and converter at start, like dynamic-hdr.
+                let running = self.state.lock().unwrap().is_some();
                 let mut settings = self.settings.lock().unwrap();
-                settings.hdr_cm = value.get::<bool>().expect("Type checked upstream");
+                if running {
+                    if stable != settings.stable_color_transport {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "stable-color-transport can only change while stopped; ignoring"
+                        );
+                    }
+                    return;
+                }
+                settings.stable_color_transport = stable;
+            }
+            "dynamic-hdr" => {
+                let hdr_cm = value.get::<bool>().expect("Type checked upstream");
+                // The compositor snapshots this at start (its colour-management globals and
+                // HDR channel), so a change mid-run would build converters that no longer
+                // match it. GLib does not enforce mutable_ready; do it here.
+                let running = self.state.lock().unwrap().is_some();
+                let mut settings = self.settings.lock().unwrap();
+                if running {
+                    if hdr_cm != settings.hdr_cm {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "dynamic-hdr can only change while stopped; ignoring"
+                        );
+                    }
+                    return;
+                }
+                settings.hdr_cm = hdr_cm;
                 // The compositor thread and converter snapshot this via the shared
                 // conversion options, so keep them in sync with the property.
                 let mut options = self.vulkan_share.conversion_options();
@@ -681,8 +739,23 @@ impl ObjectImpl for WaylandDisplaySrc {
                 settings.nv12 = value.get::<bool>().expect("Type checked upstream");
             }
             "hdr" => {
+                let hdr = value.get::<bool>().expect("Type checked upstream");
+                let running = self.state.lock().unwrap().is_some();
                 let mut settings = self.settings.lock().unwrap();
-                settings.hdr = value.get::<bool>().expect("Type checked upstream");
+                // A stable transport fixed the converter's output state at start; new caps
+                // from a later change would disagree with the frames.
+                if running && settings.stable_transport() {
+                    if hdr != settings.hdr {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "hdr can only change while stopped under stable-color-transport; \
+                             ignoring"
+                        );
+                    }
+                    return;
+                }
+                settings.hdr = hdr;
             }
             _ => unreachable!(),
         }
@@ -709,6 +782,12 @@ impl ObjectImpl for WaylandDisplaySrc {
             "vulkan-profile" => self.settings.lock().unwrap().vulkan_profile.to_value(),
             "vulkan-codec" => self.settings.lock().unwrap().vulkan_codec.to_value(),
             "dynamic-hdr" => self.settings.lock().unwrap().hdr_cm.to_value(),
+            "stable-color-transport" => self
+                .settings
+                .lock()
+                .unwrap()
+                .stable_color_transport
+                .to_value(),
             "mastering-display-info" => self
                 .settings
                 .lock()
@@ -770,6 +849,10 @@ impl ObjectImpl for WaylandDisplaySrc {
         obj.set_format(gst::Format::Time);
         obj.set_automatic_eos(false);
         obj.set_do_timestamp(true);
+
+        // Before a Vulkan encoder later in the same pipeline description loads GStreamer's
+        // Vulkan plugin: elements are created in order, and this blocks until it's done.
+        waylanddisplaycore::utils::renderer::keep_vulkan_drivers_loaded();
     }
 }
 
@@ -935,9 +1018,6 @@ impl ElementImpl for WaylandDisplaySrc {
 }
 
 impl WaylandDisplaySrc {
-    /// Guard the NV12 export path: refuse a negotiated modifier the Vulkan converter can't
-    /// export, so a bad negotiation fails here with a clear error instead of green/garbled
-    /// frames downstream. Non-NV12 DMA caps (the compositor's RGBA dmabuf) pass untouched.
     /// The codec and (if fixed in its caps) profile of a directly linked Vulkan encoder.
     /// Encoded profile constraints are downstream of the raw sink pad: follow simple
     /// filters/queues to the encoder. interpipe has no graph edge, so that case uses the
@@ -1149,6 +1229,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     .collect()
             }
         };
+        // The compositor round trip above must hold `state` (stop() drops the display), but
+        // nothing below needs it: create() must not wait on the peer query further down.
+        drop(state);
 
         tracing::info!("Supported DMA formats: {:?}", gst_dma_formats);
 
@@ -1303,8 +1386,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // Only while the shared device can actually serve the encoder: a refused device or a
         // directly linked encoder on another VkDevice drops memory:VulkanImage, so
         // negotiation falls back to the dmabuf/RGBA caps below.
-        let vulkan_on = self.settings.lock().unwrap().vulkan
-            && self.vulkan_share.check_peer_device(&self.obj().src_pad());
+        // Read the setting first: the peer query below may be answered by a downstream element
+        // that queries back upstream, which takes `settings` again on this thread.
+        let vulkan = self.settings.lock().unwrap().vulkan;
+        let vulkan_on = vulkan && self.vulkan_share.check_peer_device(&self.obj().src_pad());
         if vulkan_on {
             // NV12 (8-bit SDR) first so a format-agnostic interpipesink fixates on it; P010 is
             // a separate structure so the HDR fields apply ONLY to it (an `hdr` NV12 stream
@@ -1450,6 +1535,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
+        self.caps_generation.fetch_add(1, Ordering::AcqRel);
         // NV12 memory:VulkanImage: hand the compositor a VULKAN video-info so it builds the
         // shared-device encode-src converter. The H.264 profile isn't in our (raw) caps --
         // it lives in encoded output caps, potentially across interpipe. The
@@ -1595,6 +1681,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let (render_node, command_rx, command_tx) = {
             let mut settings = self.settings.lock().unwrap();
             settings.prune_virtual_input_devices();
+            // The fixed output state of a stable transport, for the compositor and converter.
+            let mut options = self.vulkan_share.conversion_options();
+            options.stable_output_hdr = settings.stable_transport().then_some(settings.hdr);
+            self.vulkan_share.set_conversion_options(options);
             let command_rx = self.new_startup_channel(&settings);
             let command_tx = self.command_tx.lock().unwrap().clone();
             (settings.render_node.clone(), command_rx, command_tx)
@@ -1728,6 +1818,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // Only after the display: dropping a frame the compositor still owes makes it exit, and
         // Drop must still be able to send Quit and join it.
         self.pending_frame.lock().unwrap().take();
+        self.vulkan_share.end_run();
         #[cfg(feature = "cuda")]
         self.settings.lock().unwrap().end_cuda_run();
         Ok(())
@@ -1764,22 +1855,29 @@ impl PushSrcImpl for WaylandDisplaySrc {
                 if self.flushing.load(Ordering::Acquire) {
                     return Err(gst::FlowError::Flushing);
                 }
+                let generation = self.caps_generation.load(Ordering::Acquire);
                 let stashed = self.pending_frame.lock().unwrap().take();
-                let pending = match stashed {
-                    Some(pending) => pending,
+                let (requested_in, pending) = match stashed {
+                    Some(stashed) => stashed,
                     None => match self.state.lock().unwrap().as_ref() {
-                        Some(state) => state.display.request_frame()?,
+                        Some(state) => (generation, state.display.request_frame()?),
                         None => return Err(gst::FlowError::Eos),
                     },
                 };
                 match pending.wait_unless(&self.flushing) {
                     Err(gst::FlowError::Flushing) => {
-                        *self.pending_frame.lock().unwrap() = Some(pending);
+                        *self.pending_frame.lock().unwrap() = Some((requested_in, pending));
                         Err(gst::FlowError::Flushing)
                     }
-                    frame => frame,
+                    // Rendered for caps renegotiated away since: the reply has been taken, so
+                    // the compositor is satisfied; render a frame for the current caps.
+                    Ok(_) if requested_in != generation => Ok(None),
+                    frame => frame.map(Some),
                 }
             })?;
+            let Some(buffer) = buffer else {
+                continue;
+            };
             // dynamic-hdr: drained AFTER the frame. The compositor signals a change right
             // before it renders the first frame in the new state, so this is exactly the
             // state `buffer` was converted for.
@@ -1814,7 +1912,10 @@ impl WaylandDisplaySrc {
     /// mastering-display-info / content-light-level properties override either.
     fn p010_hdr_metadata(&self) -> Option<(String, String)> {
         let settings = self.settings.lock().unwrap();
-        let hdr = if settings.hdr_cm {
+        // A stable transport keeps the static output contract; only dynamic caps follow the
+        // live state and the game's own metadata.
+        let dynamic = settings.hdr_cm && !settings.stable_color_transport;
+        let hdr = if dynamic {
             self.hdr_active.load(Ordering::Relaxed)
         } else {
             settings.hdr
@@ -1825,7 +1926,7 @@ impl WaylandDisplaySrc {
         let peak = self.vulkan_share.conversion_options().hdr_peak_nits;
         let default_mastering = format!("{HDR_PRIMARIES}:{}:1", u64::from(peak) * 10000);
         let default_cll = format!("{peak}:{}", (peak * 2 / 5).max(1));
-        let (mastering, cll) = if settings.hdr_cm {
+        let (mastering, cll) = if dynamic {
             self.hdr_meta.lock().unwrap().clone()
         } else {
             (None, None)
@@ -1856,6 +1957,24 @@ impl WaylandDisplaySrc {
         p010.then_some(caps)
     }
 
+    /// Whether the negotiated output is NV12 (dmabuf or VulkanImage): converted here to an
+    /// 8-bit BT.601 SDR stream, so it can never carry HDR. Raw RGB output is not converted
+    /// here and carries each frame's transfer as `source_color` meta instead.
+    fn negotiated_nv12(&self) -> bool {
+        self.obj()
+            .src_pad()
+            .current_caps()
+            .and_then(|caps| {
+                let s = caps.structure(0)?;
+                Some(
+                    s.get::<&str>("format").ok() == Some("NV12")
+                        || s.get::<&str>("drm-format")
+                            .is_ok_and(|f| f == "NV12" || f.starts_with("NV12:")),
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Apply a compositor HDR-state change to the element: post the bus message on a
     /// transition and retag the P010 caps before the frame converted for the new state is
     /// pushed. Only the colour fields of the current caps change, so the format, size and
@@ -1870,7 +1989,31 @@ impl WaylandDisplaySrc {
     ) -> Result<bool, gst::FlowError> {
         let prev_hdr = self.hdr_active.swap(hdr, Ordering::Relaxed);
         let prev_meta = std::mem::replace(&mut *self.hdr_meta.lock().unwrap(), (mastering, cll));
+        if hdr && self.negotiated_nv12() {
+            // The NV12 stream stays SDR, so the host must not be told it went HDR (in either
+            // transport mode). Have the compositor stay SDR, tone-mapping the HDR content, and
+            // render a replacement frame converted for that state.
+            gst::warning!(
+                CAT,
+                imp = self,
+                "dynamic-hdr: negotiated output is NV12; staying SDR for this stream"
+            );
+            self.hdr_active.store(false, Ordering::Relaxed);
+            *self.hdr_meta.lock().unwrap() = (None, None);
+            if let Some(state) = self.state.lock().unwrap().as_ref() {
+                state.display.refuse_hdr();
+            }
+            return Ok(false);
+        }
+        if self.settings.lock().unwrap().stable_transport() {
+            // The caps stay fixed and every frame is converted for them; the host still
+            // hears about the source's state.
+            self.post_hdr_transition(prev_hdr, hdr);
+            return Ok(true);
+        }
         let Some(current) = self.negotiated_p010() else {
+            // Raw RGB output: the caps carry no colour to retag, and each frame says whether
+            // it is PQ (`source_color` meta).
             self.post_hdr_transition(prev_hdr, hdr);
             return Ok(true);
         };
@@ -3598,6 +3741,167 @@ mod tests {
         drop(unserviced);
     }
 
+    fn pq_structures(caps: &gst::Caps) -> usize {
+        caps.iter()
+            .filter(|s| {
+                s.get::<String>("colorimetry")
+                    .is_ok_and(|v| v == "bt2100-pq")
+            })
+            .count()
+    }
+
+    // stable-color-transport: the source's HDR state must not change the caps, which stay
+    // at the static hdr setting; the dynamic-caps default keeps following the state.
+    #[test]
+    fn stable_transport_keeps_the_caps_across_source_color_changes() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use gst_base::subclass::prelude::BaseSrcImpl;
+        use std::sync::atomic::Ordering;
+        test_init();
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("dynamic-hdr", true)
+            .property("vulkan", true)
+            .property("nv12", true)
+            .property("stable-color-transport", true)
+            .property("hdr", true)
+            .build();
+        let imp = src.imp();
+        let initial = BaseSrcImpl::caps(imp, None).unwrap();
+        assert!(pq_structures(&initial) > 0, "hdr=true transport is PQ");
+        for active in [false, true, false, true, false] {
+            imp.hdr_active.store(active, Ordering::Relaxed);
+            assert_eq!(BaseSrcImpl::caps(imp, None).unwrap(), initial);
+        }
+        src.set_property("hdr", false);
+        assert_eq!(pq_structures(&BaseSrcImpl::caps(imp, None).unwrap()), 0);
+    }
+
+    #[test]
+    fn dynamic_caps_follow_the_source_color_by_default() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use gst_base::subclass::prelude::BaseSrcImpl;
+        use std::sync::atomic::Ordering;
+        test_init();
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("dynamic-hdr", true)
+            .property("vulkan", true)
+            .property("nv12", true)
+            .property("hdr", true)
+            .build();
+        assert!(!src.property::<bool>("stable-color-transport"));
+        let imp = src.imp();
+        imp.hdr_active.store(false, Ordering::Relaxed);
+        assert_eq!(pq_structures(&BaseSrcImpl::caps(imp, None).unwrap()), 0);
+        imp.hdr_active.store(true, Ordering::Relaxed);
+        assert!(pq_structures(&BaseSrcImpl::caps(imp, None).unwrap()) > 0);
+    }
+
+    // stable-color-transport is snapshotted at start, like dynamic-hdr, and the start pins the
+    // converter's output state to the static hdr setting.
+    #[test]
+    fn stable_transport_pins_the_output_state_at_start() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        test_init();
+        let w = wedged_pipeline();
+        w.src.set_property("stable-color-transport", true);
+        assert!(!w.src.property::<bool>("stable-color-transport"));
+        assert_eq!(
+            w.src
+                .imp()
+                .vulkan_share
+                .conversion_options()
+                .stable_output_hdr,
+            None
+        );
+        w.pipeline.set_state(gst::State::Null).unwrap();
+        let (unserviced, owed_frames) = w.wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+        w.src.set_property("dynamic-hdr", true);
+        w.src.set_property("stable-color-transport", true);
+        w.src.set_property("hdr", true);
+        w.src.set_property("render-node", "software");
+        w.pipeline.set_state(gst::State::Playing).unwrap();
+        assert_eq!(
+            w.src
+                .imp()
+                .vulkan_share
+                .conversion_options()
+                .stable_output_hdr,
+            Some(true)
+        );
+        w.pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // A frame kept across a flush that was followed by a renegotiation was rendered for the old
+    // caps: its reply is still taken (the compositor must not be left owing it), but it is not
+    // pushed, and a frame for the new caps is requested instead.
+    #[test]
+    fn frame_kept_across_a_renegotiation_is_not_pushed() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        test_init();
+
+        let w = wedged_pipeline();
+        assert!(w.src.send_event(gst::event::FlushStart::new()));
+        wait_for("create() to keep its cancelled frame", || {
+            w.src.imp().pending_frame.lock().unwrap().is_some()
+        });
+        // What set_caps() does on a renegotiation while the frame is kept.
+        w.src.imp().caps_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(w.src.send_event(gst::event::FlushStop::new(true)));
+        wait_for("the restarted task to take the kept frame", || {
+            w.src.imp().pending_frame.lock().unwrap().is_none()
+        });
+
+        w.deliver.send(()).unwrap();
+        wait_for("a frame request for the new caps", || {
+            w.requests.load(Ordering::SeqCst) == 2
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            w.frames.load(Ordering::SeqCst),
+            0,
+            "the frame rendered for the old caps was pushed"
+        );
+        w.deliver.send(()).unwrap();
+        wait_for("the frame for the new caps to reach the sink", || {
+            w.frames.load(Ordering::SeqCst) == 1
+        });
+
+        w.pipeline.set_state(gst::State::Null).unwrap();
+        let (unserviced, owed_frames) = w.wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+    }
+
+    // dynamic-hdr is snapshotted by the compositor at start; a change while running would leave
+    // new converters disagreeing with it, so it only takes effect while stopped.
+    #[test]
+    fn dynamic_hdr_only_changes_while_stopped() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        test_init();
+
+        let w = wedged_pipeline();
+        w.src.set_property("dynamic-hdr", true);
+        assert!(!w.src.property::<bool>("dynamic-hdr"));
+        assert!(!w.src.imp().vulkan_share.conversion_options().hdr_cm);
+
+        w.pipeline.set_state(gst::State::Null).unwrap();
+        let (unserviced, owed_frames) = w.wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+        w.src.set_property("dynamic-hdr", true);
+        assert!(w.src.property::<bool>("dynamic-hdr"));
+        assert!(w.src.imp().vulkan_share.conversion_options().hdr_cm);
+    }
+
     // A pipeline stopped right after a flush cancelled create(), before any flush-stop, must tear
     // down promptly, drop the kept frame with the display, and start cleanly again.
     #[test]
@@ -3631,5 +3935,57 @@ mod tests {
         w.pipeline.set_state(gst::State::Playing).unwrap();
         assert_frames_flow(&w.frames, "restart after a cancelled teardown");
         w.pipeline.set_state(gst::State::Null).unwrap();
+    }
+}
+
+/// #80's own tests, unchanged.
+#[cfg(test)]
+mod color_transport_tests {
+    use super::*;
+    use gst::subclass::prelude::ObjectSubclassIsExt;
+
+    #[test]
+    fn stable_transport_keeps_p010_caps_across_source_color_changes() {
+        gst::init().unwrap();
+        let src: super::super::WaylandDisplaySrc = glib::Object::builder()
+            .property("dynamic-hdr", true)
+            .property("vulkan", true)
+            .property("nv12", true)
+            .property("stable-color-transport", true)
+            .property("hdr", true)
+            .build();
+        let imp = src.imp();
+        let initial = BaseSrcImpl::caps(imp, None).unwrap();
+        for active in [false, true, false, true, false] {
+            imp.hdr_active.store(active, Ordering::Relaxed);
+            let caps = BaseSrcImpl::caps(imp, None).unwrap();
+            assert_eq!(caps, initial);
+            assert!(caps.iter().any(|s| {
+                s.get::<String>("colorimetry")
+                    .is_ok_and(|v| v == "bt2100-pq")
+            }));
+        }
+        src.set_property("hdr", false);
+        assert!(!BaseSrcImpl::caps(imp, None).unwrap().iter().any(|s| {
+            s.get::<String>("colorimetry")
+                .is_ok_and(|v| v == "bt2100-pq")
+        }));
+    }
+
+    #[test]
+    fn existing_dynamic_caps_mode_is_unchanged_by_default() {
+        gst::init().unwrap();
+        let src: super::super::WaylandDisplaySrc = glib::Object::builder()
+            .property("dynamic-hdr", true)
+            .property("vulkan", true)
+            .property("nv12", true)
+            .property("hdr", true)
+            .build();
+        assert!(!src.property::<bool>("stable-color-transport"));
+        let imp = src.imp();
+        imp.hdr_active.store(false, Ordering::Relaxed);
+        let sdr = BaseSrcImpl::caps(imp, None).unwrap();
+        imp.hdr_active.store(true, Ordering::Relaxed);
+        assert_ne!(BaseSrcImpl::caps(imp, None).unwrap(), sdr);
     }
 }

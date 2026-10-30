@@ -99,8 +99,9 @@ fn new_display_works_while_a_detached_compositor_is_wedged() {
     let joining = Instant::now();
     drop(fresh);
     assert!(joining.elapsed() < Duration::from_secs(5));
-    assert!(
-        !fresh_socket.exists(),
-        "the joined compositor kept its socket"
-    );
+    // Drop joins within its bound; a compositor slower than that to exit (a loaded machine)
+    // is detached instead and removes its socket as it finishes.
+    wait_until("the dropped compositor released its socket", || {
+        !fresh_socket.exists()
+    });
 }

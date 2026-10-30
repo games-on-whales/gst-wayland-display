@@ -65,3 +65,11 @@ export PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PAT
 export RUSTFLAGS="-L /usr/local/lib/x86_64-linux-gnu -l gstcuda-1.0"
 cargo build -p gst-plugin-wayland-display --features cuda
 ```
+
+## Frame-local source color with a stable transport
+
+The devcontainer includes the CUDA converter patch from `patches/series`; use
+that patched GStreamer prefix when testing `stable-color-transport=true`.
+A distribution's unpatched `cudaconvertscale` does not consume the frame color
+contract. See [the contract and validation boundary](patches/README.md#gstreamer-cuda-frame-colorpatch).
+The existing dynamic-caps mode remains the default.

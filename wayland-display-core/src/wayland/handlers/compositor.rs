@@ -1,6 +1,7 @@
 use smithay::{
     backend::allocator::{Buffer as _, Fourcc},
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::egl::fence::EGLFence,
+    backend::renderer::{gles::GlesRenderer, utils::on_commit_buffer_handler},
     delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
     reexports::{
@@ -19,13 +20,41 @@ use smithay::{
             SurfaceAttributes, add_blocker, add_pre_commit_hook, with_states,
         },
         dmabuf::get_dmabuf,
-        drm_syncobj::DrmSyncobjCachedState,
+        drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState},
         seat::WaylandFocus,
         shell::xdg::{SurfaceCachedState, XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
 };
 
 use crate::comp::{ClientState, FocusTarget, State};
+
+/// Order the renderer's GL context after the client's explicit-sync acquire point by
+/// inserting its fence into the context's command stream (`eglWaitSync`), so every later
+/// read of the buffer -- including through a cached EGLImage, which on some drivers (NVIDIA)
+/// is otherwise not ordered after the client's rendering -- waits for it on the GPU.
+///
+/// Called once the commit blocker saw the point signal, so the inserted wait is already
+/// satisfied: frames never wait on a client's in-flight rendering (the render is CPU-waited
+/// in `create_frame`, which would otherwise couple the compositor's pacing and input to the
+/// slowest client). Never waits on the CPU itself, unlike `Renderer::wait`, which falls back
+/// to an unbounded CPU wait. Best effort: `false` when the fence cannot be imported.
+fn wait_on_gpu(renderer: &GlesRenderer, acquire_point: &DrmSyncPoint) -> bool {
+    let display = renderer.egl_context().display();
+    if !EGLFence::supports_importing(display) {
+        return false;
+    }
+    let Ok(sync_file) = acquire_point.export_sync_file() else {
+        return false;
+    };
+    let Ok(fence) = EGLFence::import(display, sync_file) else {
+        return false;
+    };
+    // SAFETY: the compositor thread owns this renderer's context; this only binds it.
+    if unsafe { renderer.egl_context().make_current() }.is_err() {
+        return false;
+    }
+    fence.wait(display).is_ok()
+}
 
 /// Dynamic-HDR diagnostic: log the fourcc (and modifier) of the dmabuf a client just
 /// committed to `surface`, so we can see what pixel format an HDR game actually submits
@@ -136,11 +165,13 @@ impl CompositorHandler for State {
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
-                // Explicit sync: block the commit on the client's acquire timeline point.
+                // Explicit sync: block the commit until the client's acquire timeline point
+                // signals, then order the GL context after it as well (see `wait_on_gpu`).
                 if let Some(acquire_point) = acquire_point {
                     if let Ok((blocker, source)) = acquire_point.generate_blocker() {
                         if let Some(client) = surface.client() {
                             let res = state.handle.insert_source(source, move |_, _, data| {
+                                wait_on_gpu(&data.renderer, &acquire_point);
                                 let dh = data.dh.clone();
                                 data.client_compositor_state(&client)
                                     .blocker_cleared(data, &dh);

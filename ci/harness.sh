@@ -135,6 +135,19 @@ feature_args() {
   esac
 }
 
+# The Vulkan video element `vulkan<codec><role>` (e.g. h264enc) on the GPU behind a
+# render node. Only the first Vulkan device gets the plain name; the others register
+# as vulkan<codec>device<N><role>, with the device name at the end of the long name.
+vulkan_element() { # vulkan_element <h264enc|...> <render node>
+  local kind="$1" node="$2" vendor codec role
+  case "$(cat "/sys/class/drm/$(basename "$node")/device/vendor" 2>/dev/null)" in
+    0x10de) vendor=NVIDIA;; 0x1002) vendor=AMD;; 0x8086) vendor=Intel;; *) return 1;;
+  esac
+  codec="${kind%???}"; role="${kind: -3}"
+  gst-inspect-1.0 vulkan 2>/dev/null \
+    | sed -nE "s/^ *(vulkan${codec}(device[0-9]+)?${role}): .* on ${vendor}.*/\1/p" | head -1 | grep .
+}
+
 # gst-inspect against the freshly built plugin
 PLUGIN_DIR="$ROOT/target/$TARGET_SUBDIR"
 ginspect() { GST_PLUGIN_PATH="$PLUGIN_DIR" gst-inspect-1.0 "$1" >/dev/null 2>&1; }
@@ -155,7 +168,7 @@ phase_detect() {
   if command -v gst-inspect-1.0 >/dev/null; then
     echo "  encoders        :"
     local e
-    for e in vah265enc vah265lpenc nvh265enc vulkanh265enc vulkanh264enc dmabuftocuda; do
+    for e in vah265enc vah265lpenc nvh265enc vulkanh265enc vulkanh264enc; do
       gst-inspect-1.0 "$e" >/dev/null 2>&1 && echo "      $e"
     done
   fi
@@ -172,13 +185,16 @@ phase_lint() {
 }
 
 phase_build() {
-  sh_run "$CARGO" build --profile "$([[ $PROFILE == dev ]] && echo dev || echo release)" \
-    -p gst-plugin-wayland-display $(feature_args) || return 1
+  local profile; profile="$([[ $PROFILE == dev ]] && echo dev || echo release)"
   # always also prove the default (non-cuda) build compiles, so a cfg-gated
-  # caller can't rot unnoticed (this exact class of break shipped once).
+  # caller can't rot unnoticed (this exact class of break shipped once). Build it
+  # first: both write the same plugin library, and the integration phase must load
+  # the selected feature set (CUDA output only exists in the cuda build).
   if [[ -n "$(feature_args)" ]]; then
-    sh_run "$CARGO" build -p gst-plugin-wayland-display || return 1
+    sh_run "$CARGO" build --profile "$profile" -p gst-plugin-wayland-display || return 1
   fi
+  sh_run "$CARGO" build --profile "$profile" \
+    -p gst-plugin-wayland-display $(feature_args)
 }
 
 phase_unit() {
@@ -200,7 +216,7 @@ phase_gpu() {
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
   log "  GPU-gated Rust tests on $node"
   NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
-    sh_run "$CARGO" test --workspace $(feature_args) \
+    sh_run "$CARGO" test --workspace --no-fail-fast $(feature_args) \
       $([[ $PROFILE == release ]] && echo --release) -- --ignored
 }
 
@@ -247,24 +263,24 @@ phase_integration() {
     LIBVA_DRIVER_NAME=iHD run_to_eos "intel:vah265lpenc" \
       waylanddisplaysrc render-node="$node" num-buffers=30 ! vah265lpenc ! fakesink || ok=0
   fi
-  # Nvidia: NV12 dmabuf -> CUDA -> NVENC (needs the cuda feature build + nvcodec).
+  # Nvidia: the source's CUDA output straight into NVENC (needs the cuda feature
+  # build + nvcodec).
   if [[ -n "${NODE_FOR_VENDOR[nvidia]:-}" ]] && gst-inspect-1.0 nvh265enc >/dev/null 2>&1 \
-     && ginspect dmabuftocuda; then
+     && GST_PLUGIN_PATH="$PLUGIN_DIR" gst-inspect-1.0 waylanddisplaysrc 2>/dev/null \
+       | grep -q 'memory:CUDAMemory'; then
     node="${NODE_FOR_VENDOR[nvidia]}"
     ran=1
     run_to_eos "nvidia:nvh265enc" waylanddisplaysrc render-node="$node" num-buffers=30 \
-      ! "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,$res" \
-      ! dmabuftocuda render-node="$node" ! nvh265enc ! fakesink || ok=0
+      ! "video/x-raw(memory:CUDAMemory),$res" ! nvh265enc ! fakesink || ok=0
   fi
-  # Vulkan encode (any vendor with vulkanh264enc): the source harvests the
+  # Vulkan encode (any vendor with a Vulkan H.264 encoder): the source harvests the
   # encoder's GstVulkanDevice and hands it a shared-device NV12 memory:VulkanImage.
-  if gst-inspect-1.0 vulkanh264enc >/dev/null 2>&1; then
-    node="${FORCE_NODE:-${NODE_FOR_VENDOR[nvidia]:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-}}}}"
-    if [[ -n "$node" ]]; then
-      ran=1
-      run_to_eos "vulkan:vulkanh264enc" waylanddisplaysrc render-node="$node" vulkan=true \
-        num-buffers=30 ! vulkanh264enc ! fakesink || ok=0
-    fi
+  local enc
+  node="${FORCE_NODE:-${NODE_FOR_VENDOR[nvidia]:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-}}}}"
+  if [[ -n "$node" ]] && enc="$(vulkan_element h264enc "$node")"; then
+    ran=1
+    run_to_eos "vulkan:$enc" waylanddisplaysrc render-node="$node" vulkan=true \
+      num-buffers=30 ! "$enc" ! fakesink || ok=0
   fi
   if [[ $ran -eq 0 && -n "${GST_WAYLAND_DISPLAY_REQUIRE_GPU:-}" ]]; then
     err "no compatible GPU encoder integration ran"; return 1
@@ -280,7 +296,7 @@ phase_bench() {
   if git apply --check benchmark/conv-timing.patch 2>/dev/null; then
     git apply benchmark/conv-timing.patch && applied=1
   else
-    warn "conv-timing.patch does not apply cleanly; skipping bench"; return 0
+    err "benchmark/conv-timing.patch does not apply cleanly; rebase it onto the allocator"; return 1
   fi
   sh_run "$CARGO" build -p gst-plugin-wayland-display $(feature_args) || { [[ $applied -eq 1 ]] && git apply -R benchmark/conv-timing.patch; return 1; }
 
@@ -288,7 +304,7 @@ phase_bench() {
   for v in amd intel nvidia; do
     node="${NODE_FOR_VENDOR[$v]:-}"; [[ -n "$node" ]] || continue
     case "$v" in
-      nvidia) tail="dmabuftocuda render-node=$node ! nvh265enc ! fakesink sync=false"; export DRM_FORMAT=NV12;;
+      nvidia) tail="fakesink sync=false"; export DRM_FORMAT=NV12;;
       intel)  tail="vah265lpenc ! fakesink sync=false"; unset DRM_FORMAT;;
       amd)    tail="vah265enc ! fakesink sync=false"; unset DRM_FORMAT;;
     esac

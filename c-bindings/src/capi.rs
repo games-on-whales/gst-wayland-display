@@ -3,7 +3,9 @@
 //! Safety contract for every function taking a pointer: `dpy`/`wd` is NULL or a pointer returned
 //! by `display_init` that has not been passed to `display_finish`; string arguments are NULL or
 //! NUL-terminated; output arrays hold at least `max_len` slots. A NULL display is logged and
-//! ignored rather than dereferenced, since NULL is `display_init`'s failure return.
+//! ignored rather than dereferenced, since NULL is `display_init`'s failure return. Calls on
+//! one display must not overlap: a caller using it from several threads (input and frames,
+//! say) serializes them with its own lock. Separate displays are independent.
 #![allow(clippy::missing_safety_doc)] // covered by the module-level contract above
 
 use gst::ffi::GstBuffer;
@@ -14,6 +16,9 @@ use std::ffi::{c_char, c_uint, c_void, CStr, CString};
 use std::ptr;
 use waylanddisplaycore::{Tracer, WaylandDisplay};
 
+/// Starts a compositor on `render_node` (NULL: the default node) and returns its display, or
+/// NULL if it failed to come up. Calls on the returned display must not overlap; serialize
+/// them when using it from several threads.
 #[no_mangle]
 pub unsafe extern "C" fn display_init(render_node: *const c_char) -> *mut WaylandDisplay {
     let render_node = if !render_node.is_null() {

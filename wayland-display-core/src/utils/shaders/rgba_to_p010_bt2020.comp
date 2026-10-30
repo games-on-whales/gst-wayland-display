@@ -76,7 +76,13 @@ vec3 sdr_to_pq(vec3 srgb) {
 //   Y  = 16/255  + (219/255) * (Kr*R + Kg*G + Kb*B)
 //   Cb = 128/255 + (224/255) * (B - Y') / (2*(1-Kb))
 //   Cr = 128/255 + (224/255) * (R - Y') / (2*(1-Kr))
-float luma(vec3 c) { return 0.2256 * c.r + 0.5823 * c.g + 0.0509 * c.b + 0.0627; }
+// Exact 10-bit limited-range code -> r16 UNORM value whose top 10 bits are that code and
+// whose low 6 bits are zero (P010 stores code << 6). Normalizing by the 8-bit range limits
+// instead would give floor(f * 1023.98): white at 943, not 940, and truncation everywhere.
+// The +0.25 keeps the result exact whichever way the float -> unorm store rounds.
+float p010(float code) { return (clamp(round(code), 0.0, 1023.0) * 64.0 + 0.25) / 65535.0; }
+const vec3 KY = vec3(0.2627, 0.6780, 0.0593); // BT.2020 luma weights
+float luma(vec3 c) { return p010(64.0 + 876.0 * dot(c, KY)); }
 
 void main() {
     ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
@@ -94,7 +100,8 @@ void main() {
     imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
 
     vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average (PQ-encoded R'G'B')
-    float cb = -0.1227 * a.r - 0.3166 * a.g + 0.4392 * a.b + 0.5;
-    float cr =  0.4392 * a.r - 0.4039 * a.g - 0.0353 * a.b + 0.5;
+    float ya = dot(a, KY);
+    float cb = p010(512.0 + 896.0 * (a.b - ya) / 1.8814);
+    float cr = p010(512.0 + 896.0 * (a.r - ya) / 1.4746);
     imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
 }

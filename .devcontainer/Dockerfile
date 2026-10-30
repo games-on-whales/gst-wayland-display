@@ -91,6 +91,7 @@ RUN git clone --depth 1 --branch ${GST_VERSION} \
          -Dgst-plugins-base:videotestsrc=enabled -Dgst-plugins-base:videoconvertscale=enabled \
          -Dgst-plugins-base:playback=enabled -Dgst-plugins-base:drm=enabled \
          -Dgst-plugins-bad:vulkan=enabled -Dgst-plugins-bad:vulkan-video=enabled \
+         -Dgst-plugins-bad:nvcodec=enabled \
          -Dgst-plugins-bad:videoparsers=enabled -Dgst-plugins-bad:wayland=enabled \
          -Dorc=disabled -Ddoc=disabled -Dgtk_doc=disabled \
          -Dintrospection=disabled -Dexamples=disabled -Dtests=disabled \

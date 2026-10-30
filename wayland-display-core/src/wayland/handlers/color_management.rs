@@ -37,7 +37,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
     Weak as WlWeak, backend::ClientId, protocol::wl_surface::WlSurface,
 };
-use smithay::wayland::compositor::{Cacheable, with_states};
+use smithay::wayland::compositor::{Cacheable, SurfaceData, with_states};
 
 use crate::comp::State;
 pub use crate::utils::color::ContentTransfer;
@@ -114,6 +114,10 @@ impl MasteringDisplayInfo {
     }
 }
 
+/// A surface's `(mastering-display-info, content-light-level)` gst caps strings; `None` in
+/// either field leaves the producer's default for it.
+pub type HdrMeta = (Option<String>, Option<String>);
+
 /// Protocol-neutral per-`wl_surface` HDR colour state. Written by BOTH the standard
 /// `wp_color_management_v1` handler (used by sway) via [`set_surface_hdr_color`] and the
 /// `frog_color_management_v1` handler (used by gamescope, in
@@ -141,16 +145,19 @@ impl SurfaceHdrColor {
         self.transfer != ContentTransfer::Sdr
     }
 
-    /// The `(mastering-display-info, content-light-level)` gst caps strings, iff the client
-    /// supplied mastering metadata. `None` => the producer keeps its hardcoded HDR defaults.
-    pub fn mastering_caps(&self) -> Option<(String, String)> {
-        let mdi = self.mastering.as_ref()?.to_caps_string();
-        let cll = format!(
-            "{}:{}",
-            self.max_cll.unwrap_or(0),
-            self.max_fall.unwrap_or(0)
-        );
-        Some((mdi, cll))
+    /// The `(mastering-display-info, content-light-level)` gst caps strings the client
+    /// supplied, each independently: `None` in either keeps the producer's default for it, and
+    /// `None` overall means the client supplied neither.
+    pub fn mastering_caps(&self) -> Option<HdrMeta> {
+        let mdi = self.mastering.as_ref().map(|m| m.to_caps_string());
+        let cll = (self.max_cll.is_some() || self.max_fall.is_some()).then(|| {
+            format!(
+                "{}:{}",
+                self.max_cll.unwrap_or(0),
+                self.max_fall.unwrap_or(0)
+            )
+        });
+        (mdi.is_some() || cll.is_some()).then_some((mdi, cll))
     }
 
     /// Build from a resolved `wp_color_management_v1` image description, converting its
@@ -311,20 +318,43 @@ impl Cacheable for HdrColorState {
     }
 }
 
-/// The active toplevel's declared color state. Preserve the legacy 10-bit PQ fallback
-/// for clients without a declaration; an explicit declaration (including SDR) wins.
-/// Do not infer a whole frame's transfer from an arbitrary subsurface: the renderer
-/// has not converted mixed SDR/PQ surfaces into a common working space.
+/// A surface's current declared color state. Preserve the legacy 10-bit PQ fallback for
+/// clients without a declaration; an explicit declaration (including SDR) wins.
 pub fn surface_hdr_color(surface: &WlSurface) -> Option<SurfaceHdrColor> {
-    with_states(surface, |states| {
-        let mut cache = states.cached_state.get::<HdrColorState>();
-        let current = cache.current();
-        current.color.clone().or_else(|| {
-            current.legacy_pq.then(|| SurfaceHdrColor {
-                transfer: ContentTransfer::Pq,
-                is_bt2020: true,
-                ..Default::default()
-            })
+    with_states(surface, surface_data_hdr_color)
+}
+
+/// The HDR colour state a surface in a tree traversal *declares*, if it is visible (holds a
+/// buffer) and declares HDR content. An unmapped subsurface keeping an old PQ declaration
+/// must not turn the output HDR. The legacy 10-bit guess is not applied here: 10-bit SDR
+/// exists, so it only stands for the active window's root ([`surface_hdr_color`]).
+pub fn surface_data_visible_hdr(states: &SurfaceData) -> Option<SurfaceHdrColor> {
+    use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+    let has_buffer = states
+        .data_map
+        .get::<RendererSurfaceStateUserData>()
+        .is_some_and(|state| state.lock().unwrap().buffer().is_some());
+    if !has_buffer {
+        return None;
+    }
+    let mut cache = states.cached_state.get::<HdrColorState>();
+    cache
+        .current()
+        .color
+        .clone()
+        .filter(SurfaceHdrColor::is_hdr)
+}
+
+/// [`surface_hdr_color`] for surface data already borrowed by a surface-tree traversal
+/// (`Window::with_surfaces`), where calling `with_states` again would re-lock the tree.
+pub fn surface_data_hdr_color(states: &SurfaceData) -> Option<SurfaceHdrColor> {
+    let mut cache = states.cached_state.get::<HdrColorState>();
+    let current = cache.current();
+    current.color.clone().or_else(|| {
+        current.legacy_pq.then(|| SurfaceHdrColor {
+            transfer: ContentTransfer::Pq,
+            is_bt2020: true,
+            ..Default::default()
         })
     })
 }
@@ -335,7 +365,7 @@ pub fn surface_is_hdr(surface: &WlSurface) -> bool {
 }
 
 /// Compatibility accessor for the active surface's mastering metadata.
-pub fn surface_mastering_caps(surface: &WlSurface) -> Option<(String, String)> {
+pub fn surface_mastering_caps(surface: &WlSurface) -> Option<HdrMeta> {
     surface_hdr_color(surface).and_then(|color| color.mastering_caps())
 }
 
@@ -374,6 +404,19 @@ pub fn stage_legacy_hdr_buffer(surface: &WlSurface) {
             .get::<HdrColorState>()
             .pending()
             .legacy_pq = pq;
+    });
+}
+
+/// Stage the legacy 10-bit PQ guess on `surface` for its next commit, as an undeclared
+/// 10-bit dmabuf would.
+#[cfg(test)]
+pub(crate) fn stage_legacy_pq_for_tests(surface: &WlSurface) {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<HdrColorState>()
+            .pending()
+            .legacy_pq = true;
     });
 }
 
@@ -902,6 +945,31 @@ mod compatibility_tests {
         assert!(
             surface_is_hdr(&surface),
             "clearing the declaration restores legacy detection"
+        );
+    }
+
+    #[test]
+    fn content_light_level_is_kept_without_mastering_metadata() {
+        let pq = |mastering, max_cll, max_fall| SurfaceHdrColor {
+            transfer: ContentTransfer::Pq,
+            is_bt2020: true,
+            mastering,
+            max_cll,
+            max_fall,
+        };
+        assert_eq!(pq(None, None, None).mastering_caps(), None);
+        assert_eq!(
+            pq(None, Some(800), Some(300)).mastering_caps(),
+            Some((None, Some("800:300".into())))
+        );
+        let mastering = MasteringDisplayInfo {
+            primaries: [1, 2, 3, 4, 5, 6, 7, 8],
+            max_luminance: 10_000_000,
+            min_luminance: 50,
+        };
+        assert_eq!(
+            pq(Some(mastering), None, None).mastering_caps(),
+            Some((Some("1:2:3:4:5:6:7:8:10000000:50".into()), None))
         );
     }
 }

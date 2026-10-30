@@ -71,7 +71,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
 use smithay::reexports::drm::buffer::DrmFourcc;
 use std::os::fd::{AsFd, AsRawFd, IntoRawFd, RawFd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 const RGBA_TO_NV12_SPV: &[u8] = include_bytes!("shaders/rgba_to_nv12.spv");
 const RGBA_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010.spv");
@@ -101,14 +101,26 @@ const RGBA_PQPASS_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_pqpass_to_p0
 /// declares PQ content. Tone-maps instead of showing
 /// HDR code values as gamma.
 const RGBA_HDR_TO_P010_SDR_SPV: &[u8] = include_bytes!("shaders/rgba_hdr_to_p010_sdr.spv");
+/// HDR content -> SDR BT.601 NV12 (dynamic HDR): the NV12 sibling of
+/// [`RGBA_HDR_TO_P010_SDR_SPV`]. NV12 output never goes HDR, but an HDR client can still
+/// declare PQ content on it; this tone-maps that content instead of showing it washed out.
+const RGBA_HDR_TO_NV12_SDR_SPV: &[u8] = include_bytes!("shaders/rgba_hdr_to_nv12_sdr.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
 // Ring depth: slots cycled to pipeline convert+encode (array sizing + default active depth).
 // 4 is enough fan-out for the downstream encoder's buffer references (1 starves; 4 and 8 are
-// indistinguishable in practice). The per-element `ring-depth` property (1..=RING) overrides
-// this default before the converter is created.
+// indistinguishable in practice). The per-element `ring-depth` property overrides this
+// default before the converter is created, clamped to MIN_RING..=RING.
 const RING: usize = 4;
+/// A slot is only reused once downstream released it, and a busy ring re-emits the latest
+/// output; with one slot, anything holding the latest buffer (a sink's last-sample, a queue,
+/// an encoder's one frame of latency) would pin it and freeze the stream on one frame.
+const MIN_RING: usize = 2;
+
+fn ring_depth(options: &ConversionOptions) -> usize {
+    options.ring_depth.clamp(MIN_RING, RING)
+}
 
 /// Optional path for a one-shot debug dump of the converter's NV12 output (the LINEAR
 /// compute scratch, *before* the tiled copy) as raw NV12. Set
@@ -234,7 +246,12 @@ struct DmaBufImportSyncFile {
     flags: u32,
     fd: i32,
 }
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
+/// How long a colorimetry transition may wait, in total, for a free encode-src slot before
+/// it degrades to the busy-ring behaviour (re-emit the previous output) instead of stalling
+/// the compositor thread or ending the stream.
+const TRANSITION_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 /// `_IOW('b', 3, struct dma_buf_import_sync_file)` from `<linux/dma-buf.h>`.
 const fn iow(ty: u32, nr: u32, size: u32) -> libc::c_ulong {
     ((1u32 << 30) | (size << 16) | (ty << 8) | nr) as libc::c_ulong
@@ -264,6 +281,18 @@ unsafe fn pick_physical_device(
     let devices = instance.enumerate_physical_devices().ok()?;
     if let Some(minor) = target_minor {
         let matched = devices.iter().copied().find(|&d| {
+            // PhysicalDeviceDrmPropertiesEXT may only be chained when the device exposes
+            // VK_EXT_physical_device_drm.
+            let has_drm = instance
+                .enumerate_device_extension_properties(d)
+                .is_ok_and(|exts| {
+                    exts.iter().any(|e| {
+                        e.extension_name_as_c_str() == Ok(ash::ext::physical_device_drm::NAME)
+                    })
+                });
+            if !has_drm {
+                return false;
+            }
             let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
             instance.get_physical_device_properties2(d, &mut p2);
@@ -281,7 +310,8 @@ unsafe fn pick_physical_device(
     devices.first().copied()
 }
 
-/// DRM modifiers `target_minor`'s GPU can export NV12 with (queried once per GPU, cached).
+/// DRM modifiers `target_minor`'s GPU can export NV12 with (queried once per GPU, cached;
+/// a failed query is retried a few seconds later rather than cached as "no modifiers").
 /// The source advertises all of these so caps negotiation lands on a modifier the encoder
 /// also accepts -- the converter then exports that exact modifier (LINEAR directly, tiled
 /// via a transfer copy), so no LINEAR-vs-tiled mismatch and no guessing.
@@ -297,21 +327,33 @@ pub fn supported_p010_modifiers(target_minor: Option<u32>) -> &'static [u64] {
 }
 
 fn supported_modifiers(target_minor: Option<u32>, fmt: PixFmt) -> &'static [u64] {
-    static CACHE: OnceLock<Mutex<Vec<(Option<u32>, PixFmt, &'static [u64])>>> = OnceLock::new();
+    /// A failed probe is retried after this long: it may be transient, but caps queries are
+    /// frequent and each probe creates a Vulkan instance under the cache lock.
+    const RETRY_FAILED: std::time::Duration = std::time::Duration::from_secs(5);
+    type Probe = Result<&'static [u64], std::time::Instant>;
+    static CACHE: OnceLock<Mutex<Vec<(Option<u32>, PixFmt, Probe)>>> = OnceLock::new();
     let mut guard = CACHE.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
-    if let Some((_, _, mods)) = guard
+    let cached = guard
         .iter()
-        .find(|(m, f, _)| *m == target_minor && *f == fmt)
-    {
-        return mods;
+        .position(|(m, f, _)| *m == target_minor && *f == fmt);
+    match cached.map(|i| guard[i].2) {
+        Some(Ok(mods)) => return mods,
+        Some(Err(failed_at)) if failed_at.elapsed() < RETRY_FAILED => return &[],
+        _ => {}
     }
-    let mods = unsafe { query_modifiers(target_minor, fmt.image_format()) }.unwrap_or_default();
-    let leaked: &'static [u64] = Box::leak(mods.into_boxed_slice());
-    guard.push((target_minor, fmt, leaked));
-    leaked
+    let probe = match unsafe { query_modifiers(target_minor, fmt.image_format()) } {
+        Some(mods) => Ok(&*Box::leak(mods.into_boxed_slice())),
+        None => Err(std::time::Instant::now()),
+    };
+    match cached {
+        Some(i) => guard[i].2 = probe,
+        None => guard.push((target_minor, fmt, probe)),
+    }
+    probe.unwrap_or(&[])
 }
 
 unsafe fn query_modifiers(target_minor: Option<u32>, format: vk::Format) -> Option<Vec<u64>> {
+    crate::utils::renderer::keep_vulkan_drivers_loaded();
     let entry = ash::Entry::load().ok()?;
     let instance = entry
         .create_instance(
@@ -320,7 +362,10 @@ unsafe fn query_modifiers(target_minor: Option<u32>, format: vk::Format) -> Opti
             None,
         )
         .ok()?;
-    let pd = pick_physical_device(&instance, target_minor)?;
+    let Some(pd) = pick_physical_device(&instance, target_minor) else {
+        instance.destroy_instance(None);
+        return None;
+    };
     let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
     let mut p2 = vk::FormatProperties2::default().push_next(&mut list);
     instance.get_physical_device_format_properties2(pd, format, &mut p2);
@@ -337,17 +382,157 @@ unsafe fn query_modifiers(target_minor: Option<u32>, format: vk::Format) -> Opti
     // set (incl. AMD DCC): gst negotiation picks the encoder's preferred modifier, and on
     // every GPU tested it lands on LINEAR/Y-tiled when the encoder offers it; on a GPU
     // whose encoder *only* accepts DCC (RX 9070 / GFX12), DCC is the sole option, so we
-    // must not drop it or negotiation fails outright.
+    // must not drop it or negotiation fails outright. Only modifiers with exactly the two
+    // format planes as memory planes, though: the export describes planes 0 and 1 only, so a
+    // modifier with extra metadata planes (GFX9-11 DCC, Intel CCS) would reach the consumer
+    // with an incomplete layout.
     let mods = props
         .iter()
         .filter(|m| {
-            m.drm_format_modifier_tiling_features
-                .contains(vk::FormatFeatureFlags::TRANSFER_DST)
+            m.drm_format_modifier_plane_count == 2
+                && m.drm_format_modifier_tiling_features
+                    .contains(vk::FormatFeatureFlags::TRANSFER_DST)
         })
         .map(|m| m.drm_format_modifier)
         .collect();
     instance.destroy_instance(None);
     Some(mods)
+}
+
+/// The physical device matching `target_minor` and a logical device on it with the
+/// converter's extensions. Nothing is left to free on failure (the caller owns `instance`).
+struct OpenedDevice {
+    pd: vk::PhysicalDevice,
+    device: ash::Device,
+    qfi: u32,
+    /// The device can export a submit's signal as a SYNC_FD (and is not Nvidia), so the
+    /// converter pipelines through dmabuf fences instead of blocking.
+    implicit_sync: bool,
+    queue_family_foreign: bool,
+}
+
+unsafe fn open_device(instance: &ash::Instance, target_minor: u32) -> Result<OpenedDevice, Err> {
+    // Match by DRM render/primary minor (VK_EXT_physical_device_drm); warns and falls
+    // back to the first device if no driver reports a matching node.
+    let pd = pick_physical_device(instance, Some(target_minor)).ok_or("no vulkan device")?;
+
+    // Implicit dma-buf sync (kernel write-fence on the export buffer) is honored by
+    // the VA consumer on AMD/Intel but not by CUDA on Nvidia -- so only pipeline
+    // without a CPU stall when the selected device is not Nvidia.
+    let dev_props = instance.get_physical_device_properties(pd);
+    let implicit_sync = dev_props.vendor_id != VENDOR_NVIDIA;
+    tracing::debug!(
+        "VulkanNv12: vendor={:#x} implicit_sync(pipelined)={implicit_sync}",
+        dev_props.vendor_id
+    );
+
+    // We export exactly the negotiated modifier (the caps layer already picked one the
+    // encoder imports -- LINEAR for the interpipe/vapostproc path, the encoder's own
+    // modifier for a direct `! vah265enc`). No env-gated override.
+
+    let qfi = instance
+        .get_physical_device_queue_family_properties(pd)
+        .iter()
+        .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+        .ok_or("no compute queue")? as u32;
+    let prio = [1.0f32];
+    let qci = [vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(qfi)
+        .queue_priorities(&prio)];
+    // Only enable what the device supports: required extensions fail the converter with
+    // a clear error, optional ones degrade (blocking fence wait, EXTERNAL family).
+    let available: Vec<std::ffi::CString> = instance
+        .enumerate_device_extension_properties(pd)?
+        .iter()
+        .filter_map(|e| e.extension_name_as_c_str().ok().map(|n| n.to_owned()))
+        .collect();
+    let has = |name: &std::ffi::CStr| available.iter().any(|a| a.as_c_str() == name);
+    let mut exts = Vec::new();
+    for name in [
+        ash::khr::external_memory_fd::NAME,
+        ash::ext::external_memory_dma_buf::NAME,
+        ash::ext::image_drm_format_modifier::NAME,
+    ] {
+        if !has(name) {
+            return Err(format!("Vulkan device lacks {name:?}").into());
+        }
+        exts.push(name.as_ptr());
+    }
+    // Needed to export the submit's signal as a SYNC_FD we attach to the dmabuf; without
+    // it the converter blocks on its fence like the Nvidia path.
+    let implicit_sync = implicit_sync && has(ash::khr::external_semaphore_fd::NAME);
+    if implicit_sync {
+        exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+    }
+    let queue_family_foreign = has(ash::ext::queue_family_foreign::NAME);
+    if queue_family_foreign {
+        exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());
+    }
+    let mut supported_ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_ycbcr);
+    instance.get_physical_device_features2(pd, &mut features);
+    let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+        .sampler_ycbcr_conversion(supported_ycbcr.sampler_ycbcr_conversion != 0);
+    let device = instance.create_device(
+        pd,
+        &vk::DeviceCreateInfo::default()
+            .queue_create_infos(&qci)
+            .enabled_extension_names(&exts)
+            .push_next(&mut ycbcr),
+        None,
+    )?;
+    Ok(OpenedDevice {
+        pd,
+        device,
+        qfi,
+        implicit_sync,
+        queue_family_foreign,
+    })
+}
+
+/// A converter's own instance and device, returned when the converter drops so the next
+/// converter on the same GPU (the next session, or this one after a renegotiation) reuses
+/// them instead of destroying and recreating them.
+///
+/// Destroying a device is not safe in a process that renders with NVIDIA's EGL:
+/// `vkDestroyDevice` holds a driver lock while it joins the device's worker thread, the
+/// worker's exit waits on a driver mutex that a thread inside an EGL call (any session's
+/// compositor) holds, and that thread waits on the destroy's lock. The core GPU tests hung
+/// in about 1 run in 120 on a 615.71 driver; reused devices are never destroyed.
+struct PooledDevice {
+    minor: u32,
+    entry: ash::Entry,
+    instance: ash::Instance,
+    opened: OpenedDevice,
+}
+
+static DEVICE_POOL: Mutex<Vec<PooledDevice>> = Mutex::new(Vec::new());
+
+/// An idle device for `target_minor` from the pool, or a new one.
+unsafe fn take_device(target_minor: u32) -> Result<(ash::Entry, ash::Instance, OpenedDevice), Err> {
+    crate::utils::renderer::keep_vulkan_drivers_loaded();
+    let pooled = {
+        let mut pool = DEVICE_POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.iter()
+            .position(|d| d.minor == target_minor)
+            .map(|i| pool.swap_remove(i))
+    };
+    if let Some(d) = pooled {
+        return Ok((d.entry, d.instance, d.opened));
+    }
+    let entry = ash::Entry::load()?;
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+    let instance = entry.create_instance(
+        &vk::InstanceCreateInfo::default().application_info(&app),
+        None,
+    )?;
+    match open_device(&instance, target_minor) {
+        Ok(opened) => Ok((entry, instance, opened)),
+        Err(e) => {
+            instance.destroy_instance(None);
+            Err(e)
+        }
+    }
 }
 
 /// Map a compositor RGBA dmabuf fourcc to the Vulkan format used for the import.
@@ -396,6 +581,26 @@ struct Nv12Out {
     in_flight: bool,
 }
 
+impl Nv12Out {
+    /// A slot with nothing created yet (null handles, no export fd), filled in place.
+    fn empty() -> Self {
+        Nv12Out {
+            image: vk::Image::null(),
+            mem: vk::DeviceMemory::null(),
+            buffer: GstBuffer::new(),
+            export_fd: -1,
+            scratch: None,
+            y_view: vk::ImageView::null(),
+            uv_view: vk::ImageView::null(),
+            cmd: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            desc_set: vk::DescriptorSet::null(),
+            import: None,
+            in_flight: false,
+        }
+    }
+}
+
 /// Owns the Vulkan device, the compute pipeline, and the NV12 export ring.
 pub struct VulkanNv12 {
     _entry: ash::Entry,
@@ -412,7 +617,7 @@ pub struct VulkanNv12 {
     foreign_qf: u32,
     cmd_pool: vk::CommandPool,
     pipeline: vk::Pipeline,
-    /// Per-frame pipelines for dynamic HDR (fp16 P010 path only); `convert` picks one from the
+    /// Per-frame pipelines for dynamic HDR (fp16 input only); `convert` picks one from the
     /// frame's [`FrameColor`] instead of `pipeline`.
     dynamic: Option<DynamicPipelines>,
     pipeline_layout: vk::PipelineLayout,
@@ -425,6 +630,9 @@ pub struct VulkanNv12 {
     /// path.
     sync_sem: vk::Semaphore,
     sem_fd: Option<ash::khr::external_semaphore_fd::Device>,
+    /// `sync_sem` still holds a signal whose payload could not be exported; it is recreated
+    /// once the blocking wait has retired that submit.
+    sync_sem_stuck: bool,
     /// AMD/Intel: hand downstream a dmabuf write-fence and don't stall. Nvidia: block.
     implicit_sync: bool,
     /// LINEAR direct path (compute writes the export image; no scratch/copy).
@@ -437,6 +645,9 @@ pub struct VulkanNv12 {
     /// Keeps the shared `GstVulkanDevice` alive for the converter's lifetime (the encode-src
     /// images are allocated on it).
     _shared_device: Option<gstreamer_vulkan::VulkanDevice>,
+    /// Where our own device goes back to when we drop (see [`PooledDevice`]): its render
+    /// minor and the device as opened. `None` on the shared-device path.
+    pool_return: Option<(u32, OpenedDevice)>,
     outputs: Vec<Nv12Out>,
     next: usize, // next ring slot to write
     cur: usize,  // last slot written (the one to_gst_buffer returns)
@@ -444,9 +655,12 @@ pub struct VulkanNv12 {
     /// output to safely re-emit rather than reusing a slot the encoder still references.
     have_output: bool,
     last_output_hdr: bool,
-    /// Count of frames dropped because the target encode-src slot was still referenced at
+    /// Count of frames dropped because every ring slot was still referenced downstream at
     /// reuse time; drives rate-limited logging only.
     busy_drops: u64,
+    /// When the pending colorimetry transition started waiting for a free slot; bounds the
+    /// total wait to [`TRANSITION_SLOT_WAIT`] across frames.
+    transition_wait: Option<std::time::Instant>,
     width: u32,
     height: u32,
     /// Target output format (NV12 8-bit or P010 10-bit); selects the compute shader, image
@@ -475,6 +689,10 @@ pub struct ConversionOptions {
     /// and gates the compositor's HDR-state signalling. Read once at converter creation
     /// and at compositor start; the element property is the source of truth.
     pub hdr_cm: bool,
+    /// Under the element's `stable-color-transport`: the output state every frame is
+    /// converted for, fixed at start from the static `hdr` setting, instead of following
+    /// the compositor's HDR state. `None` = follow it (dynamic caps).
+    pub stable_output_hdr: Option<bool>,
 }
 
 impl Default for ConversionOptions {
@@ -490,6 +708,7 @@ impl Default for ConversionOptions {
                 .unwrap_or(1000)
                 .min(65535),
             hdr_cm: false,
+            stable_output_hdr: None,
         }
     }
 }
@@ -574,126 +793,31 @@ impl VulkanNv12 {
         va_share: &crate::utils::va_share::VaShare,
         options: ConversionOptions,
     ) -> Result<Self, Err> {
-        let entry = ash::Entry::load()?;
-        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
-        let instance = entry.create_instance(
-            &vk::InstanceCreateInfo::default().application_info(&app),
-            None,
-        )?;
-        // Match by DRM render/primary minor (VK_EXT_physical_device_drm); warns and falls
-        // back to the first device if no driver reports a matching node.
-        let pd = pick_physical_device(&instance, Some(target_minor)).ok_or("no vulkan device")?;
-
-        // Implicit dma-buf sync (kernel write-fence on the export buffer) is honored by
-        // the VA consumer on AMD/Intel but not by CUDA on Nvidia -- so only pipeline
-        // without a CPU stall when the selected device is not Nvidia.
-        let dev_props = instance.get_physical_device_properties(pd);
-        let implicit_sync = dev_props.vendor_id != VENDOR_NVIDIA;
-        tracing::debug!(
-            "VulkanNv12: vendor={:#x} implicit_sync(pipelined)={implicit_sync}",
-            dev_props.vendor_id
+        let (entry, instance, opened) = take_device(target_minor)?;
+        let queue = opened.device.get_device_queue(opened.qfi, 0);
+        let memp = instance.get_physical_device_memory_properties(opened.pd);
+        // From here on `this` owns everything created: if a later step fails, its Drop frees
+        // whatever was created so far (destroying a null handle is a no-op) and returns the
+        // device and the instance to the pool.
+        let mut this = Self::skeleton(
+            entry,
+            instance,
+            opened.device.clone(),
+            queue,
+            opened.qfi,
+            if opened.queue_family_foreign {
+                vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                vk::QUEUE_FAMILY_EXTERNAL
+            },
+            memp,
+            width,
+            height,
+            fmt,
         );
-
-        // We export exactly the negotiated modifier (the caps layer already picked one the
-        // encoder imports -- LINEAR for the interpipe/vapostproc path, the encoder's own
-        // modifier for a direct `! vah265enc`). No env-gated override.
-
-        let qfi = instance
-            .get_physical_device_queue_family_properties(pd)
-            .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .ok_or("no compute queue")? as u32;
-        let prio = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(qfi)
-            .queue_priorities(&prio)];
-        // Only enable what the device supports: required extensions fail the converter with
-        // a clear error, optional ones degrade (blocking fence wait, EXTERNAL family).
-        let available: Vec<std::ffi::CString> = instance
-            .enumerate_device_extension_properties(pd)?
-            .iter()
-            .filter_map(|e| e.extension_name_as_c_str().ok().map(|n| n.to_owned()))
-            .collect();
-        let has = |name: &std::ffi::CStr| available.iter().any(|a| a.as_c_str() == name);
-        let mut exts = Vec::new();
-        for name in [
-            ash::khr::external_memory_fd::NAME,
-            ash::ext::external_memory_dma_buf::NAME,
-            ash::ext::image_drm_format_modifier::NAME,
-        ] {
-            if !has(name) {
-                return Err(format!("Vulkan device lacks {name:?}").into());
-            }
-            exts.push(name.as_ptr());
-        }
-        // Needed to export the submit's signal as a SYNC_FD we attach to the dmabuf; without
-        // it the converter blocks on its fence like the Nvidia path.
-        let implicit_sync = implicit_sync && has(ash::khr::external_semaphore_fd::NAME);
-        if implicit_sync {
-            exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
-        }
-        let queue_family_foreign = has(ash::ext::queue_family_foreign::NAME);
-        if queue_family_foreign {
-            exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());
-        }
-        let mut supported_ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
-        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported_ycbcr);
-        instance.get_physical_device_features2(pd, &mut features);
-        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
-            .sampler_ycbcr_conversion(supported_ycbcr.sampler_ycbcr_conversion != 0);
-        let device = instance.create_device(
-            pd,
-            &vk::DeviceCreateInfo::default()
-                .queue_create_infos(&qci)
-                .enabled_extension_names(&exts)
-                .push_next(&mut ycbcr),
-            None,
-        )?;
-        let queue = device.get_device_queue(qfi, 0);
-        let memp = instance.get_physical_device_memory_properties(pd);
-
-        // ---- compute pipeline(s) (shader selected by output format + input format) ----
-        let binds = [
-            dsl_bind(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
-            dsl_bind(1, vk::DescriptorType::STORAGE_IMAGE),
-            dsl_bind(2, vk::DescriptorType::STORAGE_IMAGE),
-        ];
-        let desc_layout = device.create_descriptor_set_layout(
-            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
-            None,
-        )?;
-        let dsls = [desc_layout];
-        let pcr = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(8)];
-        let pipeline_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(&dsls)
-                .push_constant_ranges(&pcr),
-            None,
-        )?;
-        let (pipeline, dynamic) =
-            build_pipelines(&device, pipeline_layout, fmt, bt2020, fp16_input, &options)?;
-
-        // One descriptor set + command buffer per ring slot (pipelined, no contention).
-        let psizes = [
-            pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, RING as u32),
-            pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * RING as u32),
-        ];
-        let desc_pool = device.create_descriptor_pool(
-            &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(RING as u32)
-                .pool_sizes(&psizes),
-            None,
-        )?;
-        let sampler = device.create_sampler(&vk::SamplerCreateInfo::default(), None)?;
-        let cmd_pool = device.create_command_pool(
-            &vk::CommandPoolCreateInfo::default()
-                .queue_family_index(qfi)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-            None,
-        )?;
+        let (qfi, implicit_sync) = (opened.qfi, opened.implicit_sync);
+        this.pool_return = Some((target_minor, opened));
+        this.build_compute(fmt, bt2020, fp16_input, &options, qfi)?;
 
         // ---- NV12 export ring ----
         // Prefer the LINEAR direct path (compute writes the export image; no scratch/copy)
@@ -701,93 +825,189 @@ impl VulkanNv12 {
         // LINEAR NV12 export image, fall back to the tiled scratch+copy path.
         let gst_allocator = DmaBufAllocator::new();
         let want_direct = export_modifier == DRM_FORMAT_MOD_LINEAR;
-        let build = |direct: bool| -> Result<Vec<Nv12Out>, Err> {
-            tracing::debug!(
-                "VulkanNv12: creating {} export images {width}x{height} \
-                 modifier={export_modifier:#x} direct={direct}",
-                options.ring_depth
-            );
-            let mut outputs = Vec::with_capacity(options.ring_depth);
-            for _ in 0..options.ring_depth {
-                outputs.push(create_output(
-                    &instance,
-                    &device,
-                    &memp,
-                    &gst_allocator,
-                    desc_pool,
-                    desc_layout,
-                    cmd_pool,
-                    width,
-                    height,
-                    export_modifier,
-                    direct,
-                    fmt,
-                    va_share,
-                )?);
+        this.direct = want_direct;
+        if let Err(e) = this.build_export_ring(&gst_allocator, export_modifier, va_share, &options)
+        {
+            if !want_direct {
+                return Err(e);
             }
-            Ok(outputs)
-        };
-        let (outputs, direct) = match (want_direct, build(want_direct)) {
-            (_, Ok(o)) => (o, want_direct),
-            (true, Err(e)) => {
-                tracing::warn!(
-                    "VulkanNv12: LINEAR direct path unavailable ({e}); using scratch+copy"
-                );
-                (build(false)?, false)
-            }
-            (false, Err(e)) => return Err(e),
-        };
+            tracing::warn!("VulkanNv12: LINEAR direct path unavailable ({e}); using scratch+copy");
+            // Free the slots built so far and their descriptor sets (the pool holds exactly
+            // one set per slot) before building the tiled ring.
+            this.destroy_outputs();
+            this.device
+                .reset_descriptor_pool(this.desc_pool, vk::DescriptorPoolResetFlags::empty())?;
+            this.direct = false;
+            this.build_export_ring(&gst_allocator, export_modifier, va_share, &options)?;
+        }
 
         // Binary semaphore exported per submit as the dmabuf write-fence (implicit path).
-        let (sync_sem, sem_fd) = if implicit_sync {
+        if implicit_sync {
             let mut exp = vk::ExportSemaphoreCreateInfo::default()
                 .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-            let sem = device.create_semaphore(
+            this.sync_sem = this.device.create_semaphore(
                 &vk::SemaphoreCreateInfo::default().push_next(&mut exp),
                 None,
             )?;
-            let loader = ash::khr::external_semaphore_fd::Device::new(&instance, &device);
-            (sem, Some(loader))
-        } else {
-            (vk::Semaphore::null(), None)
-        };
+            this.sem_fd = Some(ash::khr::external_semaphore_fd::Device::new(
+                &this.instance,
+                &this.device,
+            ));
+            this.implicit_sync = true;
+        }
+        Ok(this)
+    }
 
-        Ok(VulkanNv12 {
+    /// A converter owning `device`/`instance` with no other objects yet: every other handle
+    /// is null, so dropping it part-way through construction frees exactly what was built.
+    #[allow(clippy::too_many_arguments)]
+    fn skeleton(
+        entry: ash::Entry,
+        instance: ash::Instance,
+        device: ash::Device,
+        queue: vk::Queue,
+        qfi: u32,
+        foreign_qf: u32,
+        memp: vk::PhysicalDeviceMemoryProperties,
+        width: u32,
+        height: u32,
+        fmt: PixFmt,
+    ) -> Self {
+        VulkanNv12 {
             _entry: entry,
             instance,
             device,
             queue,
             gst_queue: None,
             qfi,
-            foreign_qf: if queue_family_foreign {
-                vk::QUEUE_FAMILY_FOREIGN_EXT
-            } else {
-                vk::QUEUE_FAMILY_EXTERNAL
-            },
-            cmd_pool,
-            pipeline,
-            dynamic,
-            pipeline_layout,
-            desc_layout,
-            desc_pool,
-            sampler,
+            foreign_qf,
+            cmd_pool: vk::CommandPool::null(),
+            pipeline: vk::Pipeline::null(),
+            dynamic: None,
+            pipeline_layout: vk::PipelineLayout::null(),
+            desc_layout: vk::DescriptorSetLayout::null(),
+            desc_pool: vk::DescriptorPool::null(),
+            sampler: vk::Sampler::null(),
             memp,
-            sync_sem,
-            sem_fd,
-            implicit_sync,
-            direct,
+            sync_sem: vk::Semaphore::null(),
+            sem_fd: None,
+            sync_sem_stuck: false,
+            implicit_sync: false,
+            direct: false,
             encode_src: false,
             _shared_device: None,
-            outputs,
+            pool_return: None,
+            outputs: Vec::new(),
             next: 0,
             have_output: false,
             last_output_hdr: false,
             busy_drops: 0,
+            transition_wait: None,
             cur: 0,
             width,
             height,
             fmt,
-        })
+        }
+    }
+
+    /// The compute pipeline(s), descriptor layout/pool, sampler and command pool, shared by
+    /// the dmabuf and encode-src paths (one descriptor set and command buffer per ring slot).
+    unsafe fn build_compute(
+        &mut self,
+        fmt: PixFmt,
+        bt2020: bool,
+        fp16_input: bool,
+        options: &ConversionOptions,
+        cmd_queue_family: u32,
+    ) -> Result<(), Err> {
+        let binds = [
+            dsl_bind(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            dsl_bind(1, vk::DescriptorType::STORAGE_IMAGE),
+            dsl_bind(2, vk::DescriptorType::STORAGE_IMAGE),
+        ];
+        self.desc_layout = self.device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
+            None,
+        )?;
+        let dsls = [self.desc_layout];
+        let pcr = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(8)];
+        self.pipeline_layout = self.device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&dsls)
+                .push_constant_ranges(&pcr),
+            None,
+        )?;
+        let (pipeline, dynamic) = build_pipelines(
+            &self.device,
+            self.pipeline_layout,
+            fmt,
+            bt2020,
+            fp16_input,
+            options,
+        )?;
+        self.pipeline = pipeline;
+        self.dynamic = dynamic;
+
+        let psizes = [
+            pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, RING as u32),
+            pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * RING as u32),
+        ];
+        self.desc_pool = self.device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(RING as u32)
+                .pool_sizes(&psizes),
+            None,
+        )?;
+        self.sampler = self
+            .device
+            .create_sampler(&vk::SamplerCreateInfo::default(), None)?;
+        self.cmd_pool = self.device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default()
+                .queue_family_index(cmd_queue_family)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Fill the dmabuf export ring (`self.direct` selects the LINEAR direct or tiled path).
+    /// On failure the slots built so far stay in `self.outputs` for the caller to free.
+    unsafe fn build_export_ring(
+        &mut self,
+        gst_allocator: &DmaBufAllocator,
+        export_modifier: u64,
+        va_share: &crate::utils::va_share::VaShare,
+        options: &ConversionOptions,
+    ) -> Result<(), Err> {
+        tracing::debug!(
+            "VulkanNv12: creating {} export images {}x{} modifier={export_modifier:#x} direct={}",
+            ring_depth(options),
+            self.width,
+            self.height,
+            self.direct
+        );
+        for _ in 0..ring_depth(options) {
+            let out = create_output(
+                &self.instance,
+                &self.device,
+                &self.memp,
+                gst_allocator,
+                self.desc_pool,
+                self.desc_layout,
+                self.cmd_pool,
+                self.width,
+                self.height,
+                export_modifier,
+                self.direct,
+                self.fmt,
+                va_share,
+            )?;
+            self.outputs.push(out);
+        }
+        Ok(())
     }
 
     /// Shared-device encode path: wrap the downstream encoder's `GstVulkanDevice` and build
@@ -857,109 +1077,64 @@ impl VulkanNv12 {
             queue_families.push(enc);
         }
         let memp = instance.get_physical_device_memory_properties(raw.physical);
-
-        // ---- compute pipeline(s) (same as the dmabuf path, on the shared device) ----
-        let binds = [
-            dsl_bind(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
-            dsl_bind(1, vk::DescriptorType::STORAGE_IMAGE),
-            dsl_bind(2, vk::DescriptorType::STORAGE_IMAGE),
-        ];
-        let desc_layout = device.create_descriptor_set_layout(
-            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
-            None,
-        )?;
-        let dsls = [desc_layout];
-        let pcr = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(8)];
-        let pipeline_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(&dsls)
-                .push_constant_ranges(&pcr),
-            None,
-        )?;
-        let (pipeline, dynamic) =
-            build_pipelines(&device, pipeline_layout, fmt, bt2020, fp16_input, &options)?;
-        let psizes = [
-            pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, RING as u32),
-            pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * RING as u32),
-        ];
-        let desc_pool = device.create_descriptor_pool(
-            &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(RING as u32)
-                .pool_sizes(&psizes),
-            None,
-        )?;
-        let sampler = device.create_sampler(&vk::SamplerCreateInfo::default(), None)?;
-        let cmd_pool = device.create_command_pool(
-            &vk::CommandPoolCreateInfo::default()
-                .queue_family_index(raw.gfx_queue_family)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-            None,
-        )?;
-
-        // ---- encode-src output ring: NV12 VIDEO_ENCODE_SRC GstVulkanImageMemory images
-        // allocated directly on the shared device (bypasses the pool's generic-format check).
-        let mut outputs = Vec::with_capacity(options.ring_depth);
-        for _ in 0..options.ring_depth {
-            outputs.push(create_encode_output(
-                &device,
-                &memp,
-                &device_gst,
-                codec,
-                profile,
-                &queue_families,
-                desc_pool,
-                desc_layout,
-                cmd_pool,
-                width,
-                height,
-                fmt,
-                options.linear_encode_src,
-            )?);
-        }
-
-        Ok(VulkanNv12 {
-            _entry: entry,
+        // As on the dmabuf path, `this` frees whatever was built if a later step fails; with
+        // `encode_src` set it never destroys the encoder's device or instance.
+        let mut this = Self::skeleton(
+            entry,
             instance,
             device,
             queue,
-            qfi: raw.gfx_queue_family,
-            foreign_qf: if raw.queue_family_foreign {
+            raw.gfx_queue_family,
+            if raw.queue_family_foreign {
                 vk::QUEUE_FAMILY_FOREIGN_EXT
             } else {
                 vk::QUEUE_FAMILY_EXTERNAL
             },
-            gst_queue: Some(raw.gfx_queue),
-            cmd_pool,
-            pipeline,
-            dynamic,
-            pipeline_layout,
-            desc_layout,
-            desc_pool,
-            sampler,
             memp,
-            sync_sem: vk::Semaphore::null(),
-            sem_fd: None,
-            implicit_sync: false,
-            direct: false,
-            encode_src: true,
-            _shared_device: Some(device_gst),
-            outputs,
-            next: 0,
-            have_output: false,
-            last_output_hdr: false,
-            busy_drops: 0,
-            cur: 0,
             width,
             height,
             fmt,
-        })
+        );
+        this.encode_src = true;
+        this.gst_queue = Some(raw.gfx_queue);
+        this._shared_device = Some(device_gst.clone());
+        this.build_compute(fmt, bt2020, fp16_input, &options, raw.gfx_queue_family)?;
+
+        // ---- encode-src output ring: NV12 VIDEO_ENCODE_SRC GstVulkanImageMemory images
+        // allocated directly on the shared device (bypasses the pool's generic-format check).
+        for _ in 0..ring_depth(&options) {
+            let out = create_encode_output(
+                &this.device,
+                &this.memp,
+                &device_gst,
+                codec,
+                profile,
+                &queue_families,
+                this.desc_pool,
+                this.desc_layout,
+                this.cmd_pool,
+                width,
+                height,
+                fmt,
+                options.linear_encode_src,
+            )?;
+            this.outputs.push(out);
+        }
+        Ok(this)
+    }
+
+    /// Whether ring slot `i` may be overwritten: nothing downstream references it any more.
+    /// The encode-src child headers keep the slot buffer itself referenced (through
+    /// `GstParentBufferMeta`); a dmabuf slot is handed out as a ref of the slot buffer, and a
+    /// copy-on-write header copy of it (BaseSrc's DISCONT `make_writable`, or any downstream
+    /// element) shares its memory instead, so the memory must be unshared too.
+    fn slot_free(&self, i: usize) -> bool {
+        let buffer = &self.outputs[i].buffer;
+        buffer.is_writable() && (self.encode_src || buffer.is_all_memory_writable())
     }
 
     /// Import the compositor's `rgba` dmabuf and convert it RGBA->NV12 into the next
-    /// export ring slot. Under dynamic HDR (fp16 P010 path) `color` selects the per-frame
+    /// export ring slot. Under dynamic HDR (fp16 input) `color` selects the per-frame
     /// shader, so the pixels match the colorimetry the element tags the frame with;
     /// otherwise it is ignored and the shader fixed at creation runs.
     pub fn convert(&mut self, rgba: &Dmabuf, color: FrameColor) -> Result<(), Err> {
@@ -971,55 +1146,59 @@ impl VulkanNv12 {
         let fd = rgba.handles().next().ok_or("no fd")?.as_fd().as_raw_fd();
         let key = dma_buf_identity(fd)?;
 
-        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
-        // downstream encoders at once (interpipe delivers it to every consumer). Our own
-        // graphics fence only proves *our* last write to a slot finished -- it says nothing
-        // about the consumers' encode *reads*, which run on the encode queue with no shared
-        // sync to us. Overwriting a slot's image while an encode still reads it is a GPU data
-        // hazard that wedges the encoder, so only a slot every consumer has released (its
-        // buffer writable again, refcount back to 1) may be reused. Take the next free slot in
-        // ring order; if none is free, drop this frame and re-emit the last completed output
-        // (`to_gst_buffer` returns `cur`). A colorimetry transition must wait for a fresh
-        // slot: repeating SDR pixels under HDR caps (or vice versa) is never valid.
-        let idx = if self.encode_src {
-            let n = self.outputs.len();
-            let started = std::time::Instant::now();
-            let changing_color = self.dynamic.is_some() && self.last_output_hdr != color.output_hdr;
-            let free = loop {
-                let free = (0..n)
+        // Reuse safety: a produced buffer can still be referenced downstream -- held by an
+        // encoder (B-frames, lookahead), a queue, or several consumers at once (interpipe
+        // fan-out). Our own fence only proves *our* last write to a slot finished; it says
+        // nothing about the consumers' reads, which carry no sync back to us (the dmabuf
+        // write-fence orders their read after our write, not our next write after their
+        // read). Overwriting a slot while it is still read tears frames, corrupts encoder
+        // input, or wedges a Vulkan encoder, so only a slot every consumer has released may
+        // be reused. Take the next free slot in ring order; if none is free, drop this frame
+        // and re-emit the last completed output (`to_gst_buffer` returns `cur`).
+        //
+        // A colorimetry transition waits a little for a fresh slot, since repeating SDR pixels
+        // under HDR caps (or vice versa) is wrong; past TRANSITION_SLOT_WAIT it degrades to the
+        // same re-emit rather than stalling the compositor thread or ending the stream.
+        let n = self.outputs.len();
+        let changing_color = self
+            .dynamic
+            .as_ref()
+            .is_some_and(|d| self.last_output_hdr != d.output_hdr(color));
+        let mut free = (0..n)
+            .map(|i| (self.next + i) % n)
+            .find(|&i| self.slot_free(i));
+        if !changing_color {
+            self.transition_wait = None;
+        }
+        if free.is_none() && changing_color {
+            let since = *self
+                .transition_wait
+                .get_or_insert_with(std::time::Instant::now);
+            while free.is_none() && since.elapsed() < TRANSITION_SLOT_WAIT {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                free = (0..n)
                     .map(|i| (self.next + i) % n)
-                    .find(|&i| self.outputs[i].buffer.get_mut().is_some());
-                if free.is_some() || !changing_color {
-                    break free;
-                }
-                if started.elapsed() >= std::time::Duration::from_secs(1) {
-                    return Err(
-                        "VulkanNv12: no free encode-src slot for HDR colorimetry transition".into(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_micros(100));
-            };
-            match free {
-                Some(i) => i,
-                None if !self.have_output => {
-                    return Err(
-                        "VulkanNv12: encode-src ring busy before first completed frame".into(),
-                    );
-                }
-                None => {
-                    self.busy_drops = self.busy_drops.saturating_add(1);
-                    if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
-                        tracing::warn!(
-                            busy_drops = self.busy_drops,
-                            "VulkanNv12: every encode-src slot is still referenced; dropping new frame, re-emitting previous output"
-                        );
-                    }
-                    return Ok(());
-                }
+                    .find(|&i| self.slot_free(i));
             }
-        } else {
-            self.next
+        }
+        let idx = match free {
+            Some(i) => i,
+            None if !self.have_output => {
+                return Err("VulkanNv12: output ring busy before first completed frame".into());
+            }
+            None => {
+                self.busy_drops = self.busy_drops.saturating_add(1);
+                if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
+                    tracing::warn!(
+                        busy_drops = self.busy_drops,
+                        changing_color,
+                        "VulkanNv12: every output slot is still referenced downstream; dropping new frame, re-emitting previous output"
+                    );
+                }
+                return Ok(());
+            }
         };
+        self.transition_wait = None;
         self.next = (idx + 1) % self.outputs.len();
         // Reclaim the slot's previous (RING-frames-old) work. The fence was signalled long
         // ago in steady state, so this wait is a no-op that lets us recycle the cmd buffer.
@@ -1333,18 +1512,24 @@ impl VulkanNv12 {
         }
         self.submit(&[submit], fence)?;
 
-        if self.implicit_sync {
-            // Hand the export dmabuf's BO the submit's completion as a *write* fence, so
-            // the VA encoder's import-read waits for it via the kernel's implicit sync --
-            // no CPU stall on the producer's critical path (lever 1). The cached import
-            // stays alive (it's reused next time this slot comes round).
-            self.attach_write_fence(idx);
+        let fenced = self.implicit_sync && self.attach_fences(idx, fd);
+        if fenced {
+            // The export dmabuf's BO carries the submit's completion as a *write* fence, so
+            // the VA encoder's import-read waits for it via the kernel's implicit sync, and
+            // the RGBA dmabuf carries it as a *read* fence, so the compositor's next render
+            // into it waits for this compute to finish sampling it -- no CPU stall on the
+            // producer's critical path (lever 1). The cached import stays alive (it's
+            // reused next time this slot comes round).
             self.outputs[idx].in_flight = true;
         } else {
-            // Nvidia/CUDA ignores implicit dma-buf fences: block until the write is done
-            // before the buffer is handed downstream.
+            // Nvidia/CUDA ignores implicit dma-buf fences (and the implicit path falls back
+            // here when the fences could not be attached): block until the write is done
+            // before the buffer is handed downstream and the RGBA buffer is rendered again.
             self.device.wait_for_fences(&[fence], true, u64::MAX)?;
             self.device.reset_fences(&[fence])?;
+            if self.implicit_sync && self.sync_sem_stuck {
+                self.recreate_sync_sem();
+            }
         }
 
         // Debug: one-shot readback of the converter's NV12 output to a file. `compute_target`
@@ -1392,7 +1577,7 @@ impl VulkanNv12 {
 
         self.cur = idx;
         self.have_output = true;
-        self.last_output_hdr = color.output_hdr;
+        self.last_output_hdr = self.dynamic.as_ref().is_some_and(|d| d.output_hdr(color));
         Ok(())
     }
 
@@ -1401,6 +1586,24 @@ impl VulkanNv12 {
     /// a host buffer, then write tight raw planar (`w*h*bpp` Y plane + `w*h/2*bpp` interleaved
     /// UV) to `path`. `bpp` is 1 for NV12, 2 for P010 (16-bit samples, value in the MSBs).
     unsafe fn dump_planar(&self, img: vk::Image, w: u32, h: u32, path: &str) -> Result<(), Err> {
+        std::fs::write(path, self.read_planar(img, w, h)?)?;
+        Ok(())
+    }
+
+    /// The last converted frame as tight planar samples (as [`Self::dump_planar`] writes
+    /// them), read back on the GPU.
+    #[cfg(test)]
+    pub(crate) fn read_output(&self) -> Result<Vec<u8>, Err> {
+        let slot = &self.outputs[self.cur];
+        let img = match slot.scratch {
+            Some((s, _)) => s,
+            None => slot.image,
+        };
+        unsafe { self.read_planar(img, self.width, self.height) }
+    }
+
+    /// Copy `img` (layouts as for [`Self::dump_planar`]) into tight planar bytes.
+    unsafe fn read_planar(&self, img: vk::Image, w: u32, h: u32) -> Result<Vec<u8>, Err> {
         let bpp = self.fmt.y_bytes();
         let y_size = w as u64 * h as u64 * bpp;
         let total = y_size + (w as u64 * h as u64 / 2 * bpp);
@@ -1523,15 +1726,14 @@ impl VulkanNv12 {
         let ptr = self
             .device
             .map_memory(mem, 0, total, vk::MemoryMapFlags::empty())? as *const u8;
-        let res = std::fs::write(path, std::slice::from_raw_parts(ptr, total as usize));
+        let bytes = std::slice::from_raw_parts(ptr, total as usize).to_vec();
         self.device.unmap_memory(mem);
 
         self.device.destroy_fence(fence, None);
         self.device.free_command_buffers(self.cmd_pool, &[cmd]);
         self.device.destroy_buffer(buf, None);
         self.device.free_memory(mem, None);
-        res?;
-        Ok(())
+        Ok(bytes)
     }
 
     /// Submit to our queue, holding gst's submit lock on the shared-device path.
@@ -1668,41 +1870,83 @@ impl VulkanNv12 {
         Ok(mem)
     }
 
-    /// Export the submit's signal semaphore as a SYNC_FD and import it onto slot `idx`'s
-    /// export dmabuf as a write fence (best-effort: a failure just means the consumer
-    /// falls back to whatever ordering it had, so we log and continue).
-    unsafe fn attach_write_fence(&self, idx: usize) {
+    /// Export the submit's signal semaphore as a SYNC_FD and import it as a write fence onto
+    /// slot `idx`'s export dmabuf (the consumer's read waits for our write) and as a read
+    /// fence onto the source RGBA dmabuf `rgba_fd` (the compositor's next write waits for our
+    /// read). Returns `false` unless both landed; the caller then waits the submit's fence
+    /// on the CPU instead. A semaphore whose payload could not be exported still holds a
+    /// pending signal and must not be signalled again: it is flagged for recreation once
+    /// that wait has retired it.
+    unsafe fn attach_fences(&mut self, idx: usize, rgba_fd: RawFd) -> bool {
+        use std::os::fd::{FromRawFd, OwnedFd};
         let Some(loader) = self.sem_fd.as_ref() else {
-            return;
+            return false;
         };
         let sync_fd = match loader.get_semaphore_fd(
             &vk::SemaphoreGetFdInfoKHR::default()
                 .semaphore(self.sync_sem)
                 .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
         ) {
-            Ok(fd) if fd >= 0 => fd,
-            Ok(_) => return, // -1 means already signalled; nothing to wait on
+            Ok(fd) if fd >= 0 => OwnedFd::from_raw_fd(fd),
+            Ok(_) => return true, // -1 means already signalled; nothing to wait on
             Err(e) => {
-                tracing::warn!("VulkanNv12: get_semaphore_fd failed: {e}");
-                return;
+                tracing::warn!("VulkanNv12: get_semaphore_fd failed: {e}; waiting on the CPU");
+                self.sync_sem_stuck = true;
+                return false;
             }
         };
-        let arg = DmaBufImportSyncFile {
-            flags: DMA_BUF_SYNC_WRITE,
-            fd: sync_fd,
+        let import = |target: RawFd, flags: u32| {
+            let arg = DmaBufImportSyncFile {
+                flags,
+                fd: sync_fd.as_raw_fd(),
+            };
+            if libc::ioctl(target, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &arg as *const _) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
         };
-        let rc = libc::ioctl(
-            self.outputs[idx].export_fd,
-            DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
-            &arg as *const _,
-        );
-        if rc != 0 {
-            tracing::warn!(
-                "VulkanNv12: IMPORT_SYNC_FILE failed (errno {})",
-                std::io::Error::last_os_error()
-            );
+        match import(self.outputs[idx].export_fd, DMA_BUF_SYNC_WRITE)
+            .and_then(|()| import(rgba_fd, DMA_BUF_SYNC_READ))
+        {
+            Ok(()) => true,
+            // The kernel predates the ioctl (Linux < 6.0): it will fail every frame, so
+            // switch to the blocking path for good instead of failing and warning per frame.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::EINVAL)) => {
+                tracing::warn!(
+                    "VulkanNv12: IMPORT_SYNC_FILE unsupported ({e}); waiting on the CPU from now on"
+                );
+                self.implicit_sync = false;
+                false
+            }
+            Err(e) => {
+                tracing::warn!("VulkanNv12: IMPORT_SYNC_FILE failed ({e}); waiting on the CPU");
+                false
+            }
         }
-        libc::close(sync_fd);
+    }
+
+    /// Replace the per-submit signal semaphore after a failed export left it signalled. The
+    /// caller has waited the submit that signalled it. Without a new one the implicit path is
+    /// abandoned for the blocking fence wait.
+    unsafe fn recreate_sync_sem(&mut self) {
+        self.device.destroy_semaphore(self.sync_sem, None);
+        self.sync_sem_stuck = false;
+        let mut exp = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        match self.device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut exp),
+            None,
+        ) {
+            Ok(sem) => self.sync_sem = sem,
+            Err(e) => {
+                tracing::warn!(
+                    "VulkanNv12: cannot recreate the sync semaphore ({e}); blocking per frame"
+                );
+                self.sync_sem = vk::Semaphore::null();
+                self.implicit_sync = false;
+            }
+        }
     }
 
     unsafe fn free_import(&mut self, idx: usize) {
@@ -1754,39 +1998,37 @@ impl VulkanNv12 {
     }
 }
 
+impl VulkanNv12 {
+    /// Free every ring slot (after its in-flight work) and its cached import. The slots'
+    /// descriptor sets go back with the pool (reset or destroyed by the caller).
+    unsafe fn destroy_outputs(&mut self) {
+        // Wait for our own submits only: on the shared device, device_wait_idle would race
+        // the encoders' unsynchronised use of their queues.
+        let pending: Vec<vk::Fence> = self
+            .outputs
+            .iter()
+            .filter(|o| o.in_flight)
+            .map(|o| o.fence)
+            .collect();
+        if !pending.is_empty() {
+            let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
+        }
+        for idx in 0..self.outputs.len() {
+            self.free_import(idx);
+        }
+        // On the encode-src path the output image + memory belong to the gst pool (freed
+        // when the buffer/pool drop) and there is no export fd to close.
+        let owns_image = !self.encode_src;
+        for o in std::mem::take(&mut self.outputs) {
+            destroy_output(&self.device, self.cmd_pool, o, owns_image);
+        }
+    }
+}
+
 impl Drop for VulkanNv12 {
     fn drop(&mut self) {
         unsafe {
-            // Wait for our own submits only: on the shared device, device_wait_idle would race
-            // the encoders' unsynchronised use of their queues.
-            let pending: Vec<vk::Fence> = self
-                .outputs
-                .iter()
-                .filter(|o| o.in_flight)
-                .map(|o| o.fence)
-                .collect();
-            if !pending.is_empty() {
-                let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
-            }
-            for idx in 0..self.outputs.len() {
-                self.free_import(idx);
-            }
-            for o in self.outputs.drain(..) {
-                self.device.destroy_image_view(o.y_view, None);
-                self.device.destroy_image_view(o.uv_view, None);
-                if let Some((s_img, s_mem)) = o.scratch {
-                    self.device.destroy_image(s_img, None);
-                    self.device.free_memory(s_mem, None);
-                }
-                // On the encode-src path the output image + memory belong to the gst pool
-                // (freed when the buffer/pool drop) and there is no export fd to close.
-                if !self.encode_src {
-                    self.device.destroy_image(o.image, None);
-                    self.device.free_memory(o.mem, None);
-                    libc::close(o.export_fd);
-                }
-                self.device.destroy_fence(o.fence, None);
-            }
+            self.destroy_outputs();
             if self.sync_sem != vk::Semaphore::null() {
                 self.device.destroy_semaphore(self.sync_sem, None);
             }
@@ -1806,8 +2048,25 @@ impl Drop for VulkanNv12 {
             // encoder still frees its own DPB image views at teardown, so destroying them
             // here would yank the device out from under it. Only tear down what we created.
             if !self.encode_src {
-                self.device.destroy_device(None);
-                self.instance.destroy_instance(None);
+                // Everything we created on the device is gone; once our submits are done it
+                // is as good as new. A device that can't even go idle is not reused.
+                match self.pool_return.take() {
+                    Some((minor, opened)) if self.device.device_wait_idle().is_ok() => {
+                        DEVICE_POOL
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(PooledDevice {
+                                minor,
+                                entry: self._entry.clone(),
+                                instance: self.instance.clone(),
+                                opened,
+                            });
+                    }
+                    _ => {
+                        self.device.destroy_device(None);
+                        self.instance.destroy_instance(None);
+                    }
+                }
             }
         }
     }
@@ -1815,41 +2074,57 @@ impl Drop for VulkanNv12 {
 
 // --- helpers ---
 
-/// The per-frame pipelines of the dynamic-HDR fp16 P010 path, one per (output state,
-/// content transfer) pair.
+/// The per-frame pipelines of the dynamic-HDR fp16 path, one per (output state, content
+/// transfer) pair the output format can carry.
 struct DynamicPipelines {
+    /// HDR output pipelines; `None` on NV12, which never carries HDR.
+    hdr_out: Option<HdrOutPipelines>,
+    /// SDR output: PQ content tone-mapped to the SDR output matrix.
+    pq_to_sdr: vk::Pipeline,
+}
+
+#[derive(Clone, Copy)]
+struct HdrOutPipelines {
     /// HDR output: SDR sRGB content -> PQ at the SDR reference white.
     sdr_to_pq: vk::Pipeline,
     /// HDR output: PQ content, matrix only.
     pq_pass: vk::Pipeline,
-    /// SDR output: PQ content tone-mapped to BT.709.
-    pq_to_sdr: vk::Pipeline,
 }
 
 impl DynamicPipelines {
+    /// Whether `color`'s frame is converted for an HDR output. An output that cannot carry
+    /// HDR (NV12) is SDR whatever the requested state.
+    fn output_hdr(&self, color: FrameColor) -> bool {
+        color.output_hdr && self.hdr_out.is_some()
+    }
+
     /// The pipeline for `color`, or `None` for SDR content on an SDR frame, which is the
-    /// converter's regular BT.709 pipeline.
+    /// converter's regular pipeline.
     fn pick(&self, color: FrameColor) -> Option<vk::Pipeline> {
-        Some(match (color.output_hdr, color.content) {
-            (true, ContentTransfer::Sdr) => self.sdr_to_pq,
-            (true, ContentTransfer::Pq) => self.pq_pass,
-            (false, ContentTransfer::Pq) => self.pq_to_sdr,
-            (false, ContentTransfer::Sdr) => return None,
+        let hdr_out = self.hdr_out.filter(|_| color.output_hdr);
+        Some(match (hdr_out, color.content) {
+            (Some(h), ContentTransfer::Sdr) => h.sdr_to_pq,
+            (Some(h), ContentTransfer::Pq) => h.pq_pass,
+            (None, ContentTransfer::Pq) => self.pq_to_sdr,
+            (None, ContentTransfer::Sdr) => return None,
         })
     }
 
     unsafe fn destroy(self, device: &ash::Device) {
-        for p in [self.sdr_to_pq, self.pq_pass, self.pq_to_sdr] {
-            device.destroy_pipeline(p, None);
+        if let Some(h) = self.hdr_out {
+            device.destroy_pipeline(h.sdr_to_pq, None);
+            device.destroy_pipeline(h.pq_pass, None);
         }
+        device.destroy_pipeline(self.pq_to_sdr, None);
     }
 }
 
-/// Build the converter's pipeline(s). Under dynamic HDR on the fp16 P010 path the regular
-/// pipeline is the BT.709 SDR shader and [`DynamicPipelines`] covers every other
-/// (output, content) pair, so a mid-stream bt709 <-> bt2100-pq flip needs no rebuild.
-/// Otherwise the single pipeline follows the negotiated caps (`bt2020`). The SDR reference
-/// white feeds specialization constant 0 of the shaders that declare it.
+/// Build the converter's pipeline(s). Under dynamic HDR on the fp16 path the regular
+/// pipeline is the format's SDR shader and [`DynamicPipelines`] covers every other
+/// (output, content) pair, so a mid-stream bt709 <-> bt2100-pq flip or a PQ client on an
+/// NV12 stream needs no rebuild. Otherwise the single pipeline follows the negotiated caps
+/// (`bt2020`). The SDR reference white feeds specialization constant 0 of the shaders that
+/// declare it.
 unsafe fn build_pipelines(
     device: &ash::Device,
     layout: vk::PipelineLayout,
@@ -1859,17 +2134,21 @@ unsafe fn build_pipelines(
     options: &ConversionOptions,
 ) -> Result<(vk::Pipeline, Option<DynamicPipelines>), Err> {
     let ref_white = options.sdr_reference_white;
-    if !(options.hdr_cm && fmt == PixFmt::P010 && fp16_input) {
+    if !(options.hdr_cm && fp16_input) {
         let pipeline = build_compute_pipeline(device, layout, fmt.shader(bt2020), ref_white)?;
         return Ok((pipeline, None));
     }
-    let mut built = Vec::with_capacity(4);
-    for spv in [
-        RGBA_TO_P010_SPV,
-        RGBA_TO_P010_BT2020_SPV,
-        RGBA_PQPASS_TO_P010_SPV,
-        RGBA_HDR_TO_P010_SDR_SPV,
-    ] {
+    let shaders: &[&[u8]] = match fmt {
+        PixFmt::P010 => &[
+            RGBA_TO_P010_SPV,
+            RGBA_HDR_TO_P010_SDR_SPV,
+            RGBA_TO_P010_BT2020_SPV,
+            RGBA_PQPASS_TO_P010_SPV,
+        ],
+        PixFmt::Nv12 => &[RGBA_TO_NV12_SPV, RGBA_HDR_TO_NV12_SDR_SPV],
+    };
+    let mut built = Vec::with_capacity(shaders.len());
+    for spv in shaders {
         match build_compute_pipeline(device, layout, spv, ref_white) {
             Ok(p) => built.push(p),
             Err(e) => {
@@ -1881,11 +2160,13 @@ unsafe fn build_pipelines(
         }
     }
     let dynamic = DynamicPipelines {
-        sdr_to_pq: built[1],
-        pq_pass: built[2],
-        pq_to_sdr: built[3],
+        hdr_out: (built.len() == 4).then(|| HdrOutPipelines {
+            sdr_to_pq: built[2],
+            pq_pass: built[3],
+        }),
+        pq_to_sdr: built[1],
     };
-    tracing::debug!("VulkanNv12: dynamic-HDR pipelines ready");
+    tracing::debug!("VulkanNv12: dynamic-HDR pipelines ready ({fmt:?})");
     Ok((built[0], Some(dynamic)))
 }
 
@@ -1978,6 +2259,46 @@ unsafe fn create_storage(
         info = info.push_next(&mut extmem);
     }
     let image = device.create_image(&info, None)?;
+    let mut planes = StoragePlanes {
+        image,
+        ..Default::default()
+    };
+    match fill_storage(device, memp, export, &mut planes, fmt) {
+        Ok(()) => Ok((planes.image, planes.mem, planes.y_view, planes.uv_view)),
+        Err(e) => {
+            planes.destroy(device);
+            Err(e)
+        }
+    }
+}
+
+/// A storage image and the objects made over it; null handles are not yet created.
+#[derive(Default)]
+struct StoragePlanes {
+    image: vk::Image,
+    mem: vk::DeviceMemory,
+    y_view: vk::ImageView,
+    uv_view: vk::ImageView,
+}
+
+impl StoragePlanes {
+    unsafe fn destroy(&self, device: &ash::Device) {
+        device.destroy_image_view(self.y_view, None);
+        device.destroy_image_view(self.uv_view, None);
+        device.destroy_image(self.image, None);
+        device.free_memory(self.mem, None);
+    }
+}
+
+/// Back `planes.image` with memory (exportable when `export`) and make its plane views.
+unsafe fn fill_storage(
+    device: &ash::Device,
+    memp: &vk::PhysicalDeviceMemoryProperties,
+    export: bool,
+    planes: &mut StoragePlanes,
+    fmt: PixFmt,
+) -> Result<(), Err> {
+    let image = planes.image;
     let mr = device.get_image_memory_requirements(image);
     let mut exp = vk::ExportMemoryAllocateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -1991,21 +2312,21 @@ unsafe fn create_storage(
     if export {
         alloc = alloc.push_next(&mut exp);
     }
-    let mem = device.allocate_memory(&alloc, None)?;
-    device.bind_image_memory(image, mem, 0)?;
-    let y_view = plane_view(
+    planes.mem = device.allocate_memory(&alloc, None)?;
+    device.bind_image_memory(image, planes.mem, 0)?;
+    planes.y_view = plane_view(
         device,
         image,
         fmt.y_view_format(),
         vk::ImageAspectFlags::PLANE_0,
     )?;
-    let uv_view = plane_view(
+    planes.uv_view = plane_view(
         device,
         image,
         fmt.uv_view_format(),
         vk::ImageAspectFlags::PLANE_1,
     )?;
-    Ok((image, mem, y_view, uv_view))
+    Ok(())
 }
 
 /// Build one self-contained export ring slot (export image + dmabuf, compute target +
@@ -2026,9 +2347,53 @@ unsafe fn create_output(
     fmt: PixFmt,
     va_share: &crate::utils::va_share::VaShare,
 ) -> Result<Nv12Out, Err> {
+    let mut out = Nv12Out::empty();
+    match fill_output(
+        &mut out,
+        instance,
+        device,
+        memp,
+        allocator,
+        desc_pool,
+        desc_layout,
+        cmd_pool,
+        width,
+        height,
+        modifier,
+        direct,
+        fmt,
+        va_share,
+    ) {
+        Ok(()) => Ok(out),
+        Err(e) => {
+            destroy_output(device, cmd_pool, out, true);
+            Err(e)
+        }
+    }
+}
+
+/// Build `out` in place, storing each object as soon as it exists so a failure part-way
+/// leaves `out` holding exactly what must be freed.
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_output(
+    out: &mut Nv12Out,
+    instance: &ash::Instance,
+    device: &ash::Device,
+    memp: &vk::PhysicalDeviceMemoryProperties,
+    allocator: &DmaBufAllocator,
+    desc_pool: vk::DescriptorPool,
+    desc_layout: vk::DescriptorSetLayout,
+    cmd_pool: vk::CommandPool,
+    width: u32,
+    height: u32,
+    modifier: u64,
+    direct: bool,
+    fmt: PixFmt,
+    va_share: &crate::utils::va_share::VaShare,
+) -> Result<(), Err> {
     // The export image: direct (LINEAR, compute-writable) carries STORAGE; tiled is a
     // pure TRANSFER_DST target filled by vkCmdCopyImage.
-    let (image, mem, y_view, uv_view, scratch) = if direct {
+    if direct {
         let (image, mem, y_view, uv_view) = create_storage(
             device,
             memp,
@@ -2044,7 +2409,7 @@ unsafe fn create_output(
             true,
             fmt,
         )?;
-        (image, mem, y_view, uv_view, None)
+        (out.image, out.mem, out.y_view, out.uv_view) = (image, mem, y_view, uv_view);
     } else {
         let mods = [modifier];
         let mut modlist =
@@ -2070,10 +2435,11 @@ unsafe fn create_output(
                 .push_next(&mut modlist),
             None,
         )?;
+        out.image = image;
         let mr = device.get_image_memory_requirements(image);
         let mut exp = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let mem = device.allocate_memory(
+        out.mem = device.allocate_memory(
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(mr.size)
                 .memory_type_index(mem_type(
@@ -2084,7 +2450,7 @@ unsafe fn create_output(
                 .push_next(&mut exp),
             None,
         )?;
-        device.bind_image_memory(image, mem, 0)?;
+        device.bind_image_memory(image, out.mem, 0)?;
         // Per-slot LINEAR scratch the compute shader writes; copied into `image`.
         let (s_img, s_mem, s_y, s_uv) = create_storage(
             device,
@@ -2095,8 +2461,10 @@ unsafe fn create_output(
             false,
             fmt,
         )?;
-        (image, mem, s_y, s_uv, Some((s_img, s_mem)))
-    };
+        out.scratch = Some((s_img, s_mem));
+        (out.y_view, out.uv_view) = (s_y, s_uv);
+    }
+    let (image, mem) = (out.image, out.mem);
 
     let ext_fd = ash::khr::external_memory_fd::Device::new(instance, device);
     // `export_fd` stays ours: it attaches the per-frame write fence (the sync_file attaches to
@@ -2108,6 +2476,7 @@ unsafe fn create_output(
             .memory(mem)
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
     )?;
+    out.export_fd = export_fd;
     let dup_export = || -> Result<std::os::fd::OwnedFd, Err> {
         Ok(std::os::fd::BorrowedFd::borrow_raw(export_fd).try_clone_to_owned()?)
     };
@@ -2140,7 +2509,7 @@ unsafe fn create_output(
     // imports a new surface for every frame and runs out of reconstruct surfaces within
     // seconds ("Failed to create the reconstruct picture").
     let shared = va_share.build_shared_buffer(dup_export()?, mr.size as usize, &layout);
-    let buffer = match shared {
+    out.buffer = match shared {
         Some(b) => b,
         None => {
             let mut buffer = GstBuffer::new();
@@ -2168,42 +2537,68 @@ unsafe fn create_output(
 
     // Per-slot command buffer, fence, descriptor set; bind the (constant) compute output
     // planes now -- the source (binding 0) is rebound each frame in convert().
-    let cmd = device.allocate_command_buffers(
+    fill_slot_sync(out, device, desc_pool, desc_layout, cmd_pool)
+}
+
+/// Allocate `out`'s command buffer, fence and descriptor set, and bind its (constant)
+/// compute output planes; the source (binding 0) is rebound each frame in convert().
+unsafe fn fill_slot_sync(
+    out: &mut Nv12Out,
+    device: &ash::Device,
+    desc_pool: vk::DescriptorPool,
+    desc_layout: vk::DescriptorSetLayout,
+    cmd_pool: vk::CommandPool,
+) -> Result<(), Err> {
+    out.cmd = device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
             .command_pool(cmd_pool)
             .command_buffer_count(1),
     )?[0];
-    let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+    out.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
     let dsls = [desc_layout];
-    let desc_set = device.allocate_descriptor_sets(
+    out.desc_set = device.allocate_descriptor_sets(
         &vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(desc_pool)
             .set_layouts(&dsls),
     )?[0];
-    let y_info = [image_info(y_view)];
-    let uv_info = [image_info(uv_view)];
+    let y_info = [image_info(out.y_view)];
+    let uv_info = [image_info(out.uv_view)];
     device.update_descriptor_sets(
         &[
-            write_img(desc_set, 1, vk::DescriptorType::STORAGE_IMAGE, &y_info),
-            write_img(desc_set, 2, vk::DescriptorType::STORAGE_IMAGE, &uv_info),
+            write_img(out.desc_set, 1, vk::DescriptorType::STORAGE_IMAGE, &y_info),
+            write_img(out.desc_set, 2, vk::DescriptorType::STORAGE_IMAGE, &uv_info),
         ],
         &[],
     );
+    Ok(())
+}
 
-    Ok(Nv12Out {
-        image,
-        mem,
-        buffer,
-        export_fd,
-        scratch,
-        y_view,
-        uv_view,
-        cmd,
-        fence,
-        desc_set,
-        import: None,
-        in_flight: false,
-    })
+/// Free one ring slot. `owns_image`: the export image, its memory and export fd are ours
+/// (dmabuf path), not the encoder pool's (encode-src path). The cached import is freed by
+/// the caller; the descriptor set goes back with its pool.
+unsafe fn destroy_output(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    out: Nv12Out,
+    owns_image: bool,
+) {
+    device.destroy_image_view(out.y_view, None);
+    device.destroy_image_view(out.uv_view, None);
+    if let Some((s_img, s_mem)) = out.scratch {
+        device.destroy_image(s_img, None);
+        device.free_memory(s_mem, None);
+    }
+    if owns_image {
+        device.destroy_image(out.image, None);
+        device.free_memory(out.mem, None);
+        if out.export_fd >= 0 {
+            libc::close(out.export_fd);
+        }
+    }
+    device.destroy_fence(out.fence, None);
+    if out.cmd != vk::CommandBuffer::null() {
+        device.free_command_buffers(cmd_pool, &[out.cmd]);
+    }
 }
 
 /// Build one encode-src ring slot: a buffer from the encoder's `GstVulkanImageBufferPool`
@@ -2226,6 +2621,48 @@ unsafe fn create_encode_output(
     fmt: PixFmt,
     linear_encode_src: bool,
 ) -> Result<Nv12Out, Err> {
+    let mut out = Nv12Out::empty();
+    match fill_encode_output(
+        &mut out,
+        device,
+        memp,
+        gst_device,
+        codec,
+        profile,
+        queue_families,
+        desc_pool,
+        desc_layout,
+        cmd_pool,
+        width,
+        height,
+        fmt,
+        linear_encode_src,
+    ) {
+        Ok(()) => Ok(out),
+        Err(e) => {
+            destroy_output(device, cmd_pool, out, false);
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_encode_output(
+    out: &mut Nv12Out,
+    device: &ash::Device,
+    memp: &vk::PhysicalDeviceMemoryProperties,
+    gst_device: &gstreamer_vulkan::VulkanDevice,
+    codec: crate::utils::video_info::VulkanCodec,
+    profile: &str,
+    queue_families: &[u32],
+    desc_pool: vk::DescriptorPool,
+    desc_layout: vk::DescriptorSetLayout,
+    cmd_pool: vk::CommandPool,
+    width: u32,
+    height: u32,
+    fmt: PixFmt,
+    linear_encode_src: bool,
+) -> Result<(), Err> {
     let buffer = crate::utils::vulkan_share::alloc_encode_src_buffer(
         gst_device,
         width,
@@ -2239,6 +2676,9 @@ unsafe fn create_encode_output(
     .ok_or("encode-src image allocation failed")?;
     let out_img = crate::utils::vulkan_share::recover_vk_image(&buffer)
         .ok_or("encode-src buffer is not a single GstVulkanImageMemory")?;
+    // The pool owns the encode-src image memory; `mem` stays null.
+    out.buffer = buffer;
+    out.image = out_img;
 
     // LINEAR storage scratch (compute writes here; copied into the encode-src image).
     let (s_img, s_mem, y_view, uv_view) = create_storage(
@@ -2250,6 +2690,8 @@ unsafe fn create_encode_output(
         false,
         fmt,
     )?;
+    out.scratch = Some((s_img, s_mem));
+    (out.y_view, out.uv_view) = (y_view, uv_view);
 
     // Diagnostic for the RX 9070 green-bar/jump report: if the encoder's pool gives us an
     // encode-src image padded beyond width*height*3/2 (e.g. RDNA4 row-alignment), our copy
@@ -2261,42 +2703,7 @@ unsafe fn create_encode_output(
         device.get_image_memory_requirements(s_img).size,
     );
 
-    let cmd = device.allocate_command_buffers(
-        &vk::CommandBufferAllocateInfo::default()
-            .command_pool(cmd_pool)
-            .command_buffer_count(1),
-    )?[0];
-    let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-    let dsls = [desc_layout];
-    let desc_set = device.allocate_descriptor_sets(
-        &vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(desc_pool)
-            .set_layouts(&dsls),
-    )?[0];
-    let y_info = [image_info(y_view)];
-    let uv_info = [image_info(uv_view)];
-    device.update_descriptor_sets(
-        &[
-            write_img(desc_set, 1, vk::DescriptorType::STORAGE_IMAGE, &y_info),
-            write_img(desc_set, 2, vk::DescriptorType::STORAGE_IMAGE, &uv_info),
-        ],
-        &[],
-    );
-
-    Ok(Nv12Out {
-        image: out_img,
-        mem: vk::DeviceMemory::null(), // the pool owns the encode-src image memory
-        buffer,
-        export_fd: -1,
-        scratch: Some((s_img, s_mem)),
-        y_view,
-        uv_view,
-        cmd,
-        fence,
-        desc_set,
-        import: None,
-        in_flight: false,
-    })
+    fill_slot_sync(out, device, desc_pool, desc_layout, cmd_pool)
 }
 
 fn mem_type(
@@ -2415,5 +2822,280 @@ mod legacy_environment_tests {
             .env("WOLF_VULKAN_DUMP", "/tmp/legacy-frame").env("WOLF_VULKAN_DUMP_FRAME", "31")
             .status().unwrap();
         assert!(status.success());
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    //! Pixel-exact checks of the converter on a real GPU: a solid fp16 RGBA dmabuf goes in,
+    //! the exported NV12/P010 planes are read back and compared with the expected codes.
+    use super::*;
+    use smithay::backend::allocator::dmabuf::DmabufAllocator;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    macro_rules! skip {
+        ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
+    }
+
+    const W: u32 = 64;
+    const H: u32 = 64;
+
+    /// SMPTE ST 2084 inverse EOTF: normalised linear light (1.0 = 10000 nits) -> PQ code.
+    fn pq_oetf(l: f64) -> f64 {
+        let (m1, m2) = (0.1593017578125, 78.84375);
+        let (c1, c2, c3) = (0.8359375, 18.8515625, 18.6875);
+        let lm = l.powf(m1);
+        ((c1 + c2 * lm) / (1.0 + c3 * lm)).powf(m2)
+    }
+
+    /// A LINEAR fp16 RGBA dmabuf on `node` filled with `rgb` (alpha 1), drawn by GLES on the
+    /// same GPU as the compositor draws its frames. Filling it with the CPU instead lets the
+    /// GPU sample a stale cache sector of whatever the memory held before (one in a few
+    /// hundred conversions on NVIDIA), which the compositor's GPU-drawn frames never hit.
+    fn solid_fp16(node: DrmNode, rgb: [f32; 3]) -> Option<Dmabuf> {
+        use smithay::backend::renderer::{Bind, Frame, Renderer};
+        use smithay::utils::{Physical, Rectangle, Size, Transform};
+        let gbm = crate::utils::allocator::new_gbm_device(node)?;
+        let mut alloc = DmabufAllocator(GbmAllocator::new(gbm, GbmBufferFlags::RENDERING));
+        let dmabuf = alloc
+            .create_buffer(W, H, DrmFourcc::Abgr16161616f, &[Modifier::Linear])
+            .ok()?;
+        let mut renderer = crate::utils::renderer::setup_renderer(Some(node));
+        let size: Size<i32, Physical> = (W as i32, H as i32).into();
+        let mut bound = dmabuf.clone();
+        let mut target = renderer.bind(&mut bound).ok()?;
+        let mut frame = renderer.render(&mut target, size, Transform::Normal).ok()?;
+        frame
+            .clear(
+                [rgb[0], rgb[1], rgb[2], 1.0].into(),
+                &[Rectangle::from_size(size)],
+            )
+            .ok()?;
+        frame.finish().ok()?.wait().ok()?;
+        drop(target);
+        Some(dmabuf)
+    }
+
+    /// Convert a solid `rgb` frame with `color` and return every (Y, Cb, Cr) sample code
+    /// (P010: the 10-bit code, after checking the low 6 bits are zero).
+    fn convert_solid(
+        node: DrmNode,
+        fmt: PixFmt,
+        rgb: [f32; 3],
+        color: FrameColor,
+    ) -> Option<(Vec<u16>, Vec<(u16, u16)>)> {
+        let src = solid_fp16(node, rgb)?;
+        let drm_format = match fmt {
+            PixFmt::Nv12 => "NV12",
+            PixFmt::P010 => "P010",
+        };
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(gst_video::VideoFormat::DmaDrm)
+            .field("drm-format", drm_format)
+            .width(W as i32)
+            .height(H as i32)
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let info = VideoInfoDmaDrm::from_caps(&caps).ok()?;
+        let options = ConversionOptions {
+            hdr_cm: true,
+            ..Default::default()
+        };
+        let va_share = crate::utils::va_share::VaShare::default();
+        let mut conv = VulkanNv12::new(node, info, fmt, false, true, &va_share, options)?;
+        conv.convert(&src, color).expect("convert");
+        let buffer = conv.to_gst_buffer().expect("output buffer");
+        let mem = buffer.peek_memory(0);
+        let dma = mem
+            .downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
+            .expect("dmabuf memory");
+        // The export carries our write fence: wait for it like an implicit-sync reader.
+        let mut pfd = libc::pollfd {
+            fd: dma.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pfd, 1, 5000) },
+            1,
+            "write fence never signalled"
+        );
+        let bpp = fmt.y_bytes() as usize;
+        // Read what the shader wrote through Vulkan, as the GPU consumers do: RADV's export
+        // is in memory the CPU can't map.
+        let data = conv.read_output().expect("GPU readback");
+        let row = W as usize * bpp;
+        let (offsets, strides) = ([0, row * H as usize], [row, row]);
+        let sample = |off: usize| -> u16 {
+            if bpp == 1 {
+                data[off] as u16
+            } else {
+                let v = u16::from_le_bytes([data[off], data[off + 1]]);
+                assert_eq!(v & 0x3f, 0, "P010 sample {v:#06x} has low bits set");
+                v >> 6
+            }
+        };
+        let mut ys = Vec::new();
+        for y in 0..H as usize {
+            for x in 0..W as usize {
+                ys.push(sample(offsets[0] + y * strides[0] + x * bpp));
+            }
+        }
+        let mut cs = Vec::new();
+        for y in 0..H as usize / 2 {
+            for x in 0..W as usize / 2 {
+                let o = offsets[1] + y * strides[1] + x * 2 * bpp;
+                cs.push((sample(o), sample(o + bpp)));
+            }
+        }
+        Some((ys, cs))
+    }
+
+    /// The converters these tests open share the process-wide device pool; one test at a
+    /// time, or another test can take the device a test expects back.
+    static POOL: Mutex<()> = Mutex::new(());
+
+    fn node() -> Option<DrmNode> {
+        gst::init().unwrap();
+        let path = std::env::var("NV12_TEST_NODE").ok()?;
+        DrmNode::from_path(path).ok()
+    }
+
+    fn assert_solid(
+        label: &str,
+        (ys, cs): &(Vec<u16>, Vec<(u16, u16)>),
+        y: u16,
+        cb: u16,
+        cr: u16,
+        tol: u16,
+    ) {
+        let near = |a: u16, b: u16| a.abs_diff(b) <= tol;
+        if let Some(i) = ys.iter().position(|&v| !near(v, y)) {
+            panic!(
+                "{label}: Y[{i}] (x {}, y {}) = {} (expected {y}); {} of {} samples wrong",
+                i % W as usize,
+                i / W as usize,
+                ys[i],
+                ys.iter().filter(|&&v| !near(v, y)).count(),
+                ys.len()
+            );
+        }
+        if let Some(i) = cs.iter().position(|&(b, r)| !(near(b, cb) && near(r, cr))) {
+            panic!(
+                "{label}: CbCr[{i}] = {:?} (expected {cb},{cr}); {} of {} samples wrong",
+                cs[i],
+                cs.iter()
+                    .filter(|&&(b, r)| !(near(b, cb) && near(r, cr)))
+                    .count(),
+                cs.len()
+            );
+        }
+    }
+
+    // Converters on one GPU reuse a device instead of destroying it (see `PooledDevice`).
+    #[test]
+    #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
+    fn a_dropped_converter_hands_its_device_to_the_next_one() {
+        let _pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(node) = node() else {
+            skip!("NV12_TEST_NODE unset");
+        };
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(gst_video::VideoFormat::DmaDrm)
+            .field("drm-format", "NV12")
+            .width(W as i32)
+            .height(H as i32)
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let info = VideoInfoDmaDrm::from_caps(&caps).unwrap();
+        let va_share = crate::utils::va_share::VaShare::default();
+        let open = || {
+            VulkanNv12::new(
+                node,
+                info.clone(),
+                PixFmt::Nv12,
+                false,
+                false,
+                &va_share,
+                ConversionOptions::default(),
+            )
+            .expect("converter")
+        };
+        let first = open();
+        let device = first.device.handle();
+        drop(first);
+        let second = open();
+        assert_eq!(second.device.handle(), device, "the device was not reused");
+        // A converter alive at the same time gets a device of its own.
+        let third = open();
+        assert_ne!(third.device.handle(), device);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
+    fn p010_samples_are_exact_10_bit_limited_range_codes() {
+        let _pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(node) = node() else {
+            skip!("NV12_TEST_NODE unset");
+        };
+        let sdr = FrameColor::default();
+        let Some(white) = convert_solid(node, PixFmt::P010, [1.0; 3], sdr) else {
+            skip!("fp16 source or P010 converter unavailable on this GPU");
+        };
+        // BT.709 limited range: white 940, black 64, neutral chroma 512, exact.
+        assert_solid("p010 white", &white, 940, 512, 512, 0);
+        let black = convert_solid(node, PixFmt::P010, [0.0; 3], sdr).unwrap();
+        assert_solid("p010 black", &black, 64, 512, 512, 0);
+        // Red: Y = 64 + 876 * 0.2126, Cb = 512 - 896 * 0.2126 / 1.8556, Cr = 960.
+        let red = convert_solid(node, PixFmt::P010, [1.0, 0.0, 0.0], sdr).unwrap();
+        assert_solid("p010 red", &red, 250, 409, 960, 0);
+        // HDR output, PQ content: BT.2020 matrix only.
+        let pq = FrameColor {
+            output_hdr: true,
+            content: ContentTransfer::Pq,
+        };
+        let grey = convert_solid(node, PixFmt::P010, [0.5; 3], pq).unwrap();
+        assert_solid("p010 pq grey", &grey, 502, 512, 512, 0);
+        let pq_red = convert_solid(node, PixFmt::P010, [0.5, 0.0, 0.0], pq).unwrap();
+        assert_solid("p010 pq red", &pq_red, 179, 449, 736, 0);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
+    fn nv12_tone_maps_pq_content_instead_of_showing_it_as_gamma() {
+        let _pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(node) = node() else {
+            skip!("NV12_TEST_NODE unset");
+        };
+        // PQ-encoded SDR reference white (203 nits): tone-mapped, it lands near the top of
+        // the SDR range; passed through the sRGB shader it would read as mid grey (~143).
+        let ref_white = pq_oetf(203.0 / 10000.0) as f32;
+        let roll = 0.8 + 0.2 * (1.0 - (-(1.0f64 - 0.8) / 0.2).exp());
+        let srgb = 1.055 * roll.powf(1.0 / 2.4) - 0.055;
+        let expect_y = (255.0 * (0.859 * srgb + 0.0625)).round() as u16;
+        for output_hdr in [false, true] {
+            let color = FrameColor {
+                output_hdr,
+                content: ContentTransfer::Pq,
+            };
+            let Some(out) = convert_solid(node, PixFmt::Nv12, [ref_white; 3], color) else {
+                skip!("fp16 source or NV12 converter unavailable on this GPU");
+            };
+            // NV12 never carries HDR: a requested HDR output is still tone-mapped to SDR.
+            assert_solid(
+                &format!("nv12 pq white (output_hdr={output_hdr})"),
+                &out,
+                expect_y,
+                128,
+                128,
+                1,
+            );
+        }
+        // SDR content keeps the regular BT.601 shader.
+        let white = convert_solid(node, PixFmt::Nv12, [1.0; 3], FrameColor::default()).unwrap();
+        assert_solid("nv12 sdr white", &white, 235, 128, 128, 1);
     }
 }

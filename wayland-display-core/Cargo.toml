@@ -59,7 +59,10 @@ test-log = { version = "0.2.18", features = ["trace"] }
 
 [dependencies.smithay]
 git = "https://github.com/games-on-whales/smithay"
-rev = "a166cf4c94b5aedc332a65aa1dd753e8148829c3"
+# Branch fix/upstream-fixes-0.7: a166cf4 (0.7.0) plus the upstream drm_syncobj leak fixes
+# (0d49747f, 52a47d10), the 0.7-compatible upstream fixes since, a seat leak fix in the
+# keyboard focus destroy hook, and an EGL display terminate race fix.
+rev = "f758c0ca62923741ab2b94ce6ddb0525c59703ca"
 default-features = false
 features = [
     "backend_drm",

@@ -86,27 +86,36 @@ fn debounced_flip_drives_frame_color_and_refusal_pins_sdr() {
     f.round_trip();
 
     // Before the debounce elapses the frame stays tagged SDR, so PQ content must be
-    // converted for an SDR output (tone-mapped), never passed through.
+    // converted for an SDR output (tone-mapped by the compositor), never passed through.
     f.server.update_hdr_state();
     assert!(hdr_states(&rx).is_empty());
+    f.server.create_frame().expect("frame");
     assert_eq!(
-        f.server.frame_color(),
+        f.server.last_frame_color,
         FrameColor {
             output_hdr: false,
-            content: ContentTransfer::Pq
+            content: ContentTransfer::Sdr
         }
     );
 
     std::thread::sleep(Duration::from_millis(700));
     f.server.update_hdr_state();
     assert_eq!(hdr_states(&rx), vec![(true, None)]);
-    assert!(f.server.frame_color().output_hdr);
+    assert!(f.server.output_hdr());
+    f.server.create_frame().expect("frame");
+    assert_eq!(
+        f.server.last_frame_color,
+        FrameColor {
+            output_hdr: true,
+            content: ContentTransfer::Pq
+        }
+    );
 
     // Downstream refused HDR: the very next frame is SDR, signalled once, and it stays so.
     f.server.refuse_hdr();
     assert_eq!(hdr_states(&rx), vec![(false, None)]);
     assert!(!f.server.output_hdr_state());
-    assert!(!f.server.frame_color().output_hdr);
+    assert!(!f.server.output_hdr());
     std::thread::sleep(Duration::from_millis(700));
     f.server.update_hdr_state();
     f.server.update_hdr_state();
@@ -226,7 +235,7 @@ fn hdr_metadata_removal_restores_defaults_without_a_mode_flip() {
     f.round_trip();
     f.server.update_hdr_state();
     assert_eq!(hdr_states(&rx), vec![(true, None)]);
-    assert!(f.server.frame_color().output_hdr);
+    assert!(f.server.output_hdr());
 }
 
 #[test]
@@ -265,5 +274,38 @@ fn color_state_waits_for_the_buffer_acquire_blocker() {
     assert!(
         f.server.output_hdr_state(),
         "releasing the buffer must release its color state"
+    );
+}
+
+#[test]
+fn renegotiating_the_output_lifts_a_refusal() {
+    let mut f = two_windows();
+    set_pq(&mut f, 1, None);
+    f.client.commit_window(1);
+    f.round_trip();
+    f.server.refuse_hdr();
+    assert!(!f.server.output_hdr_state());
+
+    // A refusal belongs to the output it was made for (e.g. NV12 caps, which cannot carry
+    // HDR); renegotiated caps may accept HDR.
+    let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, 640, 480)
+        .fps(gst::Fraction::new(60, 1))
+        .build()
+        .unwrap();
+    apply_video_info(
+        &mut f.server,
+        GstVideoInfo::RAW(info),
+        &RenderTarget::Software,
+        None,
+    );
+    assert!(f.server.output_hdr_state());
+}
+
+#[test]
+fn hdr_texture_shaders_compile() {
+    let mut f = Fixture::with_hdr(true);
+    assert!(
+        f.server.hdr_programs().is_some(),
+        "the GLES driver must accept the HDR texture shaders"
     );
 }

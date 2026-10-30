@@ -79,6 +79,50 @@ unsafe extern "C" {
     fn wayland_display_vk_prepare_encode_image(memory: *mut gst::ffi::GstMemory);
 }
 
+/// Devices minted by an element that went away, kept for the next element on the same GPU
+/// instead of being destroyed: `vkDestroyDevice` can deadlock NVIDIA's driver against
+/// another session's EGL calls (see `vulkan_nv12::PooledDevice`). One element holds a
+/// device at a time, so a session still gets a device of its own, and a lost device is
+/// never pooled.
+static MINTED_POOL: Mutex<Vec<(Option<u32>, VulkanInstance, VulkanDevice)>> =
+    Mutex::new(Vec::new());
+
+/// Pool `device` (minted on `minor`) unless it was lost.
+fn return_minted(minor: Option<u32>, instance: VulkanInstance, device: VulkanDevice) {
+    if !device_healthy(&device) {
+        tracing::warn!("vulkan_share: minted device lost; not reusing it");
+        return;
+    }
+    MINTED_POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((minor, instance, device));
+}
+
+/// Whether `device` still works: a fence on a lost device reports `VK_ERROR_DEVICE_LOST`.
+/// Needs no queue, so it doesn't race other users of the device.
+fn device_healthy(device: &VulkanDevice) -> bool {
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return false;
+        };
+        let instance = ash::Instance::load(
+            entry.static_fn(),
+            wayland_display_vk_instance(device.as_ptr()),
+        );
+        let device = ash::Device::load(
+            instance.fp_v1_0(),
+            wayland_display_vk_device(device.as_ptr()),
+        );
+        let Ok(fence) = device.create_fence(&vk::FenceCreateInfo::default(), None) else {
+            return false;
+        };
+        let healthy = device.get_fence_status(fence).is_ok();
+        device.destroy_fence(fence, None);
+        healthy
+    }
+}
+
 /// Raw Vulkan handles + queue pulled out of the shared `GstVulkanDevice`, ready to drive an
 /// `ash`-loaded device.
 #[derive(Clone, Debug)]
@@ -160,6 +204,29 @@ pub struct VulkanShare {
     /// the converter's extensions, or a downstream encoder on another device); the element
     /// then stops offering `memory:VulkanImage` and negotiates dmabuf/RGBA instead.
     refused: std::sync::atomic::AtomicBool,
+    /// The render node `device` was minted for by
+    /// [`ensure_owned_device`](VulkanShare::ensure_owned_device); `None` when the slot is
+    /// empty or holds a device absorbed from `set_context`, which has no node to compare.
+    minted_for: Mutex<Option<Option<u32>>>,
+}
+
+impl Drop for VulkanShare {
+    fn drop(&mut self) {
+        let minted_for = *self.minted_for.get_mut().unwrap_or_else(|e| e.into_inner());
+        let device = self
+            .device
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let instance = self
+            .instance
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let (Some(minor), Some(device), Some(instance)) = (minted_for, device, instance) {
+            return_minted(minor, instance, device);
+        }
+    }
 }
 
 impl VulkanShare {
@@ -173,7 +240,13 @@ impl VulkanShare {
             device: Mutex::new(None),
             device_ready: Condvar::new(),
             refused: Default::default(),
+            minted_for: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn minted_pool_len() -> usize {
+        MINTED_POOL.lock().unwrap().len()
     }
 
     /// Pull the shared `GstVulkanDevice` out of a received `GstContext` and stash it in **this
@@ -226,6 +299,7 @@ impl VulkanShare {
         }
         tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
         *slot = Some(device);
+        *self.minted_for.lock().unwrap() = None;
         self.device_ready.notify_all();
         true
     }
@@ -241,6 +315,13 @@ impl VulkanShare {
     /// This element's shared device, if one has been created (or absorbed).
     pub fn shared_device(&self) -> Option<VulkanDevice> {
         self.device.lock().unwrap().clone()
+    }
+
+    /// Forget a refusal of the Vulkan output at the end of a run: the next run may be linked
+    /// to a different encoder, and its negotiation re-checks the device.
+    pub fn end_run(&self) {
+        self.refused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether `memory:VulkanImage` output may still be offered; see `refused`.
@@ -392,6 +473,7 @@ impl VulkanShare {
     /// branch — so RADV behaves byte-identically; only where the result is stored moved from a
     /// `static` slot to `self`.
     /// LOCK ORDER: `device` then `instance`, and this is the only method that holds both.
+    /// `minted_for` is only ever taken innermost, under `device`.
     /// The `device` guard is deliberately held across the instance open, `Entry::load` and
     /// device enumeration below -- it is the mutual exclusion that stops two threads each
     /// minting a `VkDevice` for this element. Every other accessor takes a single lock as a
@@ -400,13 +482,45 @@ impl VulkanShare {
     pub fn ensure_owned_device(&self, target_minor: Option<u32>) -> Option<VulkanDevice> {
         let mut slot = self.device.lock().unwrap();
         if let Some(d) = slot.clone() {
-            // Whatever this element already has wins over target_minor. Usually that is the
-            // device minted below on that very node, so the two agree; the slot records no
-            // provenance, so this branch cannot tell the two apart. When they disagree the
-            // device was injected by an embedder and the encoder is already bound to it, and
-            // minting a second device on the requested node would put producer and encoder on
-            // different VkDevices, which is worse than honouring the wrong node.
-            return Some(d);
+            let minted_for = *self.minted_for.lock().unwrap();
+            // A device injected by an embedder wins over target_minor: the encoder is
+            // already bound to it, and minting a second device on the requested node would
+            // put producer and encoder on different VkDevices, which is worse than honouring
+            // the wrong node. A device this element minted for another node (render-node
+            // changed between runs) is stale; mint a new one on the requested node.
+            if minted_for.is_none_or(|minor| minor == target_minor) {
+                return Some(d);
+            }
+            tracing::info!(
+                "vulkan_share: render node changed ({minted_for:?} -> {target_minor:?}); \
+                 creating a new device"
+            );
+            if let (Some(old), Some(minor), Some(instance)) = (
+                slot.take(),
+                minted_for,
+                self.instance.lock().unwrap().take(),
+            ) {
+                return_minted(minor, instance, old);
+            }
+            *self.minted_for.lock().unwrap() = None;
+        }
+        // The first Vulkan use in the process must not race another; see the function.
+        crate::utils::renderer::keep_vulkan_drivers_loaded();
+        let pooled = {
+            let mut pool = MINTED_POOL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pool.iter()
+                .position(|(minor, _, _)| *minor == target_minor)
+                .map(|i| pool.swap_remove(i))
+        };
+        if let Some((_, instance, device)) = pooled {
+            *self.instance.lock().unwrap() = Some(instance);
+            *slot = Some(device.clone());
+            *self.minted_for.lock().unwrap() = Some(target_minor);
+            self.device_ready.notify_all();
+            tracing::info!("vulkan_share: reusing a pooled GstVulkanDevice");
+            return Some(device);
         }
         let instance = VulkanInstance::new();
         if let Err(e) = instance.open() {
@@ -445,6 +559,7 @@ impl VulkanShare {
         }
         *self.instance.lock().unwrap() = Some(instance);
         *slot = Some(device.clone());
+        *self.minted_for.lock().unwrap() = Some(target_minor);
         self.device_ready.notify_all();
         tracing::info!(
             "vulkan_share: created per-element shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
@@ -759,5 +874,47 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
         }
         let image = wayland_display_vk_image(mem_ptr);
         (image != vk::Image::null()).then_some(image)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Elements on one GPU reuse a minted device instead of destroying it (see MINTED_POOL).
+    #[test]
+    #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
+    fn a_finalized_element_hands_its_device_to_the_next_one() {
+        let Some(minor) = std::env::var("NV12_TEST_NODE")
+            .ok()
+            .and_then(|node| crate::utils::vulkan_nv12::render_node_minor(&node))
+        else {
+            eprintln!("skip: NV12_TEST_NODE unset");
+            return;
+        };
+        gst::init().unwrap();
+        let first = VulkanShare::new();
+        let device = first
+            .ensure_owned_device(Some(minor))
+            .expect("minted device");
+        let raw = device.as_ptr();
+        drop(device);
+        drop(first);
+        assert!(
+            VulkanShare::minted_pool_len() >= 1,
+            "the device was not pooled"
+        );
+        let second = VulkanShare::new();
+        let reused = second.ensure_owned_device(Some(minor)).expect("device");
+        assert_eq!(reused.as_ptr(), raw, "the device was not reused");
+        // An element alive at the same time mints a device of its own.
+        let third = VulkanShare::new();
+        assert_ne!(
+            third
+                .ensure_owned_device(Some(minor))
+                .expect("device")
+                .as_ptr(),
+            raw
+        );
     }
 }

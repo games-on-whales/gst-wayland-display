@@ -1468,7 +1468,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/games-on-whales/smithay?rev=a166cf4c94b5aedc332a65aa1dd753e8148829c3#a166cf4c94b5aedc332a65aa1dd753e8148829c3"
+source = "git+https://github.com/games-on-whales/smithay?rev=f758c0ca62923741ab2b94ce6ddb0525c59703ca#f758c0ca62923741ab2b94ce6ddb0525c59703ca"
 dependencies = [
  "appendlist",
  "atomic_float",

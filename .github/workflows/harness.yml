@@ -35,6 +35,9 @@ jobs:
       - name: Harness
         run: bash ci/harness.sh lint build unit
 
+      - name: Type-check the raw CUDA producer path without a GPU
+        run: cargo check --workspace --features cuda
+
   # Full matrix (gpu / integration / bench) on real hardware. Off by default;
   # enable by registering a self-hosted runner labelled `gpu` and setting the
   # repository variable GPU_RUNNER=true. Require a render node and at least

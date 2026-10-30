@@ -107,6 +107,23 @@ pub fn run_client(
     rgb: [u8; 3],
     pq: bool,
 ) {
+    run_switching_client(
+        socket,
+        stop,
+        rgb,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(pq)),
+    )
+}
+
+/// Like [`run_client`], but follows `pq` while running: each change declares ST 2084 PQ /
+/// BT.2020 or unsets the image description (back to undeclared sRGB) and commits, as a
+/// game toggling its HDR setting does.
+pub fn run_switching_client(
+    socket: std::path::PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rgb: [u8; 3],
+    pq: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::sync::atomic::Ordering;
     let conn = Connection::from_socket(UnixStream::connect(socket).expect("connect")).unwrap();
     let mut queue = conn.new_event_queue();
@@ -147,21 +164,31 @@ pub fn run_client(
     let pool = shm.create_pool(file.as_fd(), w * h * 4, &qh, ());
     let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Xrgb8888, &qh, ());
 
-    if pq {
-        let color = color.expect("wp_color_manager_v1 (dynamic-hdr off?)");
-        let params = color.create_parametric_creator(&qh, ());
-        params.set_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
-        params.set_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
-        let desc = params.create(&qh, ());
-        let cm_surface = color.get_surface(&surface, &qh, ());
-        cm_surface.set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
-    }
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, w, h);
-    surface.commit();
-    conn.flush().unwrap();
-
+    let mut cm_surface = None;
+    let mut declared = None;
     while !stop.load(Ordering::Relaxed) {
+        let want = pq.load(Ordering::Relaxed);
+        if declared != Some(want) {
+            if want {
+                let color = color
+                    .as_ref()
+                    .expect("wp_color_manager_v1 (dynamic-hdr off?)");
+                let params = color.create_parametric_creator(&qh, ());
+                params.set_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
+                params.set_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
+                let desc = params.create(&qh, ());
+                cm_surface
+                    .get_or_insert_with(|| color.get_surface(&surface, &qh, ()))
+                    .set_image_description(&desc, wp_color_manager_v1::RenderIntent::Perceptual);
+            } else if let Some(cm_surface) = &cm_surface {
+                cm_surface.unset_image_description();
+            }
+            // The declaration latches with the next commit.
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage_buffer(0, 0, w, h);
+            surface.commit();
+            declared = Some(want);
+        }
         let _ = queue.dispatch_pending(&mut state);
         let _ = conn.flush();
         if let Some(guard) = conn.prepare_read() {

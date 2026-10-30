@@ -442,6 +442,24 @@ pub enum GsBufferType {
 }
 
 impl GsBufferType {
+    /// Raw RGB output (RAW, plain dmabuf, CUDA) leaves colour conversion to downstream, so
+    /// each buffer carries how its samples are encoded (see `utils::source_color`): PQ when
+    /// the frame was composited in PQ. NV12/P010 output is already converted and untagged.
+    fn tag_source_color(
+        &self,
+        output: Result<GstBuffer, Box<dyn std::error::Error>>,
+        color: FrameColor,
+    ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        let mut output = output?;
+        if !matches!(self, GsBufferType::NV12(_) | GsBufferType::VULKAN(_)) {
+            crate::utils::source_color::add_source_color_meta(
+                &mut output,
+                color.content == crate::utils::color::ContentTransfer::Pq,
+            )?;
+        }
+        Ok(output)
+    }
+
     /// The fourcc of the RGBA dmabuf the scene is rendered into for the Vulkan-converter buffer
     /// types (NV12/VULKAN) -- i.e. the GLES render target that is also the converter's input.
     /// `None` for buffer types without a separate RGBA render target. The HDR spike uses this to
@@ -497,7 +515,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         renderer: &mut GlesRenderer,
         color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
-        match self {
+        let output: Result<GstBuffer, Box<dyn std::error::Error>> = match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer.copy_framebuffer(
                     target,
@@ -624,7 +642,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     buffer_pool.as_ref(),
                 )?)
             }
-        }
+        };
+        self.tag_source_color(output, color)
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -634,7 +653,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         renderer: &mut GlesRenderer,
         color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
-        match self {
+        let output: Result<GstBuffer, Box<dyn std::error::Error>> = match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer.copy_framebuffer(
                     target,
@@ -746,7 +765,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                 v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
-        }
+        };
+        self.tag_source_color(output, color)
     }
 
     fn get_video_info(&self) -> VideoInfoTypes {

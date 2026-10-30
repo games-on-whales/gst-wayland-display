@@ -1,8 +1,9 @@
 use smithay::{
-    delegate_seat,
+    backend::input::TabletToolDescriptor,
+    delegate_seat, delegate_tablet_manager,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::wayland_server::Resource,
-    wayland::selection::data_device::set_data_device_focus,
+    wayland::{selection::data_device::set_data_device_focus, tablet_manager::TabletSeatHandler},
 };
 
 use crate::comp::{FocusTarget, State};
@@ -29,8 +30,17 @@ impl SeatHandler for State {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        self.cursor_state = image;
+        self.set_pointer_cursor_image(image);
     }
 }
 
 delegate_seat!(State);
+
+impl TabletSeatHandler for State {
+    fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
+        // The pen's image replaces the composited cursor until the mouse moves again.
+        self.set_tablet_cursor_image(image);
+    }
+}
+
+delegate_tablet_manager!(State);

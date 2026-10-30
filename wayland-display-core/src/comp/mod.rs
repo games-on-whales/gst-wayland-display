@@ -10,6 +10,7 @@ use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::{
     backend::{
         allocator::{Fourcc, dmabuf::Dmabuf},
@@ -47,7 +48,9 @@ use smithay::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
         },
     },
-    utils::{Clock, DeviceFd, Logical, Monotonic, Physical, Point, Size, Transform},
+    utils::{
+        Clock, DeviceFd, Logical, Monotonic, Physical, Point, SERIAL_COUNTER, Size, Transform,
+    },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
@@ -75,7 +78,7 @@ use tracing::debug;
 
 mod focus;
 mod input;
-mod rendering;
+pub(crate) mod rendering;
 
 pub use self::focus::*;
 pub use self::input::*;
@@ -89,7 +92,9 @@ use crate::utils::allocator::{
 use crate::utils::color::FrameColor;
 use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
-use crate::wayland::handlers::color_management::{SurfaceHdrColor, surface_hdr_color};
+use crate::wayland::handlers::color_management::{
+    HdrMeta, SurfaceHdrColor, surface_data_visible_hdr, surface_hdr_color,
+};
 use crate::{
     utils::RenderTarget,
     wayland::protocols::{
@@ -139,6 +144,8 @@ pub struct State {
     cursor_element: MemoryRenderBuffer,
     pub cursor_state: CursorImageStatus,
     surpressed_keys: HashSet<u32>,
+    /// Tablet tool (pen) state: per-tool focus, contact and button ownership. See `input.rs`.
+    pub(crate) tablet: input::TabletInput,
     pub pending_windows: Vec<Window>,
     /// Toplevels whose initial commit arrived before the output existed; they get their
     /// initial configure (and move to `pending_windows`) once `apply_video_info` runs.
@@ -161,6 +168,7 @@ pub struct State {
     pub shell_state: XdgShellState,
     pub shm_state: ShmState,
     viewporter_state: ViewporterState,
+    tablet_manager_state: TabletManagerState,
     cursor_event_count: i32,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     /// `wp_color_manager_v1` global id, present only when dynamic HDR is enabled. Gated so
@@ -182,10 +190,14 @@ pub struct State {
     last_hdr_state: bool,
     /// Mastering / CLL caps strings last signalled with an HDR state, so a game that updates
     /// its metadata after the flip reaches the encoder too.
-    last_hdr_meta: Option<(String, String)>,
-    /// Set when downstream refused the HDR colorimetry: the output stays SDR for the rest of
-    /// the stream instead of flipping into caps nobody accepts.
+    last_hdr_meta: Option<HdrMeta>,
+    /// Set when downstream refused the HDR colorimetry: the output stays SDR until it is
+    /// renegotiated instead of flipping into caps nobody accepts.
     hdr_refused: bool,
+    /// The HDR texture shaders that convert surfaces into the frame's working space;
+    /// compiled on first use (`Some(None)`: the driver rejected them). See
+    /// `rendering::Converted`.
+    pub(crate) hdr_programs: Option<Option<rendering::HdrPrograms>>,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -204,6 +216,11 @@ pub struct State {
     /// PQ-passthrough detection, the reverse-channel wiring and the converter-keep logic.
     /// Set by [`init`] from this element's `VulkanShare` conversion options.
     pub(crate) hdr_cm: bool,
+    /// The fixed output state under `stable-color-transport` (see
+    /// `ConversionOptions::stable_output_hdr`), snapshotted at start like `hdr_cm`.
+    pub(crate) stable_output_hdr: Option<bool>,
+    /// What the last rendered frame was converted as (see `output_hdr`).
+    pub(crate) last_frame_color: FrameColor,
 }
 
 /// HDR-capable dmabuf fourccs advertised to clients under dynamic HDR (when the GLES
@@ -296,6 +313,7 @@ impl State {
         let mut seat_state = SeatState::new();
         let shell_state = XdgShellState::new::<State>(&dh);
         let viewporter_state = ViewporterState::new::<State>(&dh);
+        let tablet_manager_state = TabletManagerState::new::<State>(&dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
 
         // Color management (staging wp_color_manager_v1). Gated behind dynamic HDR:
@@ -460,6 +478,7 @@ impl State {
             cursor_state: CursorImageStatus::default_named(),
             cursor_event_count: 0,
             surpressed_keys: HashSet::new(),
+            tablet: Default::default(),
             pending_windows: Vec::new(),
             windows_awaiting_output: Vec::new(),
             input_context: input_context.clone(),
@@ -478,6 +497,7 @@ impl State {
             shell_state,
             shm_state,
             viewporter_state,
+            tablet_manager_state,
             single_pixel_buffer_state,
             color_mgmt_global,
             frog_color_mgmt_global,
@@ -485,24 +505,88 @@ impl State {
             last_hdr_state: false,
             last_hdr_meta: None,
             hdr_refused: false,
+            hdr_programs: None,
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
             hdr_candidate_since: None,
             hdr_cm,
+            stable_output_hdr: None,
+            last_frame_color: FrameColor::default(),
         }
     }
 
-    /// The colour state of the active surface: the topmost mapped toplevel (smithay
-    /// iterates the space back to front and `raise_element` moves the focused window to
-    /// the end), using the toplevel's color state. Steam and a game can both be mapped, so the
-    /// bottom window is not the one on screen. `None` when nothing is mapped or the
-    /// surface declared no colour state.
+    /// Release the seat's input devices before the compositor state is dropped.
+    ///
+    /// smithay mints one sealed `memfd:smithay-keymap` per [`Seat::add_keyboard`] and keeps it
+    /// in the `Arc` behind the seat's `KeyboardHandle`. Dropping `State` does not close it
+    /// while a grab is installed: each device's grab slot lives inside that device's own
+    /// `Arc`, and the grabs smithay hands us hold clones of the handles. `xdg_popup.grab`
+    /// (`wayland/handlers/xdg.rs`) installs a `PopupKeyboardGrab` and a `PopupPointerGrab`
+    /// sharing one `PopupGrab`, which holds both the keyboard and the pointer handle. A grab
+    /// still active when the session ends is therefore an `Arc` pointing at itself, and a
+    /// surviving pointer grab alone keeps the keyboard (and its keymap fd) alive too: one
+    /// leaked fd per session, for the life of the process.
+    ///
+    /// So end the session by hand: unset every surviving grab (this breaks the cycles),
+    /// clear keyboard focus, and drop the seat's own handles.
+    pub(crate) fn release_seat(&mut self) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = self.clock.now().as_millis();
+        if let Some(pointer) = self.seat.get_pointer() {
+            if pointer.is_grabbed() {
+                tracing::debug!("Unsetting a pointer grab still active at shutdown.");
+                pointer.unset_grab(self, serial, time);
+            }
+            self.seat.remove_pointer();
+        }
+        if let Some(touch) = self.seat.get_touch() {
+            if touch.is_grabbed() {
+                tracing::debug!("Unsetting a touch grab still active at shutdown.");
+                touch.unset_grab(self);
+            }
+            self.seat.remove_touch();
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            if keyboard.is_grabbed() {
+                tracing::debug!("Unsetting a keyboard grab still active at shutdown.");
+                keyboard.unset_grab(self);
+            }
+            keyboard.set_focus(self, None, serial);
+            self.seat.remove_keyboard();
+        }
+    }
+
+    /// The colour state of the active window: the topmost mapped toplevel (smithay iterates
+    /// the space back to front and `raise_element` moves the focused window to the end;
+    /// Steam and a game can both be mapped, so the bottom window is not the one on screen).
+    /// The first HDR surface in its tree (root, subsurfaces, popups) wins: a browser keeps
+    /// its UI sRGB while presenting PQ video on a subsurface. Otherwise the root's own
+    /// declaration, or `None` when nothing is mapped or the root declared nothing.
     fn active_surface_hdr_color(&self) -> Option<SurfaceHdrColor> {
-        self.space
-            .elements()
-            .last()
-            .and_then(|window| window.wl_surface())
-            .and_then(|surface| surface_hdr_color(&surface))
+        let window = self.space.elements().last()?;
+        let mut hdr = None;
+        window.with_surfaces(|_, states| {
+            if hdr.is_none() {
+                hdr = surface_data_visible_hdr(states);
+            }
+        });
+        hdr.or_else(|| window.wl_surface().and_then(|s| surface_hdr_color(&s)))
+    }
+
+    /// The active window's root surface if it holds PQ content by the legacy 10-bit guess
+    /// (or its own declaration) and a buffer; see `surface_data_visible_hdr`.
+    pub(crate) fn active_root_pq(
+        &self,
+    ) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+        use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+        let root = self.space.elements().last()?.wl_surface()?.into_owned();
+        let has_buffer = with_states(&root, |states| {
+            states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .is_some_and(|state| state.lock().unwrap().buffer().is_some())
+        });
+        (has_buffer && surface_hdr_color(&root).is_some_and(|c| c.is_hdr())).then_some(root)
     }
 
     /// Whether the active surface declares HDR content (PQ, through
@@ -517,24 +601,21 @@ impl State {
 
     /// The active surface's HDR mastering / content-light-level gst caps strings. `None`
     /// when it carries no mastering metadata -- the producer then keeps its defaults.
-    fn active_surface_mastering_caps(&self) -> Option<(String, String)> {
+    pub(crate) fn active_surface_mastering_caps(&self) -> Option<HdrMeta> {
         self.active_surface_hdr_color()
             .and_then(|color| color.mastering_caps())
     }
 
-    /// How the converter must treat the next frame: the committed (debounced) output state
-    /// the element tags it with, and the transfer function of the content it samples.
-    pub(crate) fn frame_color(&self) -> FrameColor {
-        FrameColor {
-            output_hdr: self.last_hdr_state,
-            content: self
-                .active_surface_hdr_color()
-                .map(|color| color.transfer)
-                .unwrap_or_default(),
-        }
+    /// The output state the next frame is converted for: the committed (debounced) state the
+    /// element tags it with, or the fixed state of a stable transport -- SDR either way once
+    /// downstream refused HDR (an NV12 stream cannot carry it). The renderer composites in
+    /// it and records what it handed the converter in `last_frame_color`.
+    pub(crate) fn output_hdr(&self) -> bool {
+        !self.hdr_refused && self.stable_output_hdr.unwrap_or(self.last_hdr_state)
     }
 
-    /// Downstream refused the HDR colorimetry: stay SDR from now on, and switch the very
+    /// Downstream refused the HDR colorimetry: stay SDR until the output is renegotiated
+    /// (`apply_video_info`), and switch the very
     /// next frame (no debounce), since the element has already fallen back to SDR caps.
     pub(crate) fn refuse_hdr(&mut self) {
         tracing::warn!("dynamic HDR: downstream refused HDR caps; staying SDR");
@@ -547,9 +628,9 @@ impl State {
         }
     }
 
-    fn send_hdr_state(&self, hdr: bool, meta: Option<(String, String)>) {
+    fn send_hdr_state(&self, hdr: bool, meta: Option<HdrMeta>) {
         if let Some(tx) = &self.hdr_state_tx {
-            let (mastering, cll) = meta.unzip();
+            let (mastering, cll) = meta.unwrap_or_default();
             let _ = tx.send(Command::HdrState {
                 hdr,
                 mastering,
@@ -650,6 +731,32 @@ fn same_output_contract(prev: &GstVideoInfo, new: &GstVideoInfo) -> bool {
     }
 }
 
+/// The `wl_output` mode refresh for a framerate, in mHz (60/1 -> 60000, 60000/1001 -> 59940).
+/// A variable or unset framerate (`0/1`) yields 0, which `wl_output` reads as unknown.
+pub(crate) fn refresh_mhz(fps: gst::Fraction) -> i32 {
+    if fps.numer() <= 0 || fps.denom() <= 0 {
+        return 0;
+    }
+    let mhz = (fps.numer() as i64 * 1000 + fps.denom() as i64 / 2) / fps.denom() as i64;
+    mhz.min(i32::MAX as i64) as i32
+}
+
+/// The time one frame lasts at `fps` (60/1 -> 16.67ms), or `None` for a variable or unset
+/// framerate, which has no fixed frame time to pace to.
+pub(crate) fn frame_interval(fps: gst::Fraction) -> Option<Duration> {
+    if fps.numer() <= 0 || fps.denom() <= 0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(
+        fps.denom() as f64 / fps.numer() as f64,
+    ))
+}
+
+/// The time one refresh lasts for a mode refresh in mHz, or `None` when it is unknown (0).
+pub(crate) fn refresh_interval(refresh_mhz: i32) -> Option<Duration> {
+    (refresh_mhz > 0).then(|| Duration::from_secs_f64(1_000f64 / refresh_mhz as f64))
+}
+
 /// Apply a newly-negotiated `GstVideoInfo` to the compositor state: create or update
 /// the (single) Output's mode, rebuild the damage tracker + allocator, recenter the
 /// pointer, and re-send configure to every mapped toplevel clamped to the new size.
@@ -688,6 +795,9 @@ pub(crate) fn apply_video_info(
     }
 
     state.negotiated_output = Some(video_info.clone());
+    // A refusal was for the previous output contract (e.g. NV12 caps, which cannot carry HDR,
+    // or an encoder that rejected PQ); the renegotiated output may accept HDR again.
+    state.hdr_refused = false;
     let output_already_running = state.output.is_some();
     if output_already_running {
         tracing::info!("Output already running, updating with newly negotiated video info");
@@ -698,8 +808,7 @@ pub(crate) fn apply_video_info(
         base_info.format().to_fourcc()
     );
     let size: Size<i32, Physical> = (base_info.width() as i32, base_info.height() as i32).into();
-    let framerate = base_info.fps();
-    let duration = Duration::from_secs_f64(framerate.numer() as f64 / framerate.denom() as f64);
+    let refresh = refresh_mhz(base_info.fps());
 
     // init wayland objects
     let output = state.output.get_or_insert_with(|| {
@@ -717,7 +826,7 @@ pub(crate) fn apply_video_info(
     });
     let mode = OutputMode {
         size: size.into(),
-        refresh: (duration.as_secs_f64() * 1000.0).round() as i32,
+        refresh,
     };
     output.change_current_state(Some(mode), None, None, None);
     output.set_preferred(mode);
@@ -948,6 +1057,7 @@ pub(crate) fn init(
         hdr_cm,
         vulkan_share.conversion_options().hdr_peak_nits,
     );
+    state.stable_output_hdr = vulkan_share.conversion_options().stable_output_hdr;
     state.vulkan_share = vulkan_share;
     state.va_share = va_share;
     state.hdr_cm = hdr_cm;
@@ -978,21 +1088,10 @@ pub(crate) fn init(
                     state.add_input_device(&path);
                 }
                 Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
-                    let wait = if let Some(last_render) = state.last_render {
-                        let base_info = state.video_info.as_ref().unwrap().clone();
-                        let framerate = base_info.fps();
-                        let duration = Duration::from_secs_f64(
-                            framerate.denom() as f64 / framerate.numer() as f64,
-                        );
-                        let time_passed = Instant::now().duration_since(last_render);
-                        if time_passed < duration {
-                            Some(duration - time_passed)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    let wait = state.last_render.and_then(|last_render| {
+                        let duration = frame_interval(state.video_info.as_ref()?.fps())?;
+                        duration.checked_sub(Instant::now().duration_since(last_render))
+                    });
 
                     let render = move |state: &mut State, now: Instant| {
                         let _span = match tracer {
@@ -1058,11 +1157,10 @@ pub(crate) fn init(
                                             state.clock.now(),
                                             output
                                                 .current_mode()
-                                                .map(|mode| {
-                                                    Refresh::fixed(Duration::from_secs_f64(
-                                                        1_000f64 / mode.refresh as f64,
-                                                    ))
+                                                .and_then(|mode| {
+                                                    refresh_interval(mode.refresh)
                                                 })
+                                                .map(Refresh::fixed)
                                                 .unwrap_or(Refresh::Unknown),
                                             0,
                                             wp_presentation_feedback::Kind::Vsync,
@@ -1287,6 +1385,9 @@ pub(crate) fn init(
     }) {
         tracing::error!(?err, "Event loop broke.");
     }
+
+    // Close the seat's keymap memfd before `state` drops; see `State::release_seat`.
+    state.release_seat();
 }
 
 #[cfg(test)]
@@ -1346,5 +1447,41 @@ mod output_contract_tests {
             .build()
             .unwrap();
         assert!(!same_output_contract(&raw, &GstVideoInfo::RAW(par)));
+    }
+}
+
+#[cfg(test)]
+mod frame_timing_tests {
+    use super::*;
+    use gst::Fraction;
+
+    #[test]
+    fn refresh_is_the_framerate_in_mhz() {
+        assert_eq!(refresh_mhz(Fraction::new(60, 1)), 60_000);
+        assert_eq!(refresh_mhz(Fraction::new(144, 1)), 144_000);
+        assert_eq!(refresh_mhz(Fraction::new(60_000, 1001)), 59_940);
+        assert_eq!(refresh_mhz(Fraction::new(i32::MAX, 1)), i32::MAX);
+        assert_eq!(refresh_mhz(Fraction::new(0, 1)), 0);
+    }
+
+    #[test]
+    fn frame_interval_is_the_reciprocal_of_the_framerate() {
+        let at_60 = frame_interval(Fraction::new(60, 1)).unwrap();
+        assert!(
+            (at_60.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9,
+            "60 fps should pace at 16.67ms, got {at_60:?}"
+        );
+        let at_ntsc = frame_interval(Fraction::new(30_000, 1001)).unwrap();
+        assert!((at_ntsc.as_secs_f64() - 1001.0 / 30_000.0).abs() < 1e-9);
+        // A variable/unset framerate (reachable through the C API) must not panic in
+        // Duration::from_secs_f64(inf); it simply has no frame time to pace to.
+        assert_eq!(frame_interval(Fraction::new(0, 1)), None);
+    }
+
+    #[test]
+    fn refresh_interval_inverts_refresh_mhz() {
+        let interval = refresh_interval(refresh_mhz(Fraction::new(60, 1))).unwrap();
+        assert!((interval.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9);
+        assert_eq!(refresh_interval(0), None);
     }
 }
