@@ -4,12 +4,12 @@ pub mod data_device;
 pub mod dmabuf;
 pub mod drm_syncobj;
 pub mod frog_color_management;
-pub mod output;
 pub mod pointer_constraints;
-pub mod presentation;
 pub mod relative_pointer;
 pub mod seat;
 pub mod shm;
-pub mod viewporter;
 pub mod wl_drm;
 pub mod xdg;
+
+// Dispatch for every smithay protocol, through each one's `Dispatch2` user data.
+smithay::delegate_dispatch2!(crate::comp::State);

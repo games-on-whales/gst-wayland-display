@@ -1,6 +1,9 @@
 use crate::comp::State;
+use smithay::input::dnd::{DndFocus, Source};
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::utils::{Logical, Point};
 use smithay::{
-    backend::input::KeyState,
+    backend::input::{InputTime, KeyState},
     desktop::{PopupKind, Window, WindowSurface},
     input::{
         Seat,
@@ -11,13 +14,14 @@ use smithay::{
             GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent,
             PointerTarget, RelativeMotionEvent,
         },
-        touch::{DownEvent, OrientationEvent, ShapeEvent, TouchTarget, UpEvent},
+        touch::{DownEvent, FrameMarker, OrientationEvent, ShapeEvent, TouchTarget, UpEvent},
     },
     reexports::wayland_server::{backend::ObjectId, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Serial},
     wayland::seat::WaylandFocus,
 };
 use std::borrow::Cow;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FocusTarget {
@@ -84,7 +88,7 @@ impl KeyboardTarget<State> for FocusTarget {
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         match self {
             FocusTarget::Wayland(w) => match w.underlying_surface() {
@@ -320,7 +324,7 @@ impl PointerTarget<State> for FocusTarget {
         }
     }
 
-    fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {
+    fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {
         match self {
             FocusTarget::Wayland(w) => match w.underlying_surface() {
                 WindowSurface::Wayland(w) => {
@@ -349,25 +353,15 @@ impl WaylandFocus for FocusTarget {
 }
 
 impl TouchTarget<State> for FocusTarget {
-    fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent, seq: Serial) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    TouchTarget::down(w.wl_surface(), seat, data, event, seq)
-                }
-            },
-            FocusTarget::Popup(p) => TouchTarget::down(p.wl_surface(), seat, data, event, seq),
+    fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent) {
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::down(&*surface, seat, data, event)
         }
     }
 
-    fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    TouchTarget::up(w.wl_surface(), seat, data, event, seq)
-                }
-            },
-            FocusTarget::Popup(p) => TouchTarget::up(p.wl_surface(), seat, data, event, seq),
+    fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent) {
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::up(&*surface, seat, data, event)
         }
     }
 
@@ -376,63 +370,93 @@ impl TouchTarget<State> for FocusTarget {
         seat: &Seat<State>,
         data: &mut State,
         event: &smithay::input::touch::MotionEvent,
-        seq: Serial,
     ) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    TouchTarget::motion(w.wl_surface(), seat, data, event, seq)
-                }
-            },
-            FocusTarget::Popup(p) => TouchTarget::motion(p.wl_surface(), seat, data, event, seq),
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::motion(&*surface, seat, data, event)
         }
     }
 
-    fn frame(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => TouchTarget::frame(w.wl_surface(), seat, data, seq),
-            },
-            FocusTarget::Popup(p) => TouchTarget::frame(p.wl_surface(), seat, data, seq),
+    fn frame(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::frame(&*surface, seat, data, marker)
         }
     }
 
-    fn cancel(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => TouchTarget::cancel(w.wl_surface(), seat, data, seq),
-            },
-            FocusTarget::Popup(p) => TouchTarget::cancel(p.wl_surface(), seat, data, seq),
+    fn cancel(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::cancel(&*surface, seat, data, marker)
         }
     }
 
-    fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent, seq: Serial) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    TouchTarget::shape(w.wl_surface(), seat, data, event, seq)
-                }
-            },
-            FocusTarget::Popup(p) => TouchTarget::shape(p.wl_surface(), seat, data, event, seq),
+    fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent) {
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::shape(&*surface, seat, data, event)
         }
     }
 
-    fn orientation(
+    fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent) {
+        if let Some(surface) = self.wl_surface() {
+            TouchTarget::orientation(&*surface, seat, data, event)
+        }
+    }
+
+    fn last_frame(&self, seat: &Seat<State>, data: &mut State) -> Option<FrameMarker> {
+        let surface = self.wl_surface()?;
+        TouchTarget::last_frame(&*surface, seat, data)
+    }
+}
+
+impl DndFocus<State> for FocusTarget {
+    type OfferData<S>
+        = <WlSurface as DndFocus<State>>::OfferData<S>
+    where
+        S: Source;
+
+    fn enter<S: Source>(
         &self,
-        seat: &Seat<State>,
         data: &mut State,
-        event: &OrientationEvent,
-        seq: Serial,
+        dh: &DisplayHandle,
+        source: Arc<S>,
+        seat: &Seat<State>,
+        location: Point<f64, Logical>,
+        serial: &Serial,
+    ) -> Option<Self::OfferData<S>> {
+        let surface = self.wl_surface()?;
+        DndFocus::enter(&*surface, data, dh, source, seat, location, serial)
+    }
+
+    fn motion<S: Source>(
+        &self,
+        data: &mut State,
+        offer: Option<&mut Self::OfferData<S>>,
+        seat: &Seat<State>,
+        location: Point<f64, Logical>,
+        time: InputTime,
     ) {
-        match self {
-            FocusTarget::Wayland(w) => match w.underlying_surface() {
-                WindowSurface::Wayland(w) => {
-                    TouchTarget::orientation(w.wl_surface(), seat, data, event, seq)
-                }
-            },
-            FocusTarget::Popup(p) => {
-                TouchTarget::orientation(p.wl_surface(), seat, data, event, seq)
-            }
+        if let Some(surface) = self.wl_surface() {
+            DndFocus::motion(&*surface, data, offer, seat, location, time)
+        }
+    }
+
+    fn leave<S: Source>(
+        &self,
+        data: &mut State,
+        offer: Option<&mut Self::OfferData<S>>,
+        seat: &Seat<State>,
+    ) {
+        if let Some(surface) = self.wl_surface() {
+            DndFocus::leave(&*surface, data, offer, seat)
+        }
+    }
+
+    fn drop<S: Source>(
+        &self,
+        data: &mut State,
+        offer: Option<&mut Self::OfferData<S>>,
+        seat: &Seat<State>,
+    ) {
+        if let Some(surface) = self.wl_surface() {
+            DndFocus::drop(&*surface, data, offer, seat)
         }
     }
 }

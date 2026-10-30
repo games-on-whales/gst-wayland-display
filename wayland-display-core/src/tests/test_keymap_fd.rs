@@ -76,7 +76,7 @@ impl KeyboardGrab<State> for StaleGrab {
         state: KeyState,
         modifiers: Option<ModifiersState>,
         serial: Serial,
-        time: u32,
+        time: smithay::backend::input::InputTime,
     ) {
         handle.input(data, keycode, state, modifiers, serial, time);
     }

@@ -116,6 +116,7 @@ impl Fixture {
                 PhysicalProperties {
                     make: "Virtual".into(),
                     model: "Wolf".into(),
+                    serial_number: String::new(),
                     size: (0, 0).into(),
                     subpixel: Subpixel::Unknown,
                 },

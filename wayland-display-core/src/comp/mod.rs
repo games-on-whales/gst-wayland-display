@@ -3,6 +3,7 @@ use gst_video::VideoInfo;
 use smithay::backend::SwapBuffersError;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::input::AxisSource;
+use smithay::backend::input::InputTime;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::gbm::BufferObjectFlags;
@@ -531,7 +532,7 @@ impl State {
     /// clear keyboard focus, and drop the seat's own handles.
     pub(crate) fn release_seat(&mut self) {
         let serial = SERIAL_COUNTER.next_serial();
-        let time = self.clock.now().as_millis();
+        let time = InputTime::from_millis(self.clock.now().as_millis());
         if let Some(pointer) = self.seat.get_pointer() {
             if pointer.is_grabbed() {
                 tracing::debug!("Unsetting a pointer grab still active at shutdown.");
@@ -817,6 +818,7 @@ pub(crate) fn apply_video_info(
             PhysicalProperties {
                 make: "Virtual".into(),
                 model: "Wolf".into(),
+                serial_number: String::new(),
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
             },
@@ -1131,6 +1133,7 @@ pub(crate) fn init(
                                                 surface,
                                                 output,
                                                 states,
+                                                None,
                                                 rendered_states,
                                                 |next_output, _, _, _| next_output,
                                             );
@@ -1147,6 +1150,7 @@ pub(crate) fn init(
                                             |surface, _| {
                                                 surface_presentation_feedback_flags_from_states(
                                                     surface,
+                                                    None,
                                                     rendered_states,
                                                 )
                                             },

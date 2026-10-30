@@ -1,10 +1,16 @@
 use super::{State, focus::FocusTarget};
+use smithay::backend::input::InputTime;
 use smithay::backend::input::Keycode;
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::keyboard::Keysym;
+use smithay::input::tablet::tool::{
+    AxisFrame as ToolAxisFrame, ButtonEvent as ToolButtonEvent, DownEvent as ToolDownEvent,
+    MotionEvent as ToolMotionEvent, ProximityInEvent, ProximityOutEvent, TabletToolHandle,
+    UpEvent as ToolUpEvent,
+};
+use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
 use smithay::reexports::input::event::pointer::PointerEventTrait;
 use smithay::wayland::seat::WaylandFocus;
-use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait, TabletToolHandle};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
@@ -50,6 +56,17 @@ pub struct TabletToolAxes {
 }
 
 impl TabletToolAxes {
+    fn frame(&self) -> ToolAxisFrame {
+        ToolAxisFrame {
+            pressure: self.pressure,
+            distance: self.distance,
+            tilt: self.tilt,
+            rotation: self.rotation,
+            slider: self.slider,
+            wheel: self.wheel,
+        }
+    }
+
     /// Every tablet tool event (axis, tip and proximity alike) carries the axes that changed
     /// with it; dropping them on tip/proximity events would leave the client with a stale value.
     pub fn from_event<B: smithay::backend::input::InputBackend, E: TabletToolEvent<B>>(
@@ -96,10 +113,24 @@ struct ToolState {
 }
 
 /// A tool on a particular tablet. Tools without a serial (serial 0: most non-Wacom and virtual
-/// tablets) are only told apart by their tablet. Smithay's own tablet-seat tool map is keyed by
-/// the tool descriptor alone, so two such pens still share one `zwp_tablet_tool_v2`; our
-/// contact, button and focus state is kept per tablet regardless.
+/// tablets) are only told apart by their tablet; see [`smithay_tool`].
 type ToolKey = (TabletDescriptor, TabletToolDescriptor);
+
+/// The descriptor smithay knows `tool` on `tablet` by. Smithay keys its tools (their focus,
+/// tip and buttons) by descriptor alone, so two serial-less pens on two tablets would be one
+/// tool to it; such a tool gets a serial derived from its tablet instead.
+fn smithay_tool(tablet: &TabletDescriptor, tool: &TabletToolDescriptor) -> TabletToolDescriptor {
+    if tool.hardware_serial != 0 {
+        return tool.clone();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tablet.hash(&mut hasher);
+    TabletToolDescriptor {
+        hardware_serial: hasher.finish() | 1,
+        ..tool.clone()
+    }
+}
 
 /// Who holds a `wl_pointer` button down.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -155,7 +186,7 @@ impl State {
             keycode,
             state,
             serial,
-            event_time_msec,
+            InputTime::from_millis(event_time_msec),
             |data, modifiers, handle| {
                 if state == KeyState::Pressed {
                     if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.logo {
@@ -340,7 +371,7 @@ impl State {
                     &MotionEvent {
                         location: self.pointer_location,
                         serial: SERIAL_COUNTER.next_serial(),
-                        time,
+                        time: InputTime::from_millis(time),
                     },
                 );
             }
@@ -402,7 +433,7 @@ impl State {
                 &MotionEvent {
                     location: self.pointer_location,
                     serial,
-                    time: event_time_msec,
+                    time: InputTime::from_millis(event_time_msec),
                 },
             );
         }
@@ -414,7 +445,7 @@ impl State {
             &RelativeMotionEvent {
                 delta,
                 delta_unaccel: delta_unaccelerated,
-                utime: event_time_usec,
+                time: InputTime::from_micros(event_time_usec),
             },
         );
 
@@ -492,7 +523,7 @@ impl State {
                 button: button_code,
                 state: state.try_into().unwrap(),
                 serial,
-                time: event_time_msec,
+                time: InputTime::from_millis(event_time_msec),
             },
         );
         pointer.frame(self);
@@ -507,7 +538,7 @@ impl State {
         horizontal_amount_discrete: Option<f64>,
         vertical_amount_discrete: Option<f64>,
     ) {
-        let mut frame = AxisFrame::new(event_time_msec).source(source);
+        let mut frame = AxisFrame::new(InputTime::from_millis(event_time_msec)).source(source);
         if horizontal_amount != 0.0 {
             frame = frame.value(Axis::Horizontal, horizontal_amount);
             if let Some(discrete) = horizontal_amount_discrete {
@@ -599,7 +630,7 @@ impl State {
                 slot: slot,
                 location: location,
                 serial,
-                time: event_time_msec,
+                time: InputTime::from_millis(event_time_msec),
             },
         );
         touch.frame(self);
@@ -614,7 +645,7 @@ impl State {
             &UpEvent {
                 slot: slot,
                 serial,
-                time: event_time_msec,
+                time: InputTime::from_millis(event_time_msec),
             },
         );
         touch.frame(self);
@@ -638,7 +669,7 @@ impl State {
             &TouchMotionEvent {
                 slot,
                 location,
-                time: event_time_msec,
+                time: InputTime::from_millis(event_time_msec),
             },
         );
         touch.frame(self);
@@ -690,7 +721,7 @@ impl State {
             InputEvent::TabletToolProximity { event, .. } => {
                 if let Some(location) = self.touch_location_transformed(&event) {
                     self.tablet_tool_proximity(
-                        event.time_msec(),
+                        smithay::backend::input::Event::time(&event).millis(),
                         &TabletDescriptor::from(&event.device()),
                         &event.tool(),
                         location,
@@ -702,7 +733,7 @@ impl State {
             InputEvent::TabletToolAxis { event, .. } => {
                 if let Some(location) = self.touch_location_transformed(&event) {
                     self.tablet_tool_axis(
-                        event.time_msec(),
+                        smithay::backend::input::Event::time(&event).millis(),
                         &TabletDescriptor::from(&event.device()),
                         &event.tool(),
                         location,
@@ -715,7 +746,7 @@ impl State {
                 // axis event for them), so pressure returning to 0 on tip-up is only seen here.
                 if let Some(location) = self.touch_location_transformed(&event) {
                     self.tablet_tool_tip(
-                        event.time_msec(),
+                        smithay::backend::input::Event::time(&event).millis(),
                         &TabletDescriptor::from(&event.device()),
                         &event.tool(),
                         location,
@@ -726,7 +757,7 @@ impl State {
             }
             InputEvent::TabletToolButton { event, .. } => {
                 self.tablet_tool_button(
-                    event.time_msec(),
+                    smithay::backend::input::Event::time(&event).millis(),
                     &TabletDescriptor::from(&event.device()),
                     &event.tool(),
                     TabletToolButtonEvent::button(&event),
@@ -734,11 +765,15 @@ impl State {
                 );
             }
             InputEvent::Keyboard { event, .. } => {
-                self.keyboard_input(event.time_msec(), event.key_code(), event.state());
+                self.keyboard_input(
+                    smithay::backend::input::Event::time(&event).millis(),
+                    event.key_code(),
+                    event.state(),
+                );
             }
             InputEvent::PointerMotion { event, .. } => {
                 self.pointer_motion(
-                    event.time_msec(),
+                    smithay::backend::input::Event::time(&event).millis(),
                     event.time_usec(),
                     event.delta(),
                     event.delta_unaccel(),
@@ -757,11 +792,18 @@ impl State {
                     let new_x = event.x_transformed(output_size.w);
                     let new_y = event.y_transformed(output_size.h);
 
-                    self.pointer_motion_absolute(event.time_msec(), (new_x, new_y).into());
+                    self.pointer_motion_absolute(
+                        smithay::backend::input::Event::time(&event).millis(),
+                        (new_x, new_y).into(),
+                    );
                 }
             }
             InputEvent::PointerButton { event, .. } => {
-                self.pointer_button(event.time_msec(), event.button(), event.state());
+                self.pointer_button(
+                    smithay::backend::input::Event::time(&event).millis(),
+                    event.button(),
+                    event.state(),
+                );
             }
             InputEvent::PointerAxis { event, .. } => {
                 self.last_pointer_movement = Instant::now();
@@ -777,7 +819,7 @@ impl State {
                 let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
 
                 self.pointer_axis(
-                    event.time_msec(),
+                    smithay::backend::input::Event::time(&event).millis(),
                     event.source(),
                     horizontal_amount,
                     vertical_amount,
@@ -787,15 +829,26 @@ impl State {
             }
             InputEvent::TouchDown { event, .. } => {
                 if let Some(location) = self.touch_location_transformed(&event) {
-                    self.touch_down(event.time_msec(), event.slot(), location);
+                    self.touch_down(
+                        smithay::backend::input::Event::time(&event).millis(),
+                        event.slot(),
+                        location,
+                    );
                 }
             }
             InputEvent::TouchUp { event, .. } => {
-                self.touch_up(event.time_msec(), event.slot());
+                self.touch_up(
+                    smithay::backend::input::Event::time(&event).millis(),
+                    event.slot(),
+                );
             }
             InputEvent::TouchMotion { event, .. } => {
                 if let Some(location) = self.touch_location_transformed(&event) {
-                    self.touch_motion(event.time_msec(), event.slot(), location);
+                    self.touch_motion(
+                        smithay::backend::input::Event::time(&event).millis(),
+                        event.slot(),
+                        location,
+                    );
                 }
             }
             InputEvent::TouchCancel { .. } => {
@@ -810,7 +863,24 @@ impl State {
 
     pub fn tablet_added(&mut self, tablet: &TabletDescriptor) {
         tracing::info!(name = %tablet.name, "Tablet added");
-        self.seat.tablet_seat().add_tablet::<Self>(&self.dh, tablet);
+        self.seat.tablet_seat().add_wp_tablet(&self.dh, tablet);
+    }
+
+    /// Smithay's handle for `tool` on `tablet`, announced to the clients when first used.
+    fn tool_handle(
+        &mut self,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+    ) -> TabletToolHandle<Self> {
+        let descriptor = smithay_tool(tablet, tool);
+        let tablet_seat = self.seat.tablet_seat();
+        match tablet_seat.get_tool(&descriptor) {
+            Some(handle) => handle,
+            None => {
+                let dh = self.dh.clone();
+                tablet_seat.add_wp_tool(self, &dh, &descriptor)
+            }
+        }
     }
 
     /// A tablet went away: end every contact and release every button its tools hold, so
@@ -832,10 +902,15 @@ impl State {
         let tablet_seat = self.seat.tablet_seat();
         tablet_seat.remove_tablet(tablet);
         for tool in &tools {
-            // Smithay keys tools by descriptor alone: keep its tool while the same descriptor
-            // is still live on another tablet.
-            if !self.tablet.tools.keys().any(|(_, t)| t == tool) {
-                tablet_seat.remove_tool(tool);
+            // Keep smithay's tool while the same descriptor is still live on another tablet.
+            let descriptor = smithay_tool(tablet, tool);
+            if !self
+                .tablet
+                .tools
+                .keys()
+                .any(|(t, other)| smithay_tool(t, other) == descriptor)
+            {
+                tablet_seat.remove_tool(&descriptor);
             }
         }
         // With no tablet left no tool can be in use.
@@ -917,28 +992,6 @@ impl State {
         }
     }
 
-    /// Forwards every axis that changed; smithay sends them with the next same-surface motion.
-    fn queue_tool_axes(tool_handle: &TabletToolHandle, axes: TabletToolAxes) {
-        if let Some(pressure) = axes.pressure {
-            tool_handle.pressure(pressure);
-        }
-        if let Some(distance) = axes.distance {
-            tool_handle.distance(distance);
-        }
-        if let Some(tilt) = axes.tilt {
-            tool_handle.tilt(tilt);
-        }
-        if let Some(rotation) = axes.rotation {
-            tool_handle.rotation(rotation);
-        }
-        if let Some(slider) = axes.slider {
-            tool_handle.slider_position(slider);
-        }
-        if let Some((degrees, clicks)) = axes.wheel {
-            tool_handle.wheel(degrees, clicks);
-        }
-    }
-
     /// Whether `key`'s tool holds any emulated pointer button (its tip or a stylus button).
     fn tool_emulates(&self, key: &ToolKey) -> bool {
         self.tablet.pointer_buttons.values().any(|owners| {
@@ -975,9 +1028,7 @@ impl State {
         axes: TabletToolAxes,
     ) {
         let location = self.clamp_coords(location);
-        let tablet_seat = self.seat.tablet_seat();
-        let dh = self.dh.clone();
-        tablet_seat.add_tool::<Self>(self, &dh, tool);
+        let tool_handle = self.tool_handle(tablet, tool);
         let key: ToolKey = (tablet.clone(), tool.clone());
         let state = self.tablet.tools.entry(key.clone()).or_insert(ToolState {
             tablet: tablet.clone(),
@@ -994,7 +1045,7 @@ impl State {
         // Where the tablet-v2 events go now.
         let native_focus = match (contact, &prev_focus) {
             // Keep a stroke on the surface it started on, even across windows, as long as
-            // that surface is alive.
+            // that surface is alive (smithay's implicit grab does the same).
             (Some(Delivery::Native), Some((surface, origin))) if surface.is_alive() => {
                 Some((surface.clone(), *origin))
             }
@@ -1006,66 +1057,60 @@ impl State {
                 .filter(|(surface, _)| self.surface_accepts_tablet(surface)),
         };
 
-        let (Some(tablet_handle), Some(tool_handle)) =
-            (tablet_seat.get_tablet(tablet), tablet_seat.get_tool(tool))
-        else {
+        let Some(tablet_handle) = self.seat.tablet_seat().get_tablet(tablet) else {
             return;
         };
-        match native_focus {
-            Some(focus) => {
-                self.tablet_cursor_only_motion(location);
-                let refocused = prev_focus.as_ref().map(|(s, _)| s) != Some(&focus.0);
-                if refocused && contact == Some(Delivery::Native) {
-                    // Resets smithay's tip state, which its proximity_out leaves set when the
-                    // contact's surface is already gone (so the tip_down below would be
-                    // dropped). Only a destroyed surface loses a native contact (a live one
-                    // keeps the stroke), so there is nobody left to send zero pressure to.
-                    tool_handle.tip_up(time);
-                }
-                if refocused && prev_focus.is_some() {
-                    tool_handle.proximity_out(time);
-                }
-                if refocused {
-                    // proximity_in carries only the position; the axes follow with the motion.
-                    tool_handle.proximity_in(
-                        location,
-                        focus.clone(),
-                        &tablet_handle,
-                        SERIAL_COUNTER.next_serial(),
-                        time,
-                    );
-                }
-                Self::queue_tool_axes(&tool_handle, axes);
-                tool_handle.motion(
+        let time = InputTime::from_millis(time);
+        let serial = SERIAL_COUNTER.next_serial();
+        if native_focus.is_some() {
+            self.tablet_cursor_only_motion(location);
+        }
+        // Smithay moves the tool's tablet-v2 focus: proximity out of the surface it leaves and
+        // in to the one it enters (with the tip and held buttons), nothing while `None`.
+        if tool_handle.current_tablet().is_none() {
+            tool_handle.proximity_in(
+                self,
+                native_focus.clone(),
+                tablet_handle,
+                &ProximityInEvent {
                     location,
-                    Some(focus.clone()),
-                    &tablet_handle,
-                    SERIAL_COUNTER.next_serial(),
+                    axis: Some(axes.frame()),
+                    serial,
                     time,
-                );
-                if refocused && contact == Some(Delivery::Native) {
-                    // The contact's surface went away mid-stroke: the stroke carries on in the
-                    // surface now under the pen, which has to learn the tip is down.
-                    tool_handle.tip_down(SERIAL_COUNTER.next_serial(), time);
-                }
-                if let Some(state) = self.tablet.tools.get_mut(&key) {
-                    state.focus = Some(focus);
-                }
+                },
+            );
+        } else {
+            tool_handle.motion(
+                self,
+                native_focus.clone(),
+                &ToolMotionEvent {
+                    location,
+                    serial,
+                    time,
+                },
+            );
+            // After the motion, so every axis that changed reaches the surface the tool is
+            // over now, also when the motion changed it.
+            tool_handle.axis(self, axes.frame());
+        }
+        tool_handle.frame(self, time);
+
+        let lost_native_contact = native_focus.is_none() && contact == Some(Delivery::Native);
+        if let Some(state) = self.tablet.tools.get_mut(&key) {
+            state.focus = native_focus.clone();
+            if lost_native_contact {
+                state.contact = None;
             }
-            None => {
-                if prev_focus.is_some() {
-                    tool_handle.proximity_out(time);
-                    if let Some(state) = self.tablet.tools.get_mut(&key) {
-                        state.focus = None;
-                        if state.contact == Some(Delivery::Native) {
-                            state.contact = None;
-                        }
-                    }
-                }
-                // The pen drives the pointer now, so the cursor is the pointer's.
-                self.restore_pointer_cursor_image();
-                self.tablet_pointer_warp(time, location);
-            }
+        }
+        if lost_native_contact {
+            // The contact's surface is gone and nothing tablet-aware is under the pen: the
+            // stroke is over, so a later surface must not get its tip down either.
+            tool_handle.up(self, &ToolUpEvent { serial, time });
+        }
+        if native_focus.is_none() {
+            // The pen drives the pointer now, so the cursor is the pointer's.
+            self.restore_pointer_cursor_image();
+            self.tablet_pointer_warp(time.millis(), location);
         }
     }
 
@@ -1097,7 +1142,7 @@ impl State {
             &MotionEvent {
                 location,
                 serial: SERIAL_COUNTER.next_serial(),
-                time,
+                time: InputTime::from_millis(time),
             },
         );
         pointer.frame(self);
@@ -1131,10 +1176,13 @@ impl State {
         let Some(state) = self.tablet.tools.get_mut(&key) else {
             return;
         };
-        let had_focus = state.focus.take().is_some();
+        state.focus = None;
         state.contact = None;
         let buttons: Vec<(u32, Delivery)> = state.buttons.drain().collect();
-        let tool_handle = self.seat.tablet_seat().get_tool(tool);
+        let tool_handle = self
+            .seat
+            .tablet_seat()
+            .get_tool(&smithay_tool(tablet, tool));
         for (physical, delivery) in buttons {
             if let Delivery::Emulated(button) = delivery {
                 self.emulated_release(time, &key, physical, button);
@@ -1142,11 +1190,12 @@ impl State {
         }
         self.emulated_release(time, &key, TIP, BTN_LEFT);
         self.restore_pointer_cursor_image();
-        if had_focus {
-            if let Some(tool_handle) = tool_handle {
-                // Sends `up` first if the tip was down.
-                tool_handle.proximity_out(time);
-            }
+        if let Some(tool_handle) = tool_handle.filter(|t| t.current_tablet().is_some()) {
+            // Sends zero pressure and `up` first if the tip was down, then proximity out.
+            let time = InputTime::from_millis(time);
+            let serial = SERIAL_COUNTER.next_serial();
+            tool_handle.proximity_out(self, &ProximityOutEvent { serial, time });
+            tool_handle.frame(self, time);
         }
     }
 
@@ -1192,9 +1241,10 @@ impl State {
             let serial = SERIAL_COUNTER.next_serial();
             self.update_keyboard_focus(serial);
             if native {
-                if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
-                    tool_handle.tip_down(serial, time);
-                }
+                let tool_handle = self.tool_handle(tablet, tool);
+                let time = InputTime::from_millis(time);
+                tool_handle.down(self, &ToolDownEvent { serial, time });
+                tool_handle.frame(self, time);
                 self.tablet.tools.get_mut(&key).unwrap().contact = Some(Delivery::Native);
             } else {
                 self.emulated_press(time, &key, TIP, BTN_LEFT);
@@ -1204,9 +1254,11 @@ impl State {
         } else {
             match contact {
                 Some(Delivery::Native) => {
-                    if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
-                        tool_handle.tip_up(time);
-                    }
+                    let tool_handle = self.tool_handle(tablet, tool);
+                    let time = InputTime::from_millis(time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    tool_handle.up(self, &ToolUpEvent { serial, time });
+                    tool_handle.frame(self, time);
                 }
                 Some(Delivery::Emulated(button)) => self.emulated_release(time, &key, TIP, button),
                 None => {}
@@ -1241,9 +1293,7 @@ impl State {
                 }
                 // Routed by where this pen is, never by the mouse.
                 let delivery = if tool_state.focus.is_some() {
-                    if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
-                        tool_handle.button(button, state, SERIAL_COUNTER.next_serial(), time);
-                    }
+                    self.tool_button(time, tablet, tool, button, state);
                     Delivery::Native
                 } else {
                     // BTN_STYLUS -> right click, BTN_STYLUS2 / BTN_STYLUS3 -> middle click.
@@ -1272,11 +1322,7 @@ impl State {
                     .get_mut(&key)
                     .and_then(|t| t.buttons.remove(&button));
                 match delivery {
-                    Some(Delivery::Native) => {
-                        if let Some(tool_handle) = self.seat.tablet_seat().get_tool(tool) {
-                            tool_handle.button(button, state, SERIAL_COUNTER.next_serial(), time);
-                        }
-                    }
+                    Some(Delivery::Native) => self.tool_button(time, tablet, tool, button, state),
                     Some(Delivery::Emulated(emulated)) => {
                         self.emulated_release(time, &key, button, emulated)
                     }
@@ -1284,6 +1330,27 @@ impl State {
                 }
             }
         }
+    }
+
+    /// A stylus button on the tool's tablet-v2 focus.
+    fn tool_button(
+        &mut self,
+        time: u32,
+        tablet: &TabletDescriptor,
+        tool: &TabletToolDescriptor,
+        button: u32,
+        state: ButtonState,
+    ) {
+        let tool_handle = self.tool_handle(tablet, tool);
+        let time = InputTime::from_millis(time);
+        let event = ToolButtonEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            button,
+            state,
+            time,
+        };
+        tool_handle.button(self, &event);
+        tool_handle.frame(self, time);
     }
 
     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
@@ -1458,6 +1525,7 @@ mod tests {
             PhysicalProperties {
                 make: "Virtual".into(),
                 model: "Wolf".into(),
+                serial_number: String::new(),
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
             },
@@ -1505,6 +1573,7 @@ mod tests {
             PhysicalProperties {
                 make: "Virtual".into(),
                 model: "Wolf".into(),
+                serial_number: String::new(),
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
             },

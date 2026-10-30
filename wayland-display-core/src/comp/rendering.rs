@@ -8,6 +8,7 @@ use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTarget, GlesTexProgram, Uniform, UniformName,
     UniformType,
 };
+use smithay::utils::user_data::UserDataMap;
 use smithay::{
     backend::renderer::{
         Color32F, ExportMem, ImportAll, ImportMem, Renderer,
@@ -289,6 +290,9 @@ impl<E: Element> Element for Converted<E> {
     fn kind(&self) -> Kind {
         self.inner.kind()
     }
+    fn is_framebuffer_effect(&self) -> bool {
+        self.inner.is_framebuffer_effect()
+    }
 }
 
 impl<E: RenderElement<GlesRenderer>> RenderElement<GlesRenderer> for Converted<E> {
@@ -299,14 +303,27 @@ impl<E: RenderElement<GlesRenderer>> RenderElement<GlesRenderer> for Converted<E
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
         frame.override_default_tex_program(
             self.program.clone(),
             vec![Uniform::new("ref_white_scale", self.ref_white_scale)],
         );
-        let result = self.inner.draw(frame, src, dst, damage, opaque_regions);
+        let result = self
+            .inner
+            .draw(frame, src, dst, damage, opaque_regions, cache);
         frame.clear_tex_program_override();
         result
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), GlesError> {
+        self.inner.capture_framebuffer(frame, src, dst, cache)
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {

@@ -1,9 +1,10 @@
 use smithay::{
     backend::input::TabletToolDescriptor,
-    delegate_seat, delegate_tablet_manager,
+    input::tablet::TabletSeatHandler,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     reexports::wayland_server::Resource,
-    wayland::{selection::data_device::set_data_device_focus, tablet_manager::TabletSeatHandler},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    wayland::selection::data_device::set_data_device_focus,
 };
 
 use crate::comp::{FocusTarget, State};
@@ -34,13 +35,13 @@ impl SeatHandler for State {
     }
 }
 
-delegate_seat!(State);
-
 impl TabletSeatHandler for State {
+    // The tool's focus is the surface under it; which surfaces get tablet-v2 events at all
+    // (and which a pointer, emulated from the pen) is decided in `comp::input`.
+    type ToolFocus = WlSurface;
+
     fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
         // The pen's image replaces the composited cursor until the mouse moves again.
         self.set_tablet_cursor_image(image);
     }
 }
-
-delegate_tablet_manager!(State);

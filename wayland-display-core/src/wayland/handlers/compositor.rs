@@ -2,7 +2,6 @@ use smithay::{
     backend::allocator::{Buffer as _, Fourcc},
     backend::egl::fence::EGLFence,
     backend::renderer::{gles::GlesRenderer, utils::on_commit_buffer_handler},
-    delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
     reexports::{
         calloop::Interest,
@@ -327,6 +326,3 @@ impl CompositorHandler for State {
         };
     }
 }
-
-delegate_compositor!(State);
-delegate_single_pixel_buffer!(State);

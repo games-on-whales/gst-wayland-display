@@ -8,8 +8,8 @@ use crate::tests::fixture::Fixture;
 use smithay::backend::input::{
     ButtonState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
 };
+use smithay::input::tablet::TabletDescriptor;
 use smithay::utils::Point;
-use smithay::wayland::tablet_manager::TabletDescriptor;
 use test_log::test;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_pointer;

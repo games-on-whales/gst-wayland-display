@@ -866,14 +866,16 @@ mod tests {
     /// │  left)  │  right) │
     /// └─────────┴─────────┘
     /// ```
-    fn render_into<R, T>(renderer: &mut R, buffer: &mut T, w: i32, h: i32)
-    where
-        R: Renderer + Bind<T>,
-    {
-        let mut framebuffer = renderer.bind(buffer).expect("Failed to bind dmabuf");
-
+    /// Draws the four test quadrants into `framebuffer`. It is the target the buffer under test
+    /// was bound to: binding its dmabuf a second time would wait on that bind's texture lock.
+    fn render_into<R: Renderer>(
+        renderer: &mut R,
+        framebuffer: &mut R::Framebuffer<'_>,
+        w: i32,
+        h: i32,
+    ) {
         let mut frame = renderer
-            .render(&mut framebuffer, (w, h).into(), Transform::Normal)
+            .render(framebuffer, (w, h).into(), Transform::Normal)
             .expect("Failed to create render frame");
         frame
             .clear(
@@ -921,16 +923,12 @@ mod tests {
         let mut buffer = GsBufferType::RAW(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
 
-        let bind_result = buffer.bind(&mut renderer);
-        assert!(bind_result.is_ok());
-
-        render_into(&mut renderer, &mut raw_buffer.unwrap().buffer, 10, 10);
+        let mut target = buffer
+            .bind(&mut renderer)
+            .expect("Failed to bind the buffer");
+        render_into(&mut renderer, &mut target, 10, 10);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(
-                &mut bind_result.unwrap(),
-                &mut renderer,
-                FrameColor::default(),
-            )
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
         assert!(gst_buffer.is_writable());
         assert_eq!(gst_buffer.size(), video_info.size());
@@ -1001,16 +999,12 @@ mod tests {
         let mut buffer = GsBufferType::DMA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
 
-        let bind_result = buffer.bind(&mut renderer);
-        assert!(bind_result.is_ok());
-
-        render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
+        let mut target = buffer
+            .bind(&mut renderer)
+            .expect("Failed to bind the buffer");
+        render_into(&mut renderer, &mut target, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(
-                &mut bind_result.unwrap(),
-                &mut renderer,
-                FrameColor::default(),
-            )
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
         let gst_buffer_size = gst_buffer.size();
         assert!(gst_buffer_size >= 4096); // There might be padding but it should at least contain our data
@@ -1137,16 +1131,12 @@ mod tests {
         let mut buffer = GsBufferType::CUDA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
 
-        let bind_result = buffer.bind(&mut renderer);
-        assert!(bind_result.is_ok());
-
-        render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
+        let mut target = buffer
+            .bind(&mut renderer)
+            .expect("Failed to bind the buffer");
+        render_into(&mut renderer, &mut target, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(
-                &mut bind_result.unwrap(),
-                &mut renderer,
-                FrameColor::default(),
-            )
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
 
         let gst_buffer_size = gst_buffer.size();

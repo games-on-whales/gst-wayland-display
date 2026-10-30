@@ -13,8 +13,8 @@ use smithay::backend::input::{
     ButtonState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
 };
 use smithay::desktop::Window;
+use smithay::input::tablet::TabletDescriptor;
 use smithay::utils::{Logical, Point};
-use smithay::wayland::tablet_manager::TabletDescriptor;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -624,6 +624,44 @@ fn serial_less_pens_on_two_tablets_are_separate_tools() {
     );
 }
 
+// The same two serial-less pens for a tablet-aware client: each is its own
+// `zwp_tablet_tool_v2`, so unplugging the second tablet doesn't end the first pen's stroke.
+#[test]
+fn serial_less_pens_on_two_tablets_are_separate_native_tools() {
+    let mut f = Fixture::new();
+    aware(&mut f);
+    window_for(&mut f, None);
+    let second = TabletDescriptor {
+        name: "Second tablet".into(),
+        usb_id: None,
+        syspath: None,
+    };
+    plug(&mut f.server);
+    f.server.tablet_added(&second);
+    f.round_trip();
+    tool_events(&mut f.client);
+
+    let p = pen(0);
+    let s = &mut f.server;
+    s.tablet_tool_proximity(1, &tablet(), &p, at(50., 50.), axes(None, None), true);
+    s.tablet_tool_tip(2, &tablet(), &p, at(50., 50.), axes(Some(0.5), None), true);
+    s.tablet_tool_proximity(3, &second, &p, at(60., 60.), axes(None, None), true);
+    s.tablet_removed(&second);
+    s.tablet_tool_axis(4, &tablet(), &p, at(55., 55.), axes(Some(0.6), None));
+    f.round_trip();
+    let events = tool_events(&mut f.client);
+    assert!(
+        !events.iter().any(|e| matches!(e, Tool::Up)),
+        "unplugging one tablet lifted the other tablet's pen: {events:?}"
+    );
+    let down = position(&events, |e| matches!(e, Tool::Down { .. })).expect("no down");
+    let last_motion = events
+        .iter()
+        .rposition(|e| matches!(e, Tool::Motion { x, .. } if *x == 55.0))
+        .expect("the first pen's stroke stopped reaching the client");
+    assert!(down < last_motion);
+}
+
 // Tip-up sends pressure 0 even when the device reports a small residual pressure with it.
 #[test]
 fn tip_up_zeroes_a_residual_pressure() {
@@ -663,7 +701,7 @@ fn tip_up_zeroes_a_residual_pressure() {
 fn pen_cursor_image_does_not_stick_for_the_mouse() {
     use smithay::input::SeatHandler;
     use smithay::input::pointer::CursorImageStatus;
-    use smithay::wayland::tablet_manager::TabletSeatHandler;
+    use smithay::input::tablet::TabletSeatHandler;
     let mut f = Fixture::new();
     window_for(&mut f, None);
     let pointer_image = f.server.cursor_state.clone();

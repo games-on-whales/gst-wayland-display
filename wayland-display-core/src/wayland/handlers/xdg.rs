@@ -1,5 +1,4 @@
 use smithay::{
-    delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
         find_popup_root_surface, get_popup_toplevel_coords,
@@ -123,5 +122,3 @@ impl State {
         });
     }
 }
-
-delegate_xdg_shell!(State);
