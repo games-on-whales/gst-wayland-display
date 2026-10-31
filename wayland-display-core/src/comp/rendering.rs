@@ -669,6 +669,55 @@ impl State {
             vec![]
         };
 
+        // While no application window is on screen (the app is still downloading or
+        // starting), show the host's status text instead of a black frame. The first mapped
+        // window clears it, so a later empty desktop doesn't show a stale message.
+        if self.space.elements().next().is_some() {
+            self.status = None;
+            self.status_panel = None;
+        } else if let (Some(text), Some(vi)) = (self.status.as_deref(), self.video_info.as_ref()) {
+            let (out_w, out_h) = (vi.width(), vi.height());
+            if self
+                .status_panel
+                .as_ref()
+                .is_none_or(|(h, _, _)| *h != out_h)
+            {
+                self.status_panel =
+                    crate::utils::status_text::render(text, out_w, out_h).map(|image| {
+                        let buffer = smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_memory(
+                            smithay::backend::renderer::element::memory::MemoryBuffer::from_slice(
+                                &image.pixels,
+                                Fourcc::Abgr8888,
+                                image.size,
+                            ),
+                            1,
+                            Transform::Normal,
+                            None,
+                        );
+                        (out_h, image.size, buffer)
+                    });
+            }
+            if let Some((_, (w, h), panel)) = &self.status_panel {
+                let location: Point<f64, Physical> = (
+                    ((out_w as i32 - w) / 2).max(0) as f64,
+                    ((out_h as i32 - h) / 2).max(0) as f64,
+                )
+                    .into();
+                elements.push(CursorElement::Memory(
+                    MemoryRenderBufferRenderElement::from_buffer(
+                        &mut self.renderer,
+                        location,
+                        panel,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )
+                    .map_err(OutputDamageTrackerError::Rendering)?,
+                ));
+            }
+        }
+
         // HDR render-path spike: prepend synthetic >1.0 brightness bars across the top of the
         // output as the topmost elements (so client surfaces never occlude them). Gated behind
         // WOLF_HDR_SPIKE -- unset = exactly the elements built above (no bars, no behavior change).

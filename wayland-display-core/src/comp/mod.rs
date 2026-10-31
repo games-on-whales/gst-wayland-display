@@ -148,6 +148,10 @@ pub struct State {
     /// Tablet tool (pen) state: per-tool focus, contact and button ownership. See `input.rs`.
     pub(crate) tablet: input::TabletInput,
     pub pending_windows: Vec<Window>,
+    /// Text shown while no window is mapped (see `utils::status_text`), and its rasterised
+    /// panel with the output height it was drawn for.
+    pub(crate) status: Option<String>,
+    pub(crate) status_panel: Option<(u32, (i32, i32), MemoryRenderBuffer)>,
     /// Toplevels whose initial commit arrived before the output existed; they get their
     /// initial configure (and move to `pending_windows`) once `apply_video_info` runs.
     pub windows_awaiting_output: Vec<Window>,
@@ -481,6 +485,8 @@ impl State {
             surpressed_keys: HashSet::new(),
             tablet: Default::default(),
             pending_windows: Vec::new(),
+            status: None,
+            status_panel: None,
             windows_awaiting_output: Vec::new(),
             input_context: input_context.clone(),
             input_devices: HashMap::new(),
@@ -514,6 +520,13 @@ impl State {
             stable_output_hdr: None,
             last_frame_color: FrameColor::default(),
         }
+    }
+
+    /// Show `status` while no window is mapped (see `utils::status_text`); `None` clears it.
+    pub(crate) fn set_status(&mut self, status: Option<String>) {
+        tracing::info!(?status, "Status text.");
+        self.status = status.filter(|s| !s.trim().is_empty());
+        self.status_panel = None;
     }
 
     /// Release the seat's input devices before the compositor state is dropped.
@@ -1082,6 +1095,7 @@ pub(crate) fn init(
                 Event::Msg(Command::VideoInfo(video_info)) => {
                     apply_video_info(state, video_info, &render_target, render_node.clone());
                 }
+                Event::Msg(Command::Status(status)) => state.set_status(status),
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
                     state.add_input_device(&path);

@@ -119,6 +119,9 @@ impl WaylandDisplaySrc {
         for path in settings.startup_input_devices() {
             self.send_command(Command::InputDevice(path));
         }
+        if settings.status.is_some() {
+            self.send_command(Command::Status(settings.status.clone()));
+        }
         command_rx
     }
 }
@@ -196,6 +199,8 @@ pub struct Settings {
     // Devices announced with VirtualDevicesReady; re-added on every start() while unchanged.
     virtual_input_devices: Vec<VirtualDevice>,
     disable_intel_workaround: bool,
+    /// `status`: shown on the stream while no application window is mapped.
+    status: Option<String>,
     nv12: bool,
     /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
     /// `GstVulkanDevice` (zero-copy into `vulkanh264enc`). Default off.
@@ -491,6 +496,15 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .blurb("Input device to use (e.g. /dev/input/event0")
                     .construct()
                     .build(),
+                glib::ParamSpecString::builder("status")
+                    .nick("Status text")
+                    .blurb(
+                        "Text shown on the stream while no application window is on screen, \
+                         e.g. while the application downloads or starts (\"Downloading \
+                         Steam... 43%\"). Cleared when a window is mapped; set it again to \
+                         show a new message. Can change at any time.",
+                    )
+                    .build(),
                 glib::ParamSpecBoolean::builder("disable-intel-workaround")
                     .nick("Disable Intel workaround")
                     .blurb(
@@ -745,6 +759,17 @@ impl ObjectImpl for WaylandDisplaySrc {
                     settings.input_devices.push(actual_val.unwrap());
                 }
             }
+            "status" => {
+                let status = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .filter(|s| !s.trim().is_empty());
+                // Kept for the next start too; sent now if a display runs.
+                self.settings.lock().unwrap().status = status.clone();
+                if self.state.lock().unwrap().is_some() {
+                    self.send_command(Command::Status(status));
+                }
+            }
             "disable-intel-workaround" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.disable_intel_workaround =
@@ -840,6 +865,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.input_devices.join(",").to_value()
             }
+            "status" => self.settings.lock().unwrap().status.to_value(),
             "disable-intel-workaround" => {
                 let settings = self.settings.lock().unwrap();
                 settings.disable_intel_workaround.to_value()
@@ -1867,6 +1893,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // Drop must still be able to send Quit and join it.
         self.pending_frame.lock().unwrap().take();
         self.vulkan_share.end_run();
+        // A status belongs to the run that showed it; the next one starts without.
+        self.settings.lock().unwrap().status = None;
         #[cfg(feature = "cuda")]
         self.settings.lock().unwrap().end_cuda_run();
         Ok(())

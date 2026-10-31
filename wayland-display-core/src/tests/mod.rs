@@ -12,6 +12,7 @@ mod test_keymap_fd;
 mod test_pointer;
 mod test_render_device;
 mod test_resolution;
+mod test_status;
 mod test_tablet;
 mod test_tablet_pr64;
 mod test_unanswered_compositor;

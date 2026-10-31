@@ -67,6 +67,9 @@ pub enum Command {
     },
     /// Downstream refused the HDR caps: keep the output SDR for the rest of the stream.
     RefuseHdr,
+    /// Text shown while no application window is on screen (see `utils::status_text`);
+    /// `None` clears it.
+    Status(Option<String>),
 }
 
 #[derive(Clone)]
@@ -271,6 +274,13 @@ impl WaylandDisplay {
 
     pub fn add_input_device(&self, path: impl Into<String>) {
         let _ = self.command_tx.send(Command::InputDevice(path.into()));
+    }
+
+    /// Show `status` on the stream while no application window is mapped, e.g. while the
+    /// application is being downloaded or started. It clears once a window is mapped;
+    /// `None` clears it now.
+    pub fn set_status(&self, status: Option<String>) {
+        let _ = self.command_tx.send(Command::Status(status));
     }
 
     pub fn set_video_info(&self, info: GstVideoInfo) {

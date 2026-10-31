@@ -181,6 +181,22 @@ pub unsafe extern "C" fn display_add_input_device(dpy: *mut WaylandDisplay, path
     display.add_input_device(path);
 }
 
+/// Show `status` on the stream while no application window is mapped (e.g. while the
+/// application downloads or starts); it clears once a window is mapped. NULL or an empty
+/// string clears it now.
+#[no_mangle]
+pub unsafe extern "C" fn display_set_status(dpy: *mut WaylandDisplay, status: *const c_char) {
+    let Some(display) = (unsafe { display_ref(dpy, "display_set_status") }) else {
+        return;
+    };
+    let status = (!status.is_null()).then(|| {
+        unsafe { CStr::from_ptr(status) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    display.set_status(status);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn display_set_video_info(
     dpy: *mut WaylandDisplay,
