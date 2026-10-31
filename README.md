@@ -376,7 +376,7 @@ so independent sessions may use different values:
 
 | Property | Default | Purpose |
 | --- | --- | --- |
-| `ring-depth` | 4 | Allocated conversion slots, 2–4 (`1` is raised to 2). Keep 4 for streaming unless you have verified a smaller ring with your consumers. A slot is reused only once every downstream consumer has released it; when no slot is free the new frame is dropped and the previous output re-emitted, without waiting. With a single slot, a consumer holding the newest buffer (a sink's `enable-last-sample`, a queue) would pin it and freeze the stream, hence the floor of 2. |
+| `ring-depth` | 4 | Initial conversion slots, 2–4 (`1` is raised to 2). A slot is reused only once every downstream consumer has released it. The `memory:VulkanImage` ring adds a slot, up to 12, whenever downstream holds them all: Wolf's interpipe topology holds about five frames, and a fixed 4-slot ring dropped about half of a 60 fps stream. The dmabuf ring stays at its initial size and, when no slot is free, drops the new frame and re-emits the previous output. |
 | `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR-to-tiled `vkCmdCopyImage`. |
 | `sdr-reference-white` | 203 | SDR white level in nits for SDR → PQ conversion, 1–10000. |
 | `vulkan-codec` | auto | Codec of the consuming encoder: `h264`, `h265` or `av1`. Empty = the directly linked encoder's, else every codec. |

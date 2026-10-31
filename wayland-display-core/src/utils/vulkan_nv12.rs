@@ -116,6 +116,10 @@ const RING: usize = 4;
 /// output; with one slot, anything holding the latest buffer (a sink's last-sample, a queue,
 /// an encoder's one frame of latency) would pin it and freeze the stream on one frame.
 const MIN_RING: usize = 2;
+/// The most slots an encode-src ring grows to (see [`RingGrowth`]). Wolf's topology holds
+/// about five frames at once (interpipesink's queue and last sample, interpipesrc's queue,
+/// the encoder's queue and the frame being encoded), more than the initial ring.
+const MAX_RING: usize = 12;
 
 fn ring_depth(options: &ConversionOptions) -> usize {
     options.ring_depth.clamp(MIN_RING, RING)
@@ -695,6 +699,9 @@ pub struct VulkanNv12 {
     /// minor and the device as opened. `None` on the shared-device path.
     pool_return: Option<(u32, OpenedDevice)>,
     outputs: Vec<Nv12Out>,
+    /// How to add an encode-src slot when every slot is still held downstream; `None` on the
+    /// dmabuf export path, whose ring stays at its initial depth.
+    grow: Option<RingGrowth>,
     next: usize, // next ring slot to write
     cur: usize,  // last slot written (the one to_gst_buffer returns)
     /// True once at least one frame has completed conversion, so a busy-drop has a previous
@@ -712,6 +719,19 @@ pub struct VulkanNv12 {
     /// Target output format (NV12 8-bit or P010 10-bit); selects the compute shader, image
     /// format, and storage-view formats.
     fmt: PixFmt,
+}
+
+/// What an encode-src slot is built from, kept so the ring can grow at run time.
+///
+/// A slot is reused only once every downstream holder released it. How many frames are held
+/// depends on the pipeline (queues, last samples, the encoder, interpipe fan-out), so a ring
+/// sized up front either wastes memory or is too small: in Wolf a 4-slot ring had no free slot
+/// for about half the frames, each re-emitting the previous image (a 30 fps stream at 60).
+/// Instead the ring adds a slot whenever all of them are held, up to [`MAX_RING`].
+struct RingGrowth {
+    targets: Vec<crate::utils::video_info::EncodeTarget>,
+    queue_families: Vec<u32>,
+    linear_encode_src: bool,
 }
 
 impl std::fmt::Debug for VulkanNv12 {
@@ -951,6 +971,7 @@ impl VulkanNv12 {
             _shared_device: None,
             pool_return: None,
             outputs: Vec::new(),
+            grow: None,
             next: 0,
             have_output: false,
             last_output_hdr: false,
@@ -1005,12 +1026,12 @@ impl VulkanNv12 {
         self.dynamic = dynamic;
 
         let psizes = [
-            pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, RING as u32),
-            pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * RING as u32),
+            pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_RING as u32),
+            pool_size(vk::DescriptorType::STORAGE_IMAGE, 2 * MAX_RING as u32),
         ];
         self.desc_pool = self.device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(RING as u32)
+                .max_sets(MAX_RING as u32)
                 .pool_sizes(&psizes),
             None,
         )?;
@@ -1171,7 +1192,50 @@ impl VulkanNv12 {
             )?;
             this.outputs.push(out);
         }
+        this.grow = Some(RingGrowth {
+            targets: targets.to_vec(),
+            queue_families,
+            linear_encode_src: options.linear_encode_src,
+        });
         Ok(this)
+    }
+
+    /// Add an encode-src slot (see [`RingGrowth`]); its index, or `None` when the ring is at
+    /// [`MAX_RING`], can't grow, or the allocation failed.
+    unsafe fn grow_ring(&mut self) -> Option<usize> {
+        let grow = self.grow.as_ref()?;
+        let device_gst = self._shared_device.as_ref()?;
+        if self.outputs.len() >= MAX_RING {
+            return None;
+        }
+        match create_encode_output(
+            &self.device,
+            &self.memp,
+            device_gst,
+            &grow.targets,
+            &grow.queue_families,
+            self.desc_pool,
+            self.desc_layout,
+            self.cmd_pool,
+            self.width,
+            self.height,
+            self.fmt,
+            grow.linear_encode_src,
+        ) {
+            Ok(out) => {
+                self.outputs.push(out);
+                tracing::info!(
+                    slots = self.outputs.len(),
+                    "VulkanNv12: every slot is held downstream; grew the output ring"
+                );
+                Some(self.outputs.len() - 1)
+            }
+            Err(e) => {
+                tracing::warn!("VulkanNv12: could not grow the output ring: {e}");
+                self.grow = None;
+                None
+            }
+        }
     }
 
     /// Whether ring slot `i` may be overwritten: nothing downstream references it any more.
@@ -1231,6 +1295,9 @@ impl VulkanNv12 {
                     .map(|i| (self.next + i) % n)
                     .find(|&i| self.slot_free(i));
             }
+        }
+        if free.is_none() && self.have_output {
+            free = self.grow_ring();
         }
         let idx = match free {
             Some(i) => i,

@@ -522,7 +522,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .build(),
                 glib::ParamSpecUInt::builder("ring-depth")
                     .minimum(1).maximum(4).default_value(4)
-                    .blurb("Conversion ring depth; 4 recommended, smaller rings depend on downstream buffer retention. At least 2 slots are used: a slot is reused only once downstream released it")
+                    .blurb("Initial conversion ring depth (at least 2). A slot is reused only once downstream released it; the memory:VulkanImage ring adds slots (up to 12) whenever downstream holds them all, so frames aren't dropped")
                     .mutable_ready().build(),
                 glib::ParamSpecBoolean::builder("linear-encode-src")
                     .blurb("Prefer linear Vulkan encode input; retry optimal tiling if allocation fails")
