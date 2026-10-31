@@ -124,12 +124,19 @@ At runtime, you'll need to have access to `libcuda.so` but only to access and us
 Vulkan encode requires GStreamer 1.28+ with the `patches/` chain applied.
 
 Setting `vulkan=true` offers NV12 and P010 as `memory:VulkanImage`. The source answers the
-downstream encoder's `gst.vulkan.device` context query with a `GstVulkanDevice` it owns, and mints
-its output images on that device, so `vulkanh264enc` (NV12), `vulkanh265enc` (NV12 Main, P010
-Main-10) and `vulkanav1enc` (NV12 Main) view them with no copy. Each image is created for
-the consuming encoder's codec profile (see `vulkan-codec` / `vulkan-profile` below). The RGBA to
-NV12/P010 conversion runs as a Vulkan compute shader on that device, submitted through gst's own
-queue lock.
+downstream encoder's `gst.vulkan.device` context query with the `GstVulkanDevice` of its render
+node's GPU, and makes its output images on that device, so `vulkanh264enc` (NV12),
+`vulkanh265enc` (NV12 Main, P010 Main-10) and `vulkanav1enc` (NV12 Main) view them with no copy.
+The RGBA to NV12/P010 conversion runs as a Vulkan compute shader on that device, submitted
+through gst's own queue lock.
+
+Every source on a GPU shares that GPU's one device for the life of the process, so an encoder
+switched from one source to another (`interpipesrc listen-to=...`, as Wolf does when a session
+joins a lobby) keeps receiving images on the device it adopted. A device found lost is replaced
+for later sessions. Behind interpipe the encoder reaches the device through interpipe's
+context-query forwarding ([games-on-whales/gst-interpipe](https://github.com/games-on-whales/gst-interpipe)).
+The source never falls back to another GPU than its render node's: without a video-encode
+capable device there, `memory:VulkanImage` is unavailable.
 
 If a device offered through `set_context` lacks the converter's extensions, or a directly linked
 encoder runs on a different `VkDevice`, `memory:VulkanImage` is withdrawn and negotiation falls
@@ -168,7 +175,7 @@ There are two modes:
 
 | Mode | How | What it does |
 | --- | --- | --- |
-| Static | `hdr=true` | Tags the P010 caps as BT.2100 PQ with the default (or overridden) static metadata and converts with the BT.2020 matrix. One-way; no client detection. The compositor content is SDR, so this is signalling plus an SDR→PQ tone-map, not new highlight detail. |
+| Static | `hdr=true` | Tags the P010 caps as BT.2100 PQ with the default (or overridden) static metadata and converts with the BT.2020 matrix, and posts `wolf-hdr-state` (`hdr=true`) when those caps are negotiated (`false` if a renegotiation goes back to SDR). One-way; no client detection. The compositor content is SDR, so this is signalling plus an SDR→PQ tone-map, not new highlight detail. |
 | Dynamic | `dynamic-hdr=true` | Full dynamic HDR: the compositor detects the client's HDR state and flips the P010 colorimetry mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR content), following the active surface. Set before starting the pipeline — the Wayland globals below are created at start. |
 | Stable transport | `dynamic-hdr=true stable-color-transport=true` | Client detection as in Dynamic, but the output colour caps stay fixed at the static `hdr` setting (and the `mastering-display-info` / `content-light-level` properties) instead of being retagged: every frame is converted for that fixed output, raw RGB frames carry their own transfer (below), and `wolf-hdr-state` still reports the source's state. |
 
@@ -266,7 +273,7 @@ overridden.
 
 The dump settings are read once; `WOLF_HDR_SPIKE` enables the existing render diagnostic.
 Streaming settings use per-element properties (see the tables above and the
-[HDR section](#hdr-output)); the legacy peak-luminance variable supplies a default.
+[HDR section](#hdr-output)); the peak-luminance and reference-white variables supply defaults.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -274,6 +281,7 @@ Streaming settings use per-element properties (see the tables above and the
 | `WOLF_VULKAN_DUMP_FRAME` | `20` | Which frame `WOLF_VULKAN_DUMP` captures. Raise it to let a client connect and paint first. |
 | `WOLF_HDR_SPIKE` | unset | Draw synthetic above-1.0 brightness bars and read the fp16 framebuffer back once to check whether GLES preserved or clamped them. Forces the fp16 render target even without `dynamic-hdr`; changes the rendered image. |
 | `WOLF_HDR_PEAK_NITS` | `1000` | Existing default for HDR peak luminance (positive nits, capped at 65535); the per-element `hdr-peak-luminance` property overrides it. |
+| `WOLF_SDR_REFERENCE_WHITE` | `203` | Default SDR reference white in nits (1–10000) for SDR → PQ conversion; Wolf sets it from its config. The per-element `sdr-reference-white` property overrides it. |
 
 ## Run without a GPU
 
@@ -371,15 +379,20 @@ so independent sessions may use different values:
 | `ring-depth` | 4 | Allocated conversion slots, 2–4 (`1` is raised to 2). Keep 4 for streaming unless you have verified a smaller ring with your consumers. A slot is reused only once every downstream consumer has released it; when no slot is free the new frame is dropped and the previous output re-emitted, without waiting. With a single slot, a consumer holding the newest buffer (a sink's `enable-last-sample`, a queue) would pin it and freeze the stream, hence the floor of 2. |
 | `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR-to-tiled `vkCmdCopyImage`. |
 | `sdr-reference-white` | 203 | SDR white level in nits for SDR → PQ conversion, 1–10000. |
-| `vulkan-codec` | auto | Codec of the consuming encoder: `h264`, `h265` or `av1`. Empty = the directly linked encoder's, else `h264` for NV12 and `h265` for P010. Set it when the encoder sits behind interpipe. |
-| `vulkan-profile` | codec-dependent | Profile of the consuming encoder: H.264 `high` (default), `main`, `baseline`, `constrained-baseline`, `constrained-high`, `progressive-high` for NV12; H.265 `main` for NV12 and `main-10` for P010; AV1 `main` (NV12 only). |
+| `vulkan-codec` | auto | Codec of the consuming encoder: `h264`, `h265` or `av1`. Empty = the directly linked encoder's, else every codec. |
+| `vulkan-profile` | auto | Profile of the consuming encoder: H.264 `high`, `main`, `baseline`, `constrained-baseline`, `constrained-high`, `progressive-high` for NV12; H.265 `main` for NV12 and `main-10` for P010; AV1 `main` (NV12 only). Empty = the directly linked encoder's fixed profile, else every profile of the codec. |
 
-A directly connected Vulkan encoder's codec and fixed output profile are discovered
-through simple filters and queues. Raw caps cannot express an encoder's codec/profile
-across interpipe: configure `vulkan-codec` and `vulkan-profile` consistently with that
-consumer. The encode-src image is created for exactly that profile, and a mismatch is
-a Vulkan valid-usage violation. The source creates raw frames, and
-encoding remains downstream so lobbies can fan out to multiple consumers.
+An encoder only reads images created for its own profile. A directly connected Vulkan
+encoder's codec and fixed output profile are discovered through simple filters and queues,
+and the images are created for exactly that profile. Raw caps cannot express an encoder's
+codec/profile across interpipe, and one producer may feed several sessions with different
+codecs, so unless `vulkan-codec` / `vulkan-profile` narrow it, the images are created for
+every profile that can encode the format and that the device supports (H.264 High, Main and
+Baseline, H.265 Main and AV1 Main for NV12; H.265 Main-10 for P010). The source creates raw
+frames, and encoding remains downstream so lobbies can fan out to multiple consumers.
+
+NV12 and P010 output needs an even width and height (4:2:0 chroma); odd sizes fail
+negotiation. `render-node` can only change while the source is stopped.
 
 LINEAR Vulkan images carry their real plane offsets and strides in `VideoMeta`.
 OPTIMAL-tiled Vulkan images have no portable byte layout: their `VideoMeta`

@@ -306,6 +306,218 @@ fn vulkan_encode_to_eos() {
     .expect("Vulkan encode");
 }
 
+/// Wolf's topology: the source runs in its own pipeline into an `interpipesink`, and each
+/// streaming session encodes from an `interpipesrc` in another pipeline of the same process.
+/// The source cannot see the encoder (no graph edge), so neither its codec nor its profile is
+/// known; the encoder reaches the source's `GstVulkanDevice` only through interpipe's
+/// context-query forwarding (games-on-whales/gst-interpipe).
+struct InterpipeRig {
+    producers: Vec<gst::Pipeline>,
+    consumer: gst::Pipeline,
+    encoded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InterpipeRig {
+    /// One producer per entry of `producers` (its interpipesink name), the consumer listening
+    /// to the first, encoding with `encoder` into `encoded_caps`.
+    fn new(node: &str, names: &[&str], encoder: &str, encoded_caps: &str) -> Self {
+        let producers = names
+            .iter()
+            .map(|name| {
+                let pipeline = gst::parse::launch(&format!(
+                    "waylanddisplaysrc name=src render-node={node} vulkan=true ! \
+                     video/x-raw(memory:VulkanImage),format=NV12,width=640,height=480,\
+                     framerate=30/1 ! interpipesink name={name} sync=true async=false \
+                     max-buffers=1"
+                ))
+                .expect("parse producer")
+                .downcast::<gst::Pipeline>()
+                .unwrap();
+                pipeline
+                    .set_state(gst::State::Playing)
+                    .expect("producer to Playing");
+                pipeline
+            })
+            .collect::<Vec<_>>();
+        let consumer = gst::parse::launch(&format!(
+            "interpipesrc name=ipsrc listen-to={} is-live=true stream-sync=restart-ts \
+             max-bytes=0 max-buffers=1 leaky-type=downstream format=time ! queue ! \
+             {encoder} name=enc ! {encoded_caps} ! fakesink name=sink sync=false",
+            names[0]
+        ))
+        .expect("parse consumer")
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let encoded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = encoded.clone();
+        consumer
+            .by_name("sink")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        consumer
+            .set_state(gst::State::Playing)
+            .expect("consumer to Playing");
+        InterpipeRig {
+            producers,
+            consumer,
+            encoded,
+        }
+    }
+
+    /// Wait until `count` more encoded buffers arrived, failing on any pipeline error.
+    fn expect_frames(&self, count: usize, what: &str) {
+        let target = self.encoded.load(std::sync::atomic::Ordering::Relaxed) + count;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while self.encoded.load(std::sync::atomic::Ordering::Relaxed) < target {
+            for pipeline in self.producers.iter().chain([&self.consumer]) {
+                let bus = pipeline.bus().unwrap();
+                while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                    if let gst::MessageView::Error(err) = msg.view() {
+                        panic!(
+                            "{what}: {}: {} ({:?})",
+                            err.src().map(|s| s.path_string()).unwrap_or_default(),
+                            err.error(),
+                            err.debug()
+                        );
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: only {} of {target} encoded buffers in 20s",
+                self.encoded.load(std::sync::atomic::Ordering::Relaxed)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn producer_device(&self, i: usize) -> usize {
+        let src = self.producers[i].by_name("src").unwrap();
+        vulkan_device_of(&src.static_pad("src").unwrap())
+            .expect("the source answers no gst.vulkan.device query")
+    }
+
+    /// The device the consumer's encoder adopted, as its upstream sees it answered.
+    fn encoder_device(&self) -> usize {
+        let enc = self.consumer.by_name("enc").unwrap();
+        vulkan_device_of(&enc.static_pad("sink").unwrap())
+            .or_else(|| vulkan_device_of(&enc.static_pad("src").unwrap()))
+            .expect("the encoder answers no gst.vulkan.device query")
+    }
+}
+
+impl Drop for InterpipeRig {
+    fn drop(&mut self) {
+        let _ = self.consumer.set_state(gst::State::Null);
+        for producer in &self.producers {
+            let _ = producer.set_state(gst::State::Null);
+        }
+    }
+}
+
+/// The `GstVulkanDevice` an element answers a `gst.vulkan.device` query on `pad` with.
+fn vulkan_device_of(pad: &gst::Pad) -> Option<usize> {
+    let mut query = gst::query::Context::new("gst.vulkan.device");
+    if !pad.query(&mut query) {
+        return None;
+    }
+    let context = query.context_owned()?;
+    let device = context
+        .structure()
+        .get::<gst::Object>("gst.vulkan.device")
+        .ok()?;
+    Some(device.as_ptr() as usize)
+}
+
+/// The interpipe Wolf links its producer and encoder pipelines with, or why it is missing.
+fn interpipe_skip_reason() -> Option<&'static str> {
+    if !have("interpipesrc") || !have("interpipesink") {
+        return Some("no interpipesrc/interpipesink (games-on-whales/gst-interpipe)");
+    }
+    None
+}
+
+/// Behind interpipe (codec and profile unknown to the source) the encoder adopts the
+/// source's device and encodes its images; H.264 is pinned to Main downstream like Wolf's.
+#[test]
+#[ignore = "needs a Vulkan encoder and gst-interpipe; run via ci/harness.sh gpu"]
+fn vulkan_encode_behind_interpipe() {
+    let _gpu = init();
+    if let Some(why) = interpipe_skip_reason() {
+        skip!("{why}");
+    }
+    let Some(node) = render_node_for(&["amdgpu", "nvidia", "i915", "xe"]) else {
+        skip!("no AMD/NVIDIA/Intel render node")
+    };
+    let mut ran = false;
+    for (kind, caps) in [
+        (
+            "h264enc",
+            "h264parse ! video/x-h264,profile=main,stream-format=byte-stream",
+        ),
+        (
+            "h265enc",
+            "h265parse ! video/x-h265,stream-format=byte-stream",
+        ),
+    ] {
+        let Some(enc) = vulkan_element(kind, &node) else {
+            eprintln!("no Vulkan {kind} on {node}; not covered");
+            continue;
+        };
+        ran = true;
+        let rig = InterpipeRig::new(&node, &["wolf_video_a"], &enc, caps);
+        rig.expect_frames(30, &enc);
+        assert_eq!(
+            rig.encoder_device(),
+            rig.producer_device(0),
+            "{enc} behind interpipe is not on the source's GstVulkanDevice"
+        );
+    }
+    if !ran {
+        skip!("no Vulkan encoder on {node}");
+    }
+}
+
+/// Wolf retargets a running session's `interpipesrc` to a lobby's producer. Every producer on
+/// the GPU must hand out images on the one device the encoder adopted, and encoding carries on.
+#[test]
+#[ignore = "needs a Vulkan encoder and gst-interpipe; run via ci/harness.sh gpu"]
+fn vulkan_encode_survives_a_producer_switch() {
+    let _gpu = init();
+    if let Some(why) = interpipe_skip_reason() {
+        skip!("{why}");
+    }
+    let Some(node) = render_node_for(&["amdgpu", "nvidia", "i915", "xe"]) else {
+        skip!("no AMD/NVIDIA/Intel render node")
+    };
+    let Some(enc) = vulkan_element("h264enc", &node) else {
+        skip!("no vulkanh264enc on {node}");
+    };
+    let rig = InterpipeRig::new(
+        &node,
+        &["session_video", "lobby_video"],
+        &enc,
+        "h264parse ! video/x-h264,stream-format=byte-stream",
+    );
+    rig.expect_frames(15, "before the switch");
+    assert_eq!(
+        rig.producer_device(0),
+        rig.producer_device(1),
+        "two producers on one GPU hand out images on different GstVulkanDevices"
+    );
+    rig.consumer
+        .by_name("ipsrc")
+        .unwrap()
+        .set_property("listen-to", "lobby_video");
+    rig.expect_frames(30, "after switching to the lobby producer");
+    assert_eq!(rig.encoder_device(), rig.producer_device(1));
+}
+
 /// Regression for the device-sharing race: forcing `memory:VulkanImage` with **no**
 /// encoder downstream used to abort the process with a Rust panic in the compositor thread
 /// (`GsVulkanBuf .expect("...no shared GstVulkanDevice?")`). The source now answers the

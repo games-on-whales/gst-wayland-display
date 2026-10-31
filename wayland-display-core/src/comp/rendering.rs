@@ -672,7 +672,7 @@ impl State {
         // HDR render-path spike: prepend synthetic >1.0 brightness bars across the top of the
         // output as the topmost elements (so client surfaces never occlude them). Gated behind
         // WOLF_HDR_SPIKE -- unset = exactly the elements built above (no bars, no behavior change).
-        if std::env::var("WOLF_HDR_SPIKE").is_ok() {
+        if crate::utils::allocator::hdr_spike() {
             if let Some(vi) = self.video_info.as_ref() {
                 let mut bars = hdr_spike_bars(vi.width() as i32, vi.height() as i32);
                 bars.append(&mut elements);
@@ -766,8 +766,7 @@ impl State {
         // framebuffer (after render_output, before the Vulkan converter in to_gs_buffer) and log
         // the bar-center float values -- proving whether GLES kept >1.0 or clamped. Gated behind
         // WOLF_HDR_SPIKE, only on an fp16 target, and logged once (cheap, a handful of pixels).
-        if std::env::var("WOLF_HDR_SPIKE").is_ok()
-            && render_rgba_fourcc == Some(Fourcc::Abgr16161616f)
+        if crate::utils::allocator::hdr_spike() && render_rgba_fourcc == Some(Fourcc::Abgr16161616f)
         {
             if let Some(vi) = self.video_info.as_ref() {
                 let (w, h) = (vi.width() as i32, vi.height() as i32);

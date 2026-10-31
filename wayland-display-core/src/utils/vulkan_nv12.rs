@@ -83,11 +83,10 @@ const RGBA_TO_P010_BT2020_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_bt20
 /// topology/bindings as [`RGBA_TO_P010_BT2020_SPV`], but its input is the **linear fp16** RGBA
 /// render target (1.0 == SDR reference white, may exceed 1.0) instead of 8-bit sRGB, so it skips
 /// the sRGB EOTF and tone-maps the already-linear value straight to PQ -- proving a >1.0 value
-/// can travel render-target -> converter -> P010 PQ as a brighter-than-white highlight. Selected
-/// only on the P010+bt2020 path when `WOLF_HDR_SPIKE` is set. NOTE: the checked-in `.spv` is a
-/// compiled shader; regenerate it with `ci/shaders.sh --update` after changing the GLSL.
-// Retained for the WOLF_HDR_SPIKE linear-bars proof; the real SDR path uses the sRGB
-// tone-map and HDR content uses the passthrough pipeline, so this is otherwise unused.
+/// can travel render-target -> converter -> P010 PQ as a brighter-than-white highlight. No
+/// pipeline selects it: the spike renders through the regular converters, and this shader is
+/// kept only to reproduce that proof by hand. NOTE: the checked-in `.spv` is a compiled
+/// shader; regenerate it with `ci/shaders.sh --update` after changing the GLSL.
 #[allow(dead_code)]
 const RGBA_TO_P010_HDR_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010_hdr.spv");
 /// PQ-passthrough variant of the P010 converter (dynamic HDR). Same topology/bindings as
@@ -274,40 +273,87 @@ pub fn render_node_minor(path: &str) -> Option<u32> {
 /// render node. A render-node path resolves to the device's *render* minor, a primary
 /// (`card*`) path to its *primary* minor -- we accept either. Falls back to the first
 /// device, with a warning, when nothing matches (or the minor is unknown).
+/// NV12/P010 are 4:2:0 (one chroma sample per 2x2 block), and Vulkan only creates 4:2:0
+/// images with even extents; the dispatch and the chroma copies assume it too.
+fn check_420_extent(width: u32, height: u32) -> Result<(), Err> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(
+            format!("4:2:0 output needs a non-zero even size, got {width}x{height}").into(),
+        );
+    }
+    Ok(())
+}
+
 unsafe fn pick_physical_device(
     instance: &ash::Instance,
     target_minor: Option<u32>,
 ) -> Option<vk::PhysicalDevice> {
-    let devices = instance.enumerate_physical_devices().ok()?;
-    if let Some(minor) = target_minor {
-        let matched = devices.iter().copied().find(|&d| {
-            // PhysicalDeviceDrmPropertiesEXT may only be chained when the device exposes
-            // VK_EXT_physical_device_drm.
-            let has_drm = instance
-                .enumerate_device_extension_properties(d)
-                .is_ok_and(|exts| {
-                    exts.iter().any(|e| {
-                        e.extension_name_as_c_str() == Ok(ash::ext::physical_device_drm::NAME)
-                    })
-                });
-            if !has_drm {
-                return false;
-            }
+    physical_device_for_minor(instance, target_minor, |_| true)
+}
+
+/// The physical device backing DRM minor `target_minor`, among the GPUs `usable` accepts.
+///
+/// Never another GPU than the one named: the compositor renders on `target_minor`, and its
+/// dmabuf cannot be imported (or not correctly) into a device on another GPU. A device whose
+/// DRM minor can't be read (no `VK_EXT_physical_device_drm`) is only taken when it is the
+/// only usable GPU. With no minor (an unparsable node), the first usable GPU. CPU devices
+/// (llvmpipe/lavapipe) are never picked.
+pub(crate) unsafe fn physical_device_for_minor(
+    instance: &ash::Instance,
+    target_minor: Option<u32>,
+    usable: impl Fn(vk::PhysicalDevice) -> bool,
+) -> Option<vk::PhysicalDevice> {
+    let devices: Vec<vk::PhysicalDevice> = instance
+        .enumerate_physical_devices()
+        .ok()?
+        .into_iter()
+        .filter(|&d| {
+            instance.get_physical_device_properties(d).device_type != vk::PhysicalDeviceType::CPU
+                && usable(d)
+        })
+        .collect();
+    let Some(minor) = target_minor else {
+        return devices.first().copied();
+    };
+    // PhysicalDeviceDrmPropertiesEXT may only be chained when the device exposes
+    // VK_EXT_physical_device_drm.
+    let drm_minors = |d: vk::PhysicalDevice| {
+        let has_drm = instance
+            .enumerate_device_extension_properties(d)
+            .is_ok_and(|exts| {
+                exts.iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::physical_device_drm::NAME))
+            });
+        has_drm.then(|| {
             let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
             instance.get_physical_device_properties2(d, &mut p2);
-            (drm.has_render != 0 && drm.render_minor as i64 == minor as i64)
-                || (drm.has_primary != 0 && drm.primary_minor as i64 == minor as i64)
-        });
-        if matched.is_some() {
-            return matched;
+            drm
+        })
+    };
+    let mut unknown = Vec::new();
+    for &d in &devices {
+        match drm_minors(d) {
+            Some(drm)
+                if (drm.has_render != 0 && drm.render_minor == i64::from(minor))
+                    || (drm.has_primary != 0 && drm.primary_minor == i64::from(minor)) =>
+            {
+                return Some(d);
+            }
+            Some(_) => {}
+            None => unknown.push(d),
         }
-        tracing::warn!(
-            "VulkanNv12: no Vulkan device matches DRM minor {minor}; falling back to the \
-             first device -- wrong GPU on a multi-GPU host"
-        );
     }
-    devices.first().copied()
+    if devices.len() == 1 && unknown.len() == 1 {
+        tracing::info!(
+            "no Vulkan device reports DRM minor {minor}; using the only GPU, which cannot report it"
+        );
+        return Some(unknown[0]);
+    }
+    tracing::warn!(
+        "no usable Vulkan device matches DRM minor {minor}; not falling back to another GPU"
+    );
+    None
 }
 
 /// DRM modifiers `target_minor`'s GPU can export NV12 with (queried once per GPU, cached;
@@ -700,7 +746,13 @@ impl Default for ConversionOptions {
         Self {
             ring_depth: RING,
             linear_encode_src: false,
-            sdr_reference_white: 203.0,
+            // Wolf sets WOLF_SDR_REFERENCE_WHITE from its config; the sdr-reference-white
+            // property overrides it, like WOLF_HDR_PEAK_NITS below.
+            sdr_reference_white: std::env::var("WOLF_SDR_REFERENCE_WHITE")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|n| (1.0..=10000.0).contains(n))
+                .unwrap_or(203.0),
             hdr_peak_nits: std::env::var("WOLF_HDR_PEAK_NITS")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
@@ -793,6 +845,7 @@ impl VulkanNv12 {
         va_share: &crate::utils::va_share::VaShare,
         options: ConversionOptions,
     ) -> Result<Self, Err> {
+        check_420_extent(width, height)?;
         let (entry, instance, opened) = take_device(target_minor)?;
         let queue = opened.device.get_device_queue(opened.qfi, 0);
         let memp = instance.get_physical_device_memory_properties(opened.pd);
@@ -1021,8 +1074,7 @@ impl VulkanNv12 {
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
         nv12_caps: &gst::Caps,
-        codec: crate::utils::video_info::VulkanCodec,
-        profile: &str,
+        targets: &[crate::utils::video_info::EncodeTarget],
         width: u32,
         height: u32,
         fmt: PixFmt,
@@ -1032,7 +1084,7 @@ impl VulkanNv12 {
     ) -> Option<Self> {
         match unsafe {
             Self::new_on_shared_inner(
-                device_gst, raw, nv12_caps, codec, profile, width, height, fmt, bt2020, fp16_input,
+                device_gst, raw, nv12_caps, targets, width, height, fmt, bt2020, fp16_input,
                 options,
             )
         } {
@@ -1049,8 +1101,7 @@ impl VulkanNv12 {
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
         _nv12_caps: &gst::Caps,
-        codec: crate::utils::video_info::VulkanCodec,
-        profile: &str,
+        targets: &[crate::utils::video_info::EncodeTarget],
         width: u32,
         height: u32,
         fmt: PixFmt,
@@ -1058,6 +1109,7 @@ impl VulkanNv12 {
         fp16_input: bool,
         options: ConversionOptions,
     ) -> Result<Self, Err> {
+        check_420_extent(width, height)?;
         // An absorbed device may lack the import extensions; ash would then call stubs.
         let missing = crate::utils::vulkan_share::missing_extensions(&device_gst);
         if !missing.is_empty() {
@@ -1107,8 +1159,7 @@ impl VulkanNv12 {
                 &this.device,
                 &this.memp,
                 &device_gst,
-                codec,
-                profile,
+                targets,
                 &queue_families,
                 this.desc_pool,
                 this.desc_layout,
@@ -1511,6 +1562,9 @@ impl VulkanNv12 {
             submit = submit.signal_semaphores(&sems);
         }
         self.submit(&[submit], fence)?;
+        // In flight from here until its fence is waited on, so an error below still leaves
+        // teardown (`destroy_outputs`) waiting for it before freeing the command buffer.
+        self.outputs[idx].in_flight = true;
 
         let fenced = self.implicit_sync && self.attach_fences(idx, fd);
         if fenced {
@@ -1520,13 +1574,13 @@ impl VulkanNv12 {
             // into it waits for this compute to finish sampling it -- no CPU stall on the
             // producer's critical path (lever 1). The cached import stays alive (it's
             // reused next time this slot comes round).
-            self.outputs[idx].in_flight = true;
         } else {
             // Nvidia/CUDA ignores implicit dma-buf fences (and the implicit path falls back
             // here when the fences could not be attached): block until the write is done
             // before the buffer is handed downstream and the RGBA buffer is rendered again.
             self.device.wait_for_fences(&[fence], true, u64::MAX)?;
             self.device.reset_fences(&[fence])?;
+            self.outputs[idx].in_flight = false;
             if self.implicit_sync && self.sync_sem_stuck {
                 self.recreate_sync_sem();
             }
@@ -2610,8 +2664,7 @@ unsafe fn create_encode_output(
     device: &ash::Device,
     memp: &vk::PhysicalDeviceMemoryProperties,
     gst_device: &gstreamer_vulkan::VulkanDevice,
-    codec: crate::utils::video_info::VulkanCodec,
-    profile: &str,
+    targets: &[crate::utils::video_info::EncodeTarget],
     queue_families: &[u32],
     desc_pool: vk::DescriptorPool,
     desc_layout: vk::DescriptorSetLayout,
@@ -2627,8 +2680,7 @@ unsafe fn create_encode_output(
         device,
         memp,
         gst_device,
-        codec,
-        profile,
+        targets,
         queue_families,
         desc_pool,
         desc_layout,
@@ -2652,8 +2704,7 @@ unsafe fn fill_encode_output(
     device: &ash::Device,
     memp: &vk::PhysicalDeviceMemoryProperties,
     gst_device: &gstreamer_vulkan::VulkanDevice,
-    codec: crate::utils::video_info::VulkanCodec,
-    profile: &str,
+    targets: &[crate::utils::video_info::EncodeTarget],
     queue_families: &[u32],
     desc_pool: vk::DescriptorPool,
     desc_layout: vk::DescriptorSetLayout,
@@ -2667,8 +2718,7 @@ unsafe fn fill_encode_output(
         gst_device,
         width,
         height,
-        codec,
-        profile,
+        targets,
         fmt,
         linear_encode_src,
         queue_families,
@@ -2812,6 +2862,10 @@ mod legacy_environment_tests {
     fn legacy_diagnostics_and_peak_default_are_preserved() {
         if std::env::var_os("GST_LEGACY_ENV_TEST_CHILD").is_some() {
             assert_eq!(super::ConversionOptions::default().hdr_peak_nits, 1600);
+            assert_eq!(
+                super::ConversionOptions::default().sdr_reference_white,
+                250.0
+            );
             assert_eq!(super::dump_path(), Some("/tmp/legacy-frame"));
             assert_eq!(super::dump_frame_target(), 31);
             return;
@@ -2819,6 +2873,7 @@ mod legacy_environment_tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "utils::vulkan_nv12::legacy_environment_tests::legacy_diagnostics_and_peak_default_are_preserved"])
             .env("GST_LEGACY_ENV_TEST_CHILD", "1").env("WOLF_HDR_PEAK_NITS", "1600")
+            .env("WOLF_SDR_REFERENCE_WHITE", "250")
             .env("WOLF_VULKAN_DUMP", "/tmp/legacy-frame").env("WOLF_VULKAN_DUMP_FRAME", "31")
             .status().unwrap();
         assert!(status.success());

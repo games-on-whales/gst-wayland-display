@@ -27,6 +27,12 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+/// Whether the `WOLF_HDR_SPIKE` render diagnostic is on. Read once: it is checked every frame.
+pub(crate) fn hdr_spike() -> bool {
+    static SPIKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPIKE.get_or_init(|| std::env::var_os("WOLF_HDR_SPIKE").is_some())
+}
+
 /// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
 /// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either the debug
 /// spike (`WOLF_HDR_SPIKE`, synthetic bars) or dynamic HDR (`hdr_cm`, real HDR client
@@ -34,7 +40,7 @@ use std::sync::{Arc, Mutex};
 /// carry linear values > 1.0 (HDR highlights) into the Vulkan P010/PQ converter instead of
 /// clamping them at 8-bit white. Both off = byte-for-byte the current 8-bit path.
 fn rgba_render_fourcc(hdr_cm: bool) -> DrmFourcc {
-    if std::env::var("WOLF_HDR_SPIKE").is_ok() || hdr_cm {
+    if hdr_spike() || hdr_cm {
         DrmFourcc::Abgr16161616f
     } else {
         DrmFourcc::Abgr8888
@@ -287,14 +293,13 @@ pub struct GsVulkanBuf {
 }
 
 impl GsVulkanBuf {
-    /// `codec` / `profile` are the consuming encoder's (for the encode-src image's video
-    /// profile). Returns `None` if no usable shared `GstVulkanDevice` is available.
+    /// `targets` are the encode profiles the encode-src images are created for (see
+    /// `EncodeTarget`). Returns `None` if no usable shared `GstVulkanDevice` is available.
     pub fn new(
         renderer: &mut GlesRenderer,
         render_node: DrmNode,
         video_info: VideoInfo,
-        codec: crate::utils::video_info::VulkanCodec,
-        profile: String,
+        targets: &[crate::utils::video_info::EncodeTarget],
         vulkan_share: &crate::utils::vulkan_share::VulkanShare,
     ) -> Option<Self> {
         let (w, h) = (video_info.width(), video_info.height());
@@ -350,7 +355,7 @@ impl GsVulkanBuf {
         // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
-            dev, raw, &out_caps, codec, &profile, w, h, fmt, bt2020, fp16_input, options,
+            dev, raw, &out_caps, targets, w, h, fmt, bt2020, fp16_input, options,
         )?;
         Some(GsVulkanBuf {
             rgba,

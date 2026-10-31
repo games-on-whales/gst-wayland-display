@@ -100,6 +100,20 @@ RUN git clone --depth 1 --branch ${GST_VERSION} \
     && meson install -C build \
     && rm -rf /tmp/gstreamer /tmp/patches
 
+# --- gst-interpipe (games-on-whales fork) -> /opt/gst --------------------------
+# Wolf links its producer and encoder pipelines with interpipe; the fork forwards the
+# encoder's GstContext queries across the boundary, which is how the encoder reaches the
+# source's GstVulkanDevice. The interpipe GPU tests in tests/encode.rs need it.
+ARG INTERPIPE_REV=0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
+RUN git init /tmp/gst-interpipe && cd /tmp/gst-interpipe \
+    && git fetch --depth 1 https://github.com/games-on-whales/gst-interpipe.git ${INTERPIPE_REV} \
+    && git checkout FETCH_HEAD \
+    && PKG_CONFIG_PATH=/opt/gst/lib/x86_64-linux-gnu/pkgconfig meson setup build \
+         --prefix=/opt/gst -Dtests=disabled -Denable-gtk-doc=false \
+    && meson compile -C build \
+    && meson install -C build \
+    && rm -rf /tmp/gst-interpipe
+
 ENV PKG_CONFIG_PATH=/opt/gst/lib/x86_64-linux-gnu/pkgconfig:/opt/gst/lib/pkgconfig \
     LD_LIBRARY_PATH=/opt/gst/lib/x86_64-linux-gnu:/opt/gst/lib \
     GST_PLUGIN_PATH=/opt/gst/lib/x86_64-linux-gnu/gstreamer-1.0 \

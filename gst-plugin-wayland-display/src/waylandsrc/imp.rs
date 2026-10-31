@@ -26,7 +26,7 @@ use waylanddisplaycore::utils::allocator::{
 };
 #[cfg(feature = "cuda")]
 use waylanddisplaycore::utils::video_info::CUDAParams;
-use waylanddisplaycore::utils::video_info::VulkanCodec;
+use waylanddisplaycore::utils::video_info::{EncodeTarget, VulkanCodec};
 use waylanddisplaycore::{
     ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, PendingFrame,
     Sender, WaylandDisplay, channel, utils::device::PCIVendor,
@@ -45,6 +45,10 @@ pub struct WaylandDisplaySrc {
     /// Read in `caps()`, driven per-frame in `create()`. Default `false`. When
     /// dynamic-hdr is off this is never consulted (the static `hdr` property governs).
     hdr_active: AtomicBool,
+    /// Without dynamic-hdr: whether the negotiated caps are HDR (BT.2100 PQ), as last told to
+    /// the application with `wolf-hdr-state`. The static `hdr` output is HDR from its first
+    /// frame, and the host (Wolf) only switches the client's display mode on that message.
+    static_hdr_posted: AtomicBool,
     /// Live HDR static metadata (dynamic-hdr only): the active surface's REAL
     /// `(mastering-display-info, content-light-level)` gst caps strings, as reported by the
     /// compositor (frog for gamescope, `wp_color_management_v1` for sway). `(None, None)` =>
@@ -84,6 +88,7 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx: Mutex::new(command_tx),
             hdr_active: AtomicBool::new(false),
+            static_hdr_posted: AtomicBool::new(false),
             hdr_meta: Mutex::new((None, None)),
             va_share: Arc::new(Default::default()),
             vulkan_share: waylanddisplaycore::utils::vulkan_share::VulkanShare::new(),
@@ -535,11 +540,11 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .mutable_ready().build(),
                 glib::ParamSpecString::builder("vulkan-codec")
-                    .blurb("Codec of the Vulkan encoder consuming memory:VulkanImage output (h264, h265 or av1). Empty = the directly linked encoder's, else h264 for NV12 and h265 for P010; set it when the encoder sits behind interpipe")
+                    .blurb("Codec of the Vulkan encoder consuming memory:VulkanImage output (h264, h265 or av1). Empty = the directly linked encoder's, else every codec (the encode images then suit any encoder behind interpipe)")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("vulkan-profile")
-                    .blurb("Encode image profile, matching the downstream encoder: h264 high/main/baseline/constrained-baseline (NV12); h265 main (NV12) or main-10 (P010); av1 main (NV12)")
+                    .blurb("Encode image profile, matching the downstream encoder: h264 high/main/baseline/constrained-baseline (NV12); h265 main (NV12) or main-10 (P010); av1 main (NV12). Empty = the directly linked encoder's, else every profile of the codec")
                     .mutable_ready().build(),
                 glib::ParamSpecBoolean::builder("stable-color-transport")
                     .blurb(
@@ -675,10 +680,25 @@ impl ObjectImpl for WaylandDisplaySrc {
             }
 
             "render-node" => {
-                let mut settings = self.settings.lock().unwrap();
-                settings.render_node = value
+                let render_node = value
                     .get::<Option<String>>()
                     .expect("Type checked upstream");
+                // The compositor renders on the node it started with, and an encoder that
+                // adopted this element's Vulkan device stays on that node's GPU; switching
+                // under them mid-run would hand the encoder images from another device.
+                let running = self.state.lock().unwrap().is_some();
+                let mut settings = self.settings.lock().unwrap();
+                if running {
+                    if render_node != settings.render_node {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "render-node can only change while stopped; ignoring"
+                        );
+                    }
+                    return;
+                }
+                settings.render_node = render_node;
             }
             #[cfg(feature = "cuda")]
             "cuda-device-id" => {
@@ -1059,6 +1079,7 @@ impl WaylandDisplaySrc {
         if !is_nv12 && !is_p010 {
             return Ok(());
         }
+        check_420_size(info.width(), info.height())?;
         let (render_path, prefer_nv12) = {
             let s = self.settings.lock().unwrap();
             (
@@ -1122,11 +1143,16 @@ impl WaylandDisplaySrc {
     /// converter needs. The encoder then adopts our device (one shared device, no zero-copy
     /// gap, no gstreamer fork). Mirrors how the CUDA path shares its context.
     fn handle_vulkan_context_query(&self, query: &mut gst::QueryRef) -> bool {
+        // Only Vulkan contexts: a CUDA or VA query must not create a Vulkan device.
+        let is_vulkan = match query.view() {
+            gst::QueryView::Context(q) => q.context_type().starts_with("gst.vulkan."),
+            _ => false,
+        };
         let (vulkan_on, render_node) = {
             let s = self.settings.lock().unwrap();
             (s.vulkan, s.render_node.clone())
         };
-        if !vulkan_on {
+        if !is_vulkan || !vulkan_on || render_node.as_deref() == Some("software") {
             return false;
         }
         let node = render_node.unwrap_or_else(|| "/dev/dri/renderD128".into());
@@ -1388,7 +1414,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // negotiation falls back to the dmabuf/RGBA caps below.
         // Read the setting first: the peer query below may be answered by a downstream element
         // that queries back upstream, which takes `settings` again on this thread.
-        let vulkan = self.settings.lock().unwrap().vulkan;
+        // Software rendering has no GPU buffer for the converter to import.
+        let vulkan = {
+            let s = self.settings.lock().unwrap();
+            s.vulkan && s.render_node.as_deref() != Some("software")
+        };
         let vulkan_on = vulkan && self.vulkan_share.check_peer_device(&self.obj().src_pad());
         if vulkan_on {
             // NV12 (8-bit SDR) first so a format-agnostic interpipesink fixates on it; P010 is
@@ -1536,10 +1566,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
         self.caps_generation.fetch_add(1, Ordering::AcqRel);
+        self.post_static_hdr_state(caps);
         // NV12 memory:VulkanImage: hand the compositor a VULKAN video-info so it builds the
-        // shared-device encode-src converter. The H.264 profile isn't in our (raw) caps --
-        // it lives in encoded output caps, potentially across interpipe. The
-        // vulkan-profile property must match the consumer (defaults: high/main-10).
+        // shared-device encode-src converter. The encoder's profile isn't in our (raw) caps --
+        // it lives in encoded output caps, potentially across interpipe (see EncodeTarget).
         let is_vulkan = caps
             .features(0)
             .is_some_and(|f| f.contains("memory:VulkanImage"));
@@ -1556,11 +1586,20 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .clone()
                 .unwrap_or_else(|| "/dev/dri/renderD128".into());
             let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
+            if node == "software" {
+                return Err(gst::loggable_error!(
+                    CAT,
+                    "memory:VulkanImage output needs a GPU render node, not software rendering"
+                ));
+            }
             let base_video_info = gst_video::VideoInfo::from_caps(caps)
                 .map_err(|e| gst::loggable_error!(CAT, "Invalid Vulkan caps: {e}"))?;
-            // The producer's raw caps don't carry the codec, so it comes from the property, the
-            // linked encoder, or the format (P010 ⇒ vulkanh265enc Main-10, NV12 ⇒
-            // vulkanh264enc); the encode-src image's video profile is built from it.
+            check_420_size(base_video_info.width(), base_video_info.height())?;
+            // The producer's raw caps don't carry the codec, so it comes from the property or a
+            // directly linked encoder. Behind interpipe neither is known, and the consumers may
+            // differ per session (one producer can feed vulkanh264enc and vulkanh265enc), so
+            // the encode-src images are then created for every profile that can encode the
+            // format (filtered to what the device supports at allocation).
             let format = base_video_info.format();
             let (configured_codec, configured_profile) = {
                 let s = self.settings.lock().unwrap();
@@ -1568,32 +1607,40 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             };
             let downstream = self.downstream_vulkan_encoder();
             let codec = match configured_codec {
-                Some(name) => VulkanCodec::from_name(&name)
-                    .ok_or_else(|| gst::loggable_error!(CAT, "Unknown vulkan-codec {name}"))?,
-                None => downstream
-                    .as_ref()
-                    .map(|(codec, _)| *codec)
-                    .unwrap_or_else(|| VulkanCodec::default_for(format)),
+                Some(name) => Some(
+                    VulkanCodec::from_name(&name)
+                        .ok_or_else(|| gst::loggable_error!(CAT, "Unknown vulkan-codec {name}"))?,
+                ),
+                None => downstream.as_ref().map(|(codec, _)| *codec),
             };
-            let profile = configured_profile
-                .or_else(|| {
-                    downstream
-                        .filter(|(c, _)| *c == codec)
-                        .and_then(|(_, profile)| profile)
-                })
-                .unwrap_or_else(|| codec.default_profile(format).into());
-            if !codec.accepts(format, &profile) {
+            let profile = configured_profile.or_else(|| {
+                downstream
+                    .filter(|(c, _)| Some(*c) == codec)
+                    .and_then(|(_, profile)| profile)
+            });
+            let targets = EncodeTarget::resolve(format, codec, profile.as_deref());
+            if targets.is_empty() {
                 return Err(gst::loggable_error!(
                     CAT,
-                    "Unsupported Vulkan {codec:?} profile {profile} for {format:?}"
+                    "No Vulkan encode profile ({codec:?} {profile:?}) can encode {format:?}"
                 ));
             }
-            self.vulkan_share.ensure_owned_device(minor);
+            if self.vulkan_share.ensure_owned_device(minor).is_none() {
+                // Stop offering memory:VulkanImage so a downstream that also accepts
+                // dmabuf/RGBA renegotiates to it; a VulkanImage-only one fails here, with
+                // the reason, instead of after the compositor's device wait.
+                self.vulkan_share.refuse();
+                self.obj().src_pad().mark_reconfigure();
+                return Err(gst::loggable_error!(
+                    CAT,
+                    "Could not create the Vulkan device for {node}; memory:VulkanImage output \
+                     is unavailable"
+                ));
+            }
             let video_info =
                 GstVideoInfo::VULKAN(waylanddisplaycore::utils::video_info::VulkanParams {
                     video_info: base_video_info,
-                    codec,
-                    profile,
+                    targets,
                 });
             self.send_command(Command::VideoInfo(video_info));
             return self.parent_set_caps(caps);
@@ -1692,6 +1739,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // A new compositor starts SDR and only reports HDR changes, so a previous run's dynamic-HDR
         // state must not carry over into this one.
         self.hdr_active.store(false, Ordering::Relaxed);
+        self.static_hdr_posted.store(false, Ordering::Relaxed);
         *self.hdr_meta.lock().unwrap() = (None, None);
         self.flushing.store(false, Ordering::Release);
 
@@ -2057,6 +2105,24 @@ impl WaylandDisplaySrc {
     }
 
     /// Notify the host only after downstream accepted the new output state.
+    /// Without dynamic-hdr, tell the application when the negotiated output becomes HDR (or
+    /// SDR again): dynamic-hdr reports its transitions from `create()`, but a static `hdr`
+    /// stream is HDR from its first frame and would otherwise never say so. A run starts SDR,
+    /// so an SDR stream posts nothing.
+    fn post_static_hdr_state(&self, caps: &gst::Caps) {
+        if self.settings.lock().unwrap().hdr_cm {
+            return;
+        }
+        let hdr = caps.structure(0).is_some_and(|s| {
+            s.get::<&str>("colorimetry")
+                .ok()
+                .and_then(|c| c.parse::<gst_video::VideoColorimetry>().ok())
+                .is_some_and(|c| c.transfer() == gst_video::VideoTransferFunction::Smpte2084)
+        });
+        let prev = self.static_hdr_posted.swap(hdr, Ordering::Relaxed);
+        self.post_hdr_transition(prev, hdr);
+    }
+
     fn post_hdr_transition(&self, prev_hdr: bool, hdr: bool) {
         if prev_hdr != hdr {
             let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
@@ -2131,6 +2197,18 @@ fn set_p010_color(s: &mut gst::StructureRef, hdr: &Option<(String, String)>) {
 
 /// A `/dev/dri/*` render node backs a real `GstVaDisplay`; the `software` (llvmpipe)
 /// target and any other value do not, so VA-display sharing is skipped for them.
+/// The converter's 4:2:0 output (NV12/P010) has one chroma sample per 2x2 block, and Vulkan
+/// only creates 4:2:0 images with even extents.
+fn check_420_size(width: u32, height: u32) -> Result<(), gst::LoggableError> {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(gst::loggable_error!(
+            CAT,
+            "NV12/P010 output needs an even width and height, got {width}x{height}"
+        ));
+    }
+    Ok(())
+}
+
 fn render_node_backs_va_display(path: &str) -> bool {
     waylanddisplaycore::utils::va_query::render_node_backs_va_display(path)
 }
@@ -2526,6 +2604,54 @@ mod tests {
         assert!(src.imp().vulkan_share.shared_device().is_none());
         let caps: gst::Caps = "video/x-raw,format=RGBx".parse().unwrap();
         assert!(src.imp().set_caps(&caps).is_err());
+    }
+
+    /// Static `hdr` output is HDR from its first frame: the host must hear it once per change of
+    /// the negotiated caps, and an SDR stream must not post anything.
+    #[test]
+    fn static_hdr_caps_post_wolf_hdr_state() {
+        use super::HDR_STATE_MESSAGE;
+        use gst::prelude::*;
+        use gst::subclass::prelude::ObjectSubclassIsExt;
+        test_init();
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("hdr", true)
+            .build();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add(&src).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let caps = |colorimetry: &str| {
+            gst::Caps::builder("video/x-raw")
+                .features(["memory:VulkanImage"])
+                .field("format", "P010_10LE")
+                .field("colorimetry", colorimetry)
+                .build()
+        };
+        let posted = || {
+            std::iter::from_fn(|| bus.pop_filtered(&[gst::MessageType::Application]))
+                .filter_map(|msg| {
+                    let s = msg.structure()?;
+                    (s.name() == HDR_STATE_MESSAGE).then(|| s.get::<bool>("hdr").unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let imp = src.imp();
+        imp.post_static_hdr_state(&caps("bt709"));
+        assert_eq!(posted(), Vec::<bool>::new(), "an SDR stream posted");
+        imp.post_static_hdr_state(&caps("bt2100-pq"));
+        imp.post_static_hdr_state(&caps("bt2100-pq"));
+        assert_eq!(posted(), vec![true]);
+        imp.post_static_hdr_state(&caps("bt709"));
+        assert_eq!(posted(), vec![false]);
+
+        // Under dynamic-hdr the compositor's transitions are reported instead.
+        let dynamic = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("hdr", true)
+            .property("dynamic-hdr", true)
+            .build();
+        pipeline.add(&dynamic).unwrap();
+        dynamic.imp().post_static_hdr_state(&caps("bt2100-pq"));
+        assert_eq!(posted(), Vec::<bool>::new());
     }
 
     #[test]

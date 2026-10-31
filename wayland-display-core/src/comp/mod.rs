@@ -204,8 +204,8 @@ pub struct State {
     /// flip. See [`State::update_hdr_state`].
     hdr_candidate_since: Option<Instant>,
     /// This element's Vulkan-encode device share. A clone of the gst element's own
-    /// `Arc<VulkanShare>`, so the compositor thread reads the SAME per-element device the
-    /// element mints -- not a process-global singleton. Read in `apply_video_info` when
+    /// `Arc<VulkanShare>`, so the compositor thread reads the SAME device the element hands
+    /// the encoder (its render node's shared device). Read in `apply_video_info` when
     /// building the `memory:VulkanImage` output ring. Replaced by the real share in [`init`];
     /// the `State::new` default is an empty placeholder.
     pub(crate) vulkan_share: Arc<VulkanShare>,
@@ -713,9 +713,7 @@ fn same_output_contract(prev: &GstVideoInfo, new: &GstVideoInfo) -> bool {
     let (prev, new) = match (prev, new) {
         (GstVideoInfo::RAW(p), GstVideoInfo::RAW(n)) => (p.to_caps(), n.to_caps()),
         (GstVideoInfo::DMA(p), GstVideoInfo::DMA(n)) => (p.to_caps(), n.to_caps()),
-        (GstVideoInfo::VULKAN(p), GstVideoInfo::VULKAN(n))
-            if p.codec == n.codec && p.profile == n.profile =>
-        {
+        (GstVideoInfo::VULKAN(p), GstVideoInfo::VULKAN(n)) if p.targets == n.targets => {
             (p.video_info.to_caps(), n.video_info.to_caps())
         }
         #[cfg(feature = "cuda")]
@@ -900,8 +898,7 @@ pub(crate) fn apply_video_info(
                             &mut state.renderer,
                             node,
                             params.video_info,
-                            params.codec,
-                            params.profile,
+                            &params.targets,
                             &vulkan_share,
                         );
                         if allocation.is_none() {
@@ -912,7 +909,7 @@ pub(crate) fn apply_video_info(
                         allocation.map(GsBufferType::VULKAN)
                     } else {
                         tracing::error!(
-                            "No shared GstVulkanDevice within 5s: the downstream Vulkan encoder never shared its device. Cannot produce memory:VulkanImage output."
+                            "No GstVulkanDevice for this element within 5s. Cannot produce memory:VulkanImage output."
                         );
                         None
                     };
@@ -1397,7 +1394,7 @@ pub(crate) fn init(
 #[cfg(test)]
 mod output_contract_tests {
     use super::*;
-    use crate::utils::video_info::{VulkanCodec, VulkanParams};
+    use crate::utils::video_info::{EncodeTarget, VulkanCodec, VulkanParams};
     use gst_video::{VideoFormat, VideoInfoDmaDrm};
 
     #[test]
@@ -1415,8 +1412,7 @@ mod output_contract_tests {
         assert!(same_output_contract(&raw, &GstVideoInfo::RAW(hdr)));
         let vk = GstVideoInfo::VULKAN(VulkanParams {
             video_info: info,
-            codec: VulkanCodec::H265,
-            profile: "main-10".into(),
+            targets: vec![EncodeTarget::new(VulkanCodec::H265, "main-10")],
         });
         assert!(
             !same_output_contract(&raw, &vk),
@@ -1424,12 +1420,11 @@ mod output_contract_tests {
         );
         let mut changed = vk.clone();
         if let GstVideoInfo::VULKAN(params) = &mut changed {
-            params.codec = VulkanCodec::Av1;
+            params.targets = vec![EncodeTarget::new(VulkanCodec::Av1, "main")];
         }
         assert!(!same_output_contract(&vk, &changed));
         if let GstVideoInfo::VULKAN(params) = &mut changed {
-            params.codec = VulkanCodec::H265;
-            params.profile = "main".into();
+            params.targets = vec![EncodeTarget::new(VulkanCodec::H265, "main")];
         }
         assert!(!same_output_contract(&vk, &changed));
         let dma = |drm: &str| {

@@ -1,15 +1,16 @@
-//! Share the downstream encoder's `GstVulkanDevice` with our producer, and mint
-//! encode-ready NV12 `GstVulkanImageMemory` buffers on it.
+//! Share a `GstVulkanDevice` between our producer and the downstream encoder, and make
+//! encode-ready NV12/P010 `GstVulkanImageMemory` buffers on it.
 //!
 //! For the Vulkan-encode path (`waylanddisplaysrc ! interpipesink` ⇒ `interpipesrc !
 //! vulkanh264enc`, both in one process) the producer must output NV12 images on the *same*
 //! `GstVulkanDevice` the encoder uses, created as a *single multiplanar*
 //! `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` image with `VIDEO_ENCODE_SRC` usage and the
-//! encoder's video profile chained in — then `vulkanh264enc` image-views it with no copy.
+//! encoders' video profiles chained in — then `vulkanh264enc` image-views it with no copy.
 //!
-//! The shared device arrives via `GstContext` (`gst.vulkan.device`), exactly like the
-//! CUDA path's context sharing in Wolf. This module extracts + stashes the shared device
-//! (set from `ElementImpl::set_context`), exposes the raw `VkInstance`/`VkPhysicalDevice`/
+//! The source answers the encoder's `gst.vulkan.device` context query with its render node's
+//! process-wide device (see [`SHARED_DEVICES`]); behind interpipe the query crosses the
+//! boundary through interpipe's context forwarding. An embedder may instead inject a device
+//! with `set_context`. This module holds that device, exposes the raw `VkInstance`/`VkPhysicalDevice`/
 //! `VkDevice` + a graphics queue family so our `ash` compute/copy runs on the encoder's
 //! device, and mints encode-src NV12 images one at a time via
 //! `gst_vulkan_image_memory_alloc_with_image_info`, whose `VkImage` we recover.
@@ -23,7 +24,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::utils::video_info::VulkanCodec;
+use crate::utils::video_info::{EncodeTarget, VulkanCodec};
 use crate::utils::vulkan_nv12::PixFmt;
 use ash::vk;
 use gst::glib::translate::{ToGlibPtr, from_glib_full};
@@ -33,9 +34,9 @@ use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, Vulka
 use gstreamer_vulkan_sys as gstvk;
 use std::sync::{Arc, Condvar, Mutex};
 
-// VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
-// values (stable, and avoids depending on the named ash constants existing).
-const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR: u32 = 0x0000_2000;
+/// The encoder's input image usage. (0x2000, used here before, is VIDEO_ENCODE_DST: the
+/// images were created as encode *outputs*, which the driver rejects once asked.)
+const VIDEO_ENCODE_SRC: vk::ImageUsageFlags = vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
 
 /// Device extensions the converter cannot run without: importing the compositor's RGBA
 /// dmabuf. A device lacking any of them is refused instead of reaching an ash stub.
@@ -79,29 +80,52 @@ unsafe extern "C" {
     fn wayland_display_vk_prepare_encode_image(memory: *mut gst::ffi::GstMemory);
 }
 
-/// Devices minted by an element that went away, kept for the next element on the same GPU
-/// instead of being destroyed: `vkDestroyDevice` can deadlock NVIDIA's driver against
-/// another session's EGL calls (see `vulkan_nv12::PooledDevice`). One element holds a
-/// device at a time, so a session still gets a device of its own, and a lost device is
-/// never pooled.
-static MINTED_POOL: Mutex<Vec<(Option<u32>, VulkanInstance, VulkanDevice)>> =
+/// The device each render node's elements share, for the life of the process.
+///
+/// Wolf retargets a running consumer (`interpipesrc listen-to=...`) from one producer to
+/// another, e.g. when a session joins a lobby. The consumer's encoder stays on the
+/// `GstVulkanDevice` it adopted from the first producer, so every producer it may switch to
+/// must hand out images on that same device: one device per GPU, not per element. Devices are
+/// never destroyed (`vkDestroyDevice` can deadlock NVIDIA's driver against another session's
+/// EGL calls, see `vulkan_nv12::PooledDevice`); a device found lost is replaced, and the lost
+/// one is leaked rather than destroyed.
+static SHARED_DEVICES: Mutex<Vec<(Option<u32>, VulkanInstance, VulkanDevice)>> =
     Mutex::new(Vec::new());
 
-/// Pool `device` (minted on `minor`) unless it was lost.
-fn return_minted(minor: Option<u32>, instance: VulkanInstance, device: VulkanDevice) {
-    if !device_healthy(&device) {
-        tracing::warn!("vulkan_share: minted device lost; not reusing it");
-        return;
-    }
-    MINTED_POOL
+/// The graphics `GstVulkanQueue` of each device, one per device for the whole process.
+///
+/// `gst_vulkan_device_select_queue()` returns a new `GstVulkanQueue` wrapper on every call, and
+/// its submit lock belongs to the wrapper, not to the `VkQueue`. Every converter on a shared
+/// device submits to the same `VkQueue`, so they must all lock the same wrapper: with one
+/// wrapper each, two sessions' `vkQueueSubmit`s raced (validation: Threading-MultipleThreads,
+/// then `VK_ERROR_DEVICE_LOST` on NVIDIA). The device reference keeps its pointer unique.
+static GRAPHICS_QUEUES: Mutex<Vec<(VulkanDevice, VulkanQueue)>> = Mutex::new(Vec::new());
+
+/// `device`'s process-wide graphics queue (see [`GRAPHICS_QUEUES`]).
+fn graphics_queue(device: &VulkanDevice) -> Option<VulkanQueue> {
+    let mut queues = GRAPHICS_QUEUES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((minor, instance, device));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, queue)) = queues.iter().find(|(d, _)| d.as_ptr() == device.as_ptr()) {
+        return Some(queue.clone());
+    }
+    let ptr = unsafe {
+        gstvk::gst_vulkan_device_select_queue(device.as_ptr(), vk::QueueFlags::GRAPHICS.as_raw())
+    };
+    if ptr.is_null() {
+        return None;
+    }
+    // `gst_vulkan_device_select_queue()` is transfer-full.
+    let queue: VulkanQueue = unsafe { from_glib_full(ptr) };
+    queues.push((device.clone(), queue.clone()));
+    Some(queue)
 }
 
-/// Whether `device` still works: a fence on a lost device reports `VK_ERROR_DEVICE_LOST`.
-/// Needs no queue, so it doesn't race other users of the device.
-fn device_healthy(device: &VulkanDevice) -> bool {
+/// Whether `device` is lost. Submits an empty batch with a fence to gst's graphics queue:
+/// `vkQueueSubmit` or the fence wait report `VK_ERROR_DEVICE_LOST` on a lost device (a fence
+/// that was never submitted can't tell, since `vkGetFenceStatus` may answer `VK_NOT_READY`
+/// there). A busy queue that doesn't drain within a second counts as alive.
+fn device_lost(device: &VulkanDevice) -> bool {
     unsafe {
         let Ok(entry) = ash::Entry::load() else {
             return false;
@@ -110,16 +134,34 @@ fn device_healthy(device: &VulkanDevice) -> bool {
             entry.static_fn(),
             wayland_display_vk_instance(device.as_ptr()),
         );
-        let device = ash::Device::load(
+        let ash_device = ash::Device::load(
             instance.fp_v1_0(),
             wayland_display_vk_device(device.as_ptr()),
         );
-        let Ok(fence) = device.create_fence(&vk::FenceCreateInfo::default(), None) else {
+        let Some(queue) = graphics_queue(device) else {
             return false;
         };
-        let healthy = device.get_fence_status(fence).is_ok();
-        device.destroy_fence(fence, None);
-        healthy
+        let fence = match ash_device.create_fence(&vk::FenceCreateInfo::default(), None) {
+            Ok(fence) => fence,
+            Err(e) => return e == vk::Result::ERROR_DEVICE_LOST,
+        };
+        let submitted = {
+            let _guard = QueueSubmitGuard::new(&queue);
+            ash_device.queue_submit(wayland_display_vk_queue_handle(queue.as_ptr()), &[], fence)
+        };
+        let lost = match submitted {
+            Err(e) => e == vk::Result::ERROR_DEVICE_LOST,
+            Ok(()) => match ash_device.wait_for_fences(&[fence], true, 1_000_000_000) {
+                Err(vk::Result::TIMEOUT) => {
+                    // Still pending: destroying it now would be invalid. Leak it.
+                    return false;
+                }
+                Err(e) => e == vk::Result::ERROR_DEVICE_LOST,
+                Ok(()) => false,
+            },
+        };
+        ash_device.destroy_fence(fence, None);
+        lost
     }
 }
 
@@ -170,25 +212,14 @@ pub fn missing_extensions(device: &VulkanDevice) -> Vec<&'static str> {
         .collect()
 }
 
-/// Per-`waylanddisplaysrc`-element owner of the Vulkan objects the encode path shares.
+/// Per-`waylanddisplaysrc`-element handle on the Vulkan objects the encode path shares.
 ///
-/// Historically the
-/// owned `GstVulkanInstance` + `GstVulkanDevice` lived in *process-global* `OnceLock` slots,
-/// so every session in one process reused the first session's `VkDevice` (a single failure
-/// domain — one session's `DEVICE_LOST` corrupts all N; session 2..N's `target_minor`
-/// ignored; a deliberate per-process device leak). One `VulkanShare` is now created per
-/// element and cloned **once** into that element's compositor thread (mirroring the existing
-/// `app_surface_commits` / `renderer_degraded` `Arc`s threaded through
-/// `WaylandDisplay::new_with_channel` -> `comp::init`), so each `waylanddisplaysrc` mints,
-/// answers `gst.vulkan.{instance,device}` context queries with, and owns its **own** device,
-/// released when the element is finalized and this `Arc` drops. N concurrent Vulkan-encode
-/// sessions on one host therefore get N isolated devices — a `DEVICE_LOST` on one retires
-/// only that element's device, leaving the other N-1 untouched.
-///
-/// This is a **storage-location** change only: device creation
-/// ([`ensure_owned_device`](VulkanShare::ensure_owned_device)) is byte-identical to the
-/// previous global path, with no vendor branch, so the RADV path sees no behavioral change.
-/// The `wayland_display_vk_*` C bridge is untouched.
+/// One `VulkanShare` is created per element and cloned **once** into that element's
+/// compositor thread (through `WaylandDisplay::new_with_channel` -> `comp::init`). It holds
+/// the element's own conversion options and refusal state, and a reference to the device the
+/// element produces on: its render node's process-wide device (see [`SHARED_DEVICES`]), or
+/// one an embedder injected with `set_context`. The element answers
+/// `gst.vulkan.{instance,device}` context queries with that device.
 pub struct VulkanShare {
     /// The `GstVulkanInstance` we own (keeps it alive + lets us answer `gst.vulkan.instance`
     /// context queries). Replaces the process-global `instance_slot()`.
@@ -210,25 +241,6 @@ pub struct VulkanShare {
     minted_for: Mutex<Option<Option<u32>>>,
 }
 
-impl Drop for VulkanShare {
-    fn drop(&mut self) {
-        let minted_for = *self.minted_for.get_mut().unwrap_or_else(|e| e.into_inner());
-        let device = self
-            .device
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let instance = self
-            .instance
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let (Some(minor), Some(device), Some(instance)) = (minted_for, device, instance) {
-            return_minted(minor, instance, device);
-        }
-    }
-}
-
 impl VulkanShare {
     /// A fresh, empty per-element share. Cheap; holds no Vulkan objects until first use. Kept
     /// behind an `Arc` so one clone can be handed to the compositor thread while the element
@@ -244,11 +256,6 @@ impl VulkanShare {
         })
     }
 
-    #[cfg(test)]
-    fn minted_pool_len() -> usize {
-        MINTED_POOL.lock().unwrap().len()
-    }
-
     /// Pull the shared `GstVulkanDevice` out of a received `GstContext` and stash it in **this
     /// element's** slot. Call from `ElementImpl::set_context` for the `gst.vulkan.device`
     /// context type. Returns true if a device is now shared.
@@ -262,12 +269,11 @@ impl VulkanShare {
         let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
         let mut slot = self.device.lock().unwrap();
         // Keep the device this element already has. GstBin fans a have-context message to
-        // EVERY child, so with two waylanddisplaysrc in one bin the second element's encoder
-        // would otherwise overwrite the first element's device while that element's own
-        // encoder stays on the original -- producing buffers on one VkDevice and encoding
-        // them on another. Under the old process-global slot everyone shared one device and
-        // the overwrite was free; per element it is a cross-device hazard, so refuse it here
-        // rather than relying on the embedder to check.
+        // EVERY child, so with two waylanddisplaysrc in one bin (possibly on different GPUs)
+        // the second element's encoder would otherwise overwrite the first element's device
+        // while that element's own encoder stays on the original -- producing buffers on one
+        // VkDevice and encoding them on another. Refuse it here rather than relying on the
+        // embedder to check.
         if let Some(existing) = slot.as_ref() {
             if existing.as_ptr() != device.as_ptr() {
                 tracing::warn!(
@@ -322,6 +328,20 @@ impl VulkanShare {
     pub fn end_run(&self) {
         self.refused
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Look the render node's device up again next run: it may have been replaced as lost.
+        // An injected device stays; the embedder bound its encoder to it.
+        let mut slot = self.device.lock().unwrap();
+        if self.minted_for.lock().unwrap().take().is_some() {
+            *slot = None;
+            *self.instance.lock().unwrap() = None;
+        }
+    }
+
+    /// Stop offering `memory:VulkanImage` output for the rest of this run (no device could be
+    /// created for it).
+    pub fn refuse(&self) {
+        self.refused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether `memory:VulkanImage` output may still be offered; see `refused`.
@@ -406,164 +426,95 @@ unsafe fn device_name(ash_inst: &ash::Instance, dev: vk::PhysicalDevice) -> Stri
     String::from_utf8_lossy(slice).into_owned()
 }
 
-/// Pick the physical device to back our shared encode device. We must NEVER hand the encoder a
-/// device that can't video-encode (e.g. llvmpipe), so encode capability is a hard requirement:
-/// prefer the encode-capable GPU whose DRM render/primary minor matches the compositor's render
-/// node (`target_minor`); otherwise the first encode-capable GPU. Only if none can encode do we
-/// fall back to index 0. (The old code fell back to a bare index 0, which — since Vulkan
-/// enumeration order isn't guaranteed — could land on llvmpipe and make `vulkanh264enc` fail to
-/// link, intermittently across restarts.)
+/// The index of the physical device to back the shared encode device: the encode-capable GPU
+/// behind `target_minor` (see `vulkan_nv12::physical_device_for_minor`, which never crosses to
+/// another GPU). A device without a video-encode queue (e.g. llvmpipe) is useless to the
+/// encoder and makes `vulkanh26xenc` fail to link, so it is never picked.
 unsafe fn physical_index_for_minor(
     ash_inst: &ash::Instance,
     target_minor: Option<u32>,
 ) -> Option<u32> {
     let devices = ash_inst.enumerate_physical_devices().ok()?;
-    if devices.is_empty() {
-        return None;
-    }
-    let encode_capable: Vec<usize> = (0..devices.len())
-        .filter(|&i| has_video_encode_queue(ash_inst, devices[i]))
-        .collect();
-
-    // Prefer an encode-capable device matching the compositor's render minor.
-    if let Some(minor) = target_minor {
-        for &i in &encode_capable {
-            let d = devices[i];
-            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
-            ash_inst.get_physical_device_properties2(d, &mut p2);
-            if (drm.has_render != 0 && drm.render_minor as i64 == minor as i64)
-                || (drm.has_primary != 0 && drm.primary_minor as i64 == minor as i64)
-            {
-                tracing::info!(
-                    "vulkan_share: selected physical device {i} '{}' (matches render minor {minor}, video-encode capable)",
-                    device_name(ash_inst, d)
-                );
-                return Some(i as u32);
-            }
-        }
+    let chosen =
+        crate::utils::vulkan_nv12::physical_device_for_minor(ash_inst, target_minor, |d| {
+            has_video_encode_queue(ash_inst, d)
+        });
+    let Some(chosen) = chosen else {
         tracing::warn!(
-            "vulkan_share: no encode-capable physical device matched render minor {minor}; \
-             falling back to first encode-capable GPU"
+            "vulkan_share: no video-encode capable GPU for render minor {target_minor:?}; \
+             memory:VulkanImage output is unavailable"
         );
-    }
-    if let Some(&i) = encode_capable.first() {
-        tracing::info!(
-            "vulkan_share: selected physical device {i} '{}' (first video-encode capable)",
-            device_name(ash_inst, devices[i])
-        );
-        return Some(i as u32);
-    }
-    tracing::warn!(
-        "vulkan_share: NO video-encode-capable physical device found; using index 0 (encode will likely fail)"
+        return None;
+    };
+    let index = devices.iter().position(|&d| d == chosen)?;
+    tracing::info!(
+        "vulkan_share: selected physical device {index} '{}' (render minor {target_minor:?}, \
+         video-encode capable)",
+        device_name(ash_inst, chosen)
     );
-    Some(0)
+    Some(index as u32)
 }
 
 impl VulkanShare {
-    /// Create (once, on **this element**) the `GstVulkanInstance` + `GstVulkanDevice` that *we*
-    /// own, on the GPU backing `target_minor`, with the external-memory extensions the
-    /// RGBA-dmabuf import needs (`VK_KHR_external_memory_fd` etc.) enabled — which gst-vulkan's
-    /// own device does not. This is the device we hand the encoder (see
-    /// [`provide_context`](VulkanShare::provide_context)) so producer and encoder share one
-    /// device with no zero-copy gap *and* no gstreamer fork. Idempotent **per element** (not
-    /// per process): the first call on *this* share mints on *this* element's `target_minor`.
+    /// The device this element produces on: an injected one (see `handle_set_context`), or
+    /// the process-wide device of `target_minor`'s GPU, created on first use with the
+    /// external-memory extensions the RGBA-dmabuf import needs (`VK_KHR_external_memory_fd`
+    /// etc.), which gst-vulkan's own device does not enable. This is the device the encoder is
+    /// handed (see [`provide_context`](VulkanShare::provide_context)), so producer and encoder
+    /// share one device with no zero-copy gap and no gstreamer fork. `None` when no device
+    /// can be created on that GPU.
     ///
-    /// Device creation below is unchanged from the pre-patch process-global path — no vendor
-    /// branch — so RADV behaves byte-identically; only where the result is stored moved from a
-    /// `static` slot to `self`.
-    /// LOCK ORDER: `device` then `instance`, and this is the only method that holds both.
-    /// `minted_for` is only ever taken innermost, under `device`.
-    /// The `device` guard is deliberately held across the instance open, `Entry::load` and
-    /// device enumeration below -- it is the mutual exclusion that stops two threads each
-    /// minting a `VkDevice` for this element. Every other accessor takes a single lock as a
-    /// temporary (`provide_context` clones instance and device in separate statements, so it
-    /// never holds both), which is why the inverse order cannot arise.
+    /// LOCK ORDER: `device`, then [`SHARED_DEVICES`], then `instance` / `minted_for`. Holding
+    /// `SHARED_DEVICES` across creation keeps two elements on one GPU from each creating one.
     pub fn ensure_owned_device(&self, target_minor: Option<u32>) -> Option<VulkanDevice> {
         let mut slot = self.device.lock().unwrap();
         if let Some(d) = slot.clone() {
             let minted_for = *self.minted_for.lock().unwrap();
             // A device injected by an embedder wins over target_minor: the encoder is
-            // already bound to it, and minting a second device on the requested node would
-            // put producer and encoder on different VkDevices, which is worse than honouring
-            // the wrong node. A device this element minted for another node (render-node
-            // changed between runs) is stale; mint a new one on the requested node.
+            // already bound to it, and switching to another device would put producer and
+            // encoder on different VkDevices, which is worse than honouring the wrong node.
             if minted_for.is_none_or(|minor| minor == target_minor) {
                 return Some(d);
             }
             tracing::info!(
                 "vulkan_share: render node changed ({minted_for:?} -> {target_minor:?}); \
-                 creating a new device"
+                 switching to that GPU's device"
             );
-            if let (Some(old), Some(minor), Some(instance)) = (
-                slot.take(),
-                minted_for,
-                self.instance.lock().unwrap().take(),
-            ) {
-                return_minted(minor, instance, old);
-            }
+            *slot = None;
+            *self.instance.lock().unwrap() = None;
             *self.minted_for.lock().unwrap() = None;
         }
         // The first Vulkan use in the process must not race another; see the function.
         crate::utils::renderer::keep_vulkan_drivers_loaded();
-        let pooled = {
-            let mut pool = MINTED_POOL
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pool.iter()
-                .position(|(minor, _, _)| *minor == target_minor)
-                .map(|i| pool.swap_remove(i))
-        };
-        if let Some((_, instance, device)) = pooled {
-            *self.instance.lock().unwrap() = Some(instance);
-            *slot = Some(device.clone());
-            *self.minted_for.lock().unwrap() = Some(target_minor);
-            self.device_ready.notify_all();
-            tracing::info!("vulkan_share: reusing a pooled GstVulkanDevice");
-            return Some(device);
-        }
-        let instance = VulkanInstance::new();
-        if let Err(e) = instance.open() {
-            tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
-            return None;
-        }
-        let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
-        let index = unsafe {
-            let entry = match ash::Entry::load() {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!("vulkan_share: ash entry load failed: {e}");
-                    return None;
-                }
-            };
-            let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
-            physical_index_for_minor(&ash_inst, target_minor)?
-        };
-        let physical = VulkanPhysicalDevice::new(&instance, index);
-        let device = VulkanDevice::new(&physical);
-        // enable_extension() fails when the physical device lacks the extension.
-        for ext in REQUIRED_DEVICE_EXTENSIONS {
-            if !device.enable_extension(ext) {
-                tracing::error!("vulkan_share: physical device {index} lacks {ext}");
-                return None;
+        let mut shared = SHARED_DEVICES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = shared
+            .iter()
+            .position(|(minor, _, _)| *minor == target_minor)
+        {
+            if device_lost(&shared[i].2) {
+                tracing::warn!(
+                    "vulkan_share: the shared device for render minor {target_minor:?} was \
+                     lost; creating a new one"
+                );
+                // Leaked, not destroyed: see SHARED_DEVICES.
+                std::mem::forget(shared.swap_remove(i));
+            } else {
+                let (_, instance, device) = &shared[i];
+                *self.instance.lock().unwrap() = Some(instance.clone());
+                *slot = Some(device.clone());
+                *self.minted_for.lock().unwrap() = Some(target_minor);
+                self.device_ready.notify_all();
+                return Some(device.clone());
             }
         }
-        for ext in OPTIONAL_DEVICE_EXTENSIONS {
-            if !device.enable_extension(ext) {
-                tracing::info!("vulkan_share: optional {ext} unavailable");
-            }
-        }
-        if let Err(e) = device.open() {
-            tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
-            return None;
-        }
+        let (instance, device) = mint_device(target_minor)?;
+        shared.push((target_minor, instance.clone(), device.clone()));
         *self.instance.lock().unwrap() = Some(instance);
         *slot = Some(device.clone());
         *self.minted_for.lock().unwrap() = Some(target_minor);
         self.device_ready.notify_all();
-        tracing::info!(
-            "vulkan_share: created per-element shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
-        );
         Some(device)
     }
 
@@ -608,6 +559,51 @@ impl VulkanShare {
     }
 }
 
+/// Create a `GstVulkanInstance` + `GstVulkanDevice` on `target_minor`'s GPU with the
+/// converter's required (and available optional) extensions enabled.
+fn mint_device(target_minor: Option<u32>) -> Option<(VulkanInstance, VulkanDevice)> {
+    let instance = VulkanInstance::new();
+    if let Err(e) = instance.open() {
+        tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
+        return None;
+    }
+    let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
+    let index = unsafe {
+        let entry = match ash::Entry::load() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("vulkan_share: ash entry load failed: {e}");
+                return None;
+            }
+        };
+        let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
+        physical_index_for_minor(&ash_inst, target_minor)?
+    };
+    let physical = VulkanPhysicalDevice::new(&instance, index);
+    let device = VulkanDevice::new(&physical);
+    // enable_extension() fails when the physical device lacks the extension.
+    for ext in REQUIRED_DEVICE_EXTENSIONS {
+        if !device.enable_extension(ext) {
+            tracing::error!("vulkan_share: physical device {index} lacks {ext}");
+            return None;
+        }
+    }
+    for ext in OPTIONAL_DEVICE_EXTENSIONS {
+        if !device.enable_extension(ext) {
+            tracing::info!("vulkan_share: optional {ext} unavailable");
+        }
+    }
+    if let Err(e) = device.open() {
+        tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
+        return None;
+    }
+    tracing::info!(
+        "vulkan_share: created the shared GstVulkanDevice for render minor {target_minor:?} \
+         (phys idx {index}) with external-memory extensions"
+    );
+    Some((instance, device))
+}
+
 /// Extract the raw `VkInstance`/`VkPhysicalDevice`/`VkDevice`, gst's graphics queue and the
 /// video-encode queue family from the (shared) `GstVulkanDevice`.
 pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
@@ -625,14 +621,8 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
         if vk_physical == vk::PhysicalDevice::null() {
             return None;
         }
-        // `gst_vulkan_device_select_queue()` is transfer-full.
-        let gfx_ptr =
-            gstvk::gst_vulkan_device_select_queue(dev_ptr, vk::QueueFlags::GRAPHICS.as_raw());
-        if gfx_ptr.is_null() {
-            return None;
-        }
-        let gfx_queue: VulkanQueue = from_glib_full(gfx_ptr);
-        let gfx_queue_family = wayland_display_vk_queue_family(gfx_ptr);
+        let gfx_queue = graphics_queue(device)?;
+        let gfx_queue_family = wayland_display_vk_queue_family(gfx_queue.as_ptr());
         let enc_ptr =
             gstvk::gst_vulkan_device_select_queue(dev_ptr, VK_QUEUE_VIDEO_ENCODE_BIT_KHR.as_raw());
         let encode_queue_family = (!enc_ptr.is_null()).then(|| {
@@ -652,6 +642,169 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
     }
 }
 
+/// `VkVideoProfileInfoKHR`s for encode targets, with the codec-specific structs they point
+/// to kept alive (and at fixed addresses) alongside them.
+// Boxed: each profile's p_next points at its codec struct, which must not move as the Vecs grow.
+#[allow(clippy::vec_box)]
+struct EncodeProfiles {
+    _h264: Vec<Box<vk::VideoEncodeH264ProfileInfoKHR<'static>>>,
+    _h265: Vec<Box<vk::VideoEncodeH265ProfileInfoKHR<'static>>>,
+    _av1: Vec<Box<VideoEncodeAv1ProfileInfo>>,
+    infos: Vec<vk::VideoProfileInfoKHR<'static>>,
+}
+
+impl EncodeProfiles {
+    /// The profiles of the `targets` that accept `fmt` (matching what the encoder builds from
+    /// its caps: the codec struct chained off the `VkVideoProfileInfoKHR`, usage info omitted).
+    fn new(targets: &[EncodeTarget], fmt: PixFmt) -> Self {
+        let bit_depth = match fmt {
+            PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+            PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+        };
+        let mut this = EncodeProfiles {
+            _h264: Vec::new(),
+            _h265: Vec::new(),
+            _av1: Vec::new(),
+            infos: Vec::new(),
+        };
+        for target in targets {
+            if !target.codec.accepts(fmt.gst_format(), &target.profile) {
+                continue;
+            }
+            let base = vk::VideoProfileInfoKHR::default()
+                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(bit_depth)
+                .chroma_bit_depth(bit_depth);
+            let info = match target.codec {
+                VulkanCodec::H264 => {
+                    let idc = match target.profile.as_str() {
+                        "high" | "constrained-high" | "progressive-high" => {
+                            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+                        }
+                        "main" => {
+                            vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN
+                        }
+                        _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
+                    };
+                    let codec =
+                        Box::new(vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(idc));
+                    let mut info =
+                        base.video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264);
+                    info.p_next = &*codec as *const _ as *const _;
+                    this._h264.push(codec);
+                    info
+                }
+                VulkanCodec::H265 => {
+                    let idc = match fmt {
+                        PixFmt::P010 => {
+                            vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+                        }
+                        PixFmt::Nv12 => {
+                            vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
+                        }
+                    };
+                    let codec =
+                        Box::new(vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(idc));
+                    let mut info =
+                        base.video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265);
+                    info.p_next = &*codec as *const _ as *const _;
+                    this._h265.push(codec);
+                    info
+                }
+                VulkanCodec::Av1 => {
+                    let codec = Box::new(VideoEncodeAv1ProfileInfo {
+                        s_type: vk::StructureType::from_raw(
+                            VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
+                        ),
+                        p_next: std::ptr::null(),
+                        std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
+                    });
+                    let mut info =
+                        base.video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
+                            VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_KHR,
+                        ));
+                    info.p_next = &*codec as *const _ as *const _;
+                    this._av1.push(codec);
+                    info
+                }
+            };
+            // Keep the list free of duplicates (the H.264 aliases share a profile_idc).
+            let same = |a: &vk::VideoProfileInfoKHR, b: &vk::VideoProfileInfoKHR| {
+                a.video_codec_operation == b.video_codec_operation
+                    && unsafe { profile_idc(a) == profile_idc(b) }
+            };
+            if this.infos.iter().any(|known| same(known, &info)) {
+                continue;
+            }
+            this.infos.push(info);
+        }
+        this
+    }
+}
+
+/// The std profile id behind a profile built by [`EncodeProfiles`].
+unsafe fn profile_idc(info: &vk::VideoProfileInfoKHR) -> u32 {
+    if info.video_codec_operation == vk::VideoCodecOperationFlagsKHR::ENCODE_H264 {
+        (*(info.p_next as *const vk::VideoEncodeH264ProfileInfoKHR)).std_profile_idc
+    } else if info.video_codec_operation == vk::VideoCodecOperationFlagsKHR::ENCODE_H265 {
+        (*(info.p_next as *const vk::VideoEncodeH265ProfileInfoKHR)).std_profile_idc
+    } else {
+        (*(info.p_next as *const VideoEncodeAv1ProfileInfo)).std_profile
+    }
+}
+
+/// Whether `device`'s GPU can encode from a `fmt` image in `profile`
+/// (`vkGetPhysicalDeviceVideoFormatPropertiesKHR` for `VIDEO_ENCODE_SRC`).
+unsafe fn encode_src_format_supported(
+    device: &VulkanDevice,
+    profile: &vk::VideoProfileInfoKHR,
+    fmt: PixFmt,
+) -> bool {
+    let Ok(entry) = ash::Entry::load() else {
+        return false;
+    };
+    let instance = ash::Instance::load(
+        entry.static_fn(),
+        wayland_display_vk_instance(device.as_ptr()),
+    );
+    let video = ash::khr::video_queue::Instance::new(&entry, &instance);
+    let physical = gstvk::gst_vulkan_device_get_physical_device(device.as_ptr());
+    let one = [*profile];
+    let mut list = vk::VideoProfileListInfoKHR::default().profiles(&one);
+    let info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(VIDEO_ENCODE_SRC)
+        .push_next(&mut list);
+    let query = video.fp().get_physical_device_video_format_properties_khr;
+    let mut count = 0u32;
+    let result = query(physical, &info, &mut count, std::ptr::null_mut());
+    if result != vk::Result::SUCCESS {
+        tracing::debug!(
+            "vulkan_share: {:?} profile {} not supported for encode input: {result:?}",
+            profile.video_codec_operation,
+            profile_idc(profile)
+        );
+        return false;
+    }
+    let mut formats = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+    let result = query(physical, &info, &mut count, formats.as_mut_ptr());
+    if result != vk::Result::SUCCESS {
+        tracing::debug!("vulkan_share: video format query failed: {result:?}");
+        return false;
+    }
+    let wanted = match fmt {
+        PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+        PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+    };
+    let formats = &formats[..count as usize];
+    tracing::debug!(
+        "vulkan_share: {:?} profile {} encode-input formats {:?}",
+        profile.video_codec_operation,
+        profile_idc(profile),
+        formats.iter().map(|f| f.format).collect::<Vec<_>>()
+    );
+    formats.iter().any(|f| f.format == wanted)
+}
+
 /// Allocate ONE encode-src NV12/P010 image as a `GstVulkanImageMemory`, built directly via
 /// `gst_vulkan_image_memory_alloc_with_image_info` so we control the `VkImageCreateInfo`
 /// (usage `TRANSFER_DST | VIDEO_ENCODE_SRC` + the encoder's `VkVideoProfileListInfoKHR`
@@ -666,62 +819,40 @@ pub fn alloc_encode_src_buffer(
     device: &VulkanDevice,
     width: u32,
     height: u32,
-    codec: VulkanCodec,
-    profile: &str,
+    targets: &[EncodeTarget],
     fmt: PixFmt,
     linear_encsrc: bool,
     queue_families: &[u32],
 ) -> Option<gst::Buffer> {
-    if !codec.accepts(fmt.gst_format(), profile) {
-        tracing::error!("Vulkan {codec:?} profile {profile} cannot encode {fmt:?}");
+    let profiles = EncodeProfiles::new(targets, fmt);
+    if profiles.infos.is_empty() {
+        tracing::error!("No Vulkan encode profile in {targets:?} can encode {fmt:?}");
         return None;
     }
-    let bit_depth = match fmt {
-        PixFmt::P010 => vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
-        PixFmt::Nv12 => vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
-    };
     unsafe {
-        // Profile chain (matches what the encoder builds from caps): the codec struct chained
-        // off the VkVideoProfileInfoKHR; usage info omitted.
-        let std_h264_idc = match profile {
-            "high" | "constrained-high" | "progressive-high" => {
-                vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
-            }
-            "main" => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN,
-            _ => vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
+        // Several targets (an encoder behind interpipe) keep only the profiles this device
+        // can encode from `fmt`: one unsupported profile in the list fails the whole image.
+        // A single target is the encoder's own profile and is kept as is.
+        let supported: Vec<vk::VideoProfileInfoKHR> = if profiles.infos.len() > 1 {
+            profiles
+                .infos
+                .iter()
+                .copied()
+                .filter(|p| encode_src_format_supported(device, p, fmt))
+                .collect()
+        } else {
+            profiles.infos.clone()
         };
-        let mut h264 = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
-        let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(match fmt {
-            PixFmt::P010 => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10,
-            PixFmt::Nv12 => vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
-        });
-        let av1 = VideoEncodeAv1ProfileInfo {
-            s_type: vk::StructureType::from_raw(
-                VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
-            ),
-            p_next: std::ptr::null(),
-            std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
-        };
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(bit_depth)
-            .chroma_bit_depth(bit_depth);
-        profile_info = match codec {
-            VulkanCodec::H264 => profile_info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-                .push_next(&mut h264),
-            VulkanCodec::H265 => profile_info
-                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-                .push_next(&mut h265),
-            VulkanCodec::Av1 => {
-                profile_info.p_next = &av1 as *const VideoEncodeAv1ProfileInfo as *const _;
-                profile_info.video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
-                    VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_KHR,
-                ))
-            }
-        };
-        let profiles = [profile_info];
-        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+        if supported.is_empty() {
+            tracing::error!("The Vulkan device can encode {fmt:?} with none of {targets:?}");
+            return None;
+        }
+        tracing::debug!(
+            "vulkan_share: encode-src images for {} of {} profiles in {targets:?}",
+            supported.len(),
+            profiles.infos.len()
+        );
+        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&supported);
 
         // RX 9070 / GFX12 (RDNA4) workaround: radv mishandles a LINEAR->tiled (different
         // swizzle mode) vkCmdCopyImage on GFX12 (cf. Mesa 26.0.2 "radv: fix copying images
@@ -753,10 +884,7 @@ pub fn alloc_encode_src_buffer(
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(tiling)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR),
-            )
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | VIDEO_ENCODE_SRC)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut profile_list);
         // EXCLUSIVE would need a graphics -> video-encode ownership transfer that the encoder
@@ -881,10 +1009,11 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
 mod tests {
     use super::*;
 
-    // Elements on one GPU reuse a minted device instead of destroying it (see MINTED_POOL).
+    // Every producer on a GPU hands out the same device, so a consumer switched from one to
+    // another (Wolf's lobbies) keeps receiving images on the device its encoder adopted.
     #[test]
     #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
-    fn a_finalized_element_hands_its_device_to_the_next_one() {
+    fn elements_on_one_gpu_share_its_device() {
         let Some(minor) = std::env::var("NV12_TEST_NODE")
             .ok()
             .and_then(|node| crate::utils::vulkan_nv12::render_node_minor(&node))
@@ -896,25 +1025,59 @@ mod tests {
         let first = VulkanShare::new();
         let device = first
             .ensure_owned_device(Some(minor))
-            .expect("minted device");
-        let raw = device.as_ptr();
-        drop(device);
-        drop(first);
-        assert!(
-            VulkanShare::minted_pool_len() >= 1,
-            "the device was not pooled"
-        );
+            .expect("created device");
         let second = VulkanShare::new();
-        let reused = second.ensure_owned_device(Some(minor)).expect("device");
-        assert_eq!(reused.as_ptr(), raw, "the device was not reused");
-        // An element alive at the same time mints a device of its own.
+        assert_eq!(
+            second
+                .ensure_owned_device(Some(minor))
+                .expect("device")
+                .as_ptr(),
+            device.as_ptr(),
+            "a concurrent element got a device of its own"
+        );
+        drop(first);
+        first_run_ends_and_restarts(&second, minor, device.as_ptr());
         let third = VulkanShare::new();
-        assert_ne!(
+        assert_eq!(
             third
                 .ensure_owned_device(Some(minor))
                 .expect("device")
                 .as_ptr(),
-            raw
+            device.as_ptr(),
+            "a later element got a device of its own"
         );
+    }
+
+    fn first_run_ends_and_restarts(
+        share: &VulkanShare,
+        minor: u32,
+        device: *mut gstvk::GstVulkanDevice,
+    ) {
+        share.end_run();
+        assert!(share.shared_device().is_none());
+        assert_eq!(
+            share
+                .ensure_owned_device(Some(minor))
+                .expect("device")
+                .as_ptr(),
+            device
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
+    fn a_working_device_is_not_reported_lost() {
+        let Some(minor) = std::env::var("NV12_TEST_NODE")
+            .ok()
+            .and_then(|node| crate::utils::vulkan_nv12::render_node_minor(&node))
+        else {
+            eprintln!("skip: NV12_TEST_NODE unset");
+            return;
+        };
+        gst::init().unwrap();
+        let device = VulkanShare::new()
+            .ensure_owned_device(Some(minor))
+            .expect("created device");
+        assert!(!device_lost(&device));
     }
 }

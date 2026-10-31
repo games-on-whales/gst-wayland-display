@@ -52,26 +52,6 @@ impl VulkanCodec {
         })
     }
 
-    /// The codec assumed when neither the property nor a linked encoder names one:
-    /// H.264 for 8-bit NV12, H.265 Main-10 for P010.
-    pub fn default_for(format: gst_video::VideoFormat) -> Self {
-        if format == gst_video::VideoFormat::P01010le {
-            VulkanCodec::H265
-        } else {
-            VulkanCodec::H264
-        }
-    }
-
-    /// The profile used when none is configured or found downstream.
-    pub fn default_profile(self, format: gst_video::VideoFormat) -> &'static str {
-        match (self, format == gst_video::VideoFormat::P01010le) {
-            (VulkanCodec::H264, _) => "high",
-            (VulkanCodec::H265, false) => "main",
-            (VulkanCodec::H265, true) => "main-10",
-            (VulkanCodec::Av1, _) => "main",
-        }
-    }
-
     /// Whether `profile` of this codec can encode `format` (NV12 or P010).
     pub fn accepts(self, format: gst_video::VideoFormat, profile: &str) -> bool {
         use gst_video::VideoFormat::{Nv12, P01010le};
@@ -94,14 +74,77 @@ impl VulkanCodec {
     }
 }
 
+/// A video profile an encode-src image is created for. Vulkan only lets an encode session
+/// read an image whose `VkVideoProfileListInfoKHR` lists the session's own profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeTarget {
+    pub codec: VulkanCodec,
+    pub profile: String,
+}
+
+impl EncodeTarget {
+    pub fn new(codec: VulkanCodec, profile: impl Into<String>) -> Self {
+        EncodeTarget {
+            codec,
+            profile: profile.into(),
+        }
+    }
+
+    /// Every codec profile that can encode `format`: the targets for an encoder this element
+    /// cannot see. Behind interpipe the consumers are unknown and may differ per session (one
+    /// producer can feed an H.264 and an H.265 encoder), so the image must suit all of them.
+    /// One entry per distinct Vulkan profile (the H.264 aliases share a profile_idc).
+    pub fn all_for(format: gst_video::VideoFormat) -> Vec<EncodeTarget> {
+        [
+            (VulkanCodec::H264, "high"),
+            (VulkanCodec::H264, "main"),
+            (VulkanCodec::H264, "baseline"),
+            (VulkanCodec::H265, "main"),
+            (VulkanCodec::H265, "main-10"),
+            (VulkanCodec::Av1, "main"),
+        ]
+        .into_iter()
+        .filter(|(codec, profile)| codec.accepts(format, profile))
+        .map(|(codec, profile)| EncodeTarget::new(codec, profile))
+        .collect()
+    }
+
+    /// The targets for the codec and profile configured on, or found downstream of, the
+    /// element: either may be unknown, and an unknown one covers every candidate for `format`.
+    /// Empty when nothing can encode `format` under those constraints.
+    pub fn resolve(
+        format: gst_video::VideoFormat,
+        codec: Option<VulkanCodec>,
+        profile: Option<&str>,
+    ) -> Vec<EncodeTarget> {
+        match (codec, profile) {
+            (Some(codec), Some(profile)) => {
+                if codec.accepts(format, profile) {
+                    vec![EncodeTarget::new(codec, profile)]
+                } else {
+                    Vec::new()
+                }
+            }
+            (codec, Some(profile)) => [VulkanCodec::H264, VulkanCodec::H265, VulkanCodec::Av1]
+                .into_iter()
+                .filter(|c| codec.is_none_or(|codec| codec == *c) && c.accepts(format, profile))
+                .map(|c| EncodeTarget::new(c, profile))
+                .collect(),
+            (codec, None) => EncodeTarget::all_for(format)
+                .into_iter()
+                .filter(|t| codec.is_none_or(|codec| codec == t.codec))
+                .collect(),
+        }
+    }
+}
+
 /// NV12/P010 `memory:VulkanImage` output on the downstream encoder's shared `GstVulkanDevice`
-/// (the Vulkan-encode/interpipe path). Carries the encoder's `codec` and `profile` so the
-/// encode-src image is created with a matching `VkVideoProfileListInfoKHR`.
+/// (the Vulkan-encode/interpipe path). Carries the encode profiles the encode-src images are
+/// created for (see [`EncodeTarget`]).
 #[derive(Debug, Clone)]
 pub struct VulkanParams {
     pub video_info: VideoInfo,
-    pub codec: VulkanCodec,
-    pub profile: String,
+    pub targets: Vec<EncodeTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,5 +263,38 @@ mod tests {
         let back: VideoInfo = wrapped.into();
         assert_eq!(back.width(), 640);
         assert_eq!(back.height(), 480);
+    }
+}
+
+#[cfg(test)]
+mod encode_target_tests {
+    use super::*;
+    use gst_video::VideoFormat::{Nv12, P01010le};
+
+    #[test]
+    fn an_unseen_encoder_gets_every_profile_for_the_format() {
+        let nv12 = EncodeTarget::resolve(Nv12, None, None);
+        assert!(nv12.contains(&EncodeTarget::new(VulkanCodec::H264, "main")));
+        assert!(nv12.contains(&EncodeTarget::new(VulkanCodec::H264, "high")));
+        assert!(nv12.contains(&EncodeTarget::new(VulkanCodec::H265, "main")));
+        assert!(!nv12.iter().any(|t| t.profile == "main-10"));
+        assert_eq!(
+            EncodeTarget::resolve(P01010le, None, None),
+            vec![EncodeTarget::new(VulkanCodec::H265, "main-10")]
+        );
+    }
+
+    #[test]
+    fn a_known_codec_or_profile_narrows_the_targets() {
+        assert_eq!(
+            EncodeTarget::resolve(Nv12, Some(VulkanCodec::H264), Some("main")),
+            vec![EncodeTarget::new(VulkanCodec::H264, "main")]
+        );
+        let h265 = EncodeTarget::resolve(Nv12, Some(VulkanCodec::H265), None);
+        assert_eq!(h265, vec![EncodeTarget::new(VulkanCodec::H265, "main")]);
+        let main = EncodeTarget::resolve(Nv12, None, Some("main"));
+        assert!(main.iter().all(|t| t.profile == "main"));
+        assert_eq!(main.len(), 3);
+        assert!(EncodeTarget::resolve(Nv12, Some(VulkanCodec::H265), Some("main-10")).is_empty());
     }
 }
