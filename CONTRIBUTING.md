@@ -66,6 +66,22 @@ export RUSTFLAGS="-L /usr/local/lib/x86_64-linux-gnu -l gstcuda-1.0"
 cargo build -p gst-plugin-wayland-display --features cuda
 ```
 
+The `cuda` build also registers `dmabuftocuda`, which imports NV12 and P010
+DMABufs into the encoder's CUDA context. Frame pixels stay on the GPU; the
+element performs a device-to-device copy into a pooled CUDA buffer and preserves
+timestamps and HDR caps. Set `render-node` to the producer's render node.
+
+Native NVIDIA encoding additionally requires GStreamer's `nvcodec` plugin at
+runtime. `cudaconvertscale` also requires NVRTC. These are separate from the
+`libgstcuda` library: an image that ships only that library cannot use NVENC.
+
+The GPU test `nvidia_p010_dmabuf_encode_to_eos` exercises the complete HDR path:
+
+```sh
+cargo test -p gst-plugin-wayland-display --features cuda --test encode \
+  nvidia_p010_dmabuf_encode_to_eos -- --ignored --nocapture
+```
+
 ## Frame-local source color with a stable transport
 
 The devcontainer includes the CUDA converter patch from `patches/series`; use

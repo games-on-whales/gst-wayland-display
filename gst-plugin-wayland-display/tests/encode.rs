@@ -483,6 +483,84 @@ fn vulkan_encode_behind_interpipe() {
     }
 }
 
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "needs NVIDIA NVENC and P010 dmabuf export"]
+fn nvidia_p010_dmabuf_encode_to_eos() {
+    let _gpu = init();
+    if !have("dmabuftocuda") || !have("nvh265enc") {
+        skip!("no native CUDA/NVENC elements");
+    }
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no NVIDIA render node");
+    };
+    run_to_eos(&format!(
+        "waylanddisplaysrc render-node={node} hdr=true num-buffers=120 ! \
+         video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=P010,width=1920,height=1080,framerate=60/1 ! \
+         dmabuftocuda render-node={node} ! video/x-raw(memory:CUDAMemory),format=P010_10LE,colorimetry=bt2100-pq ! \
+         nvh265enc preset=p1 tune=ultra-low-latency zerolatency=true ! \
+         h265parse ! video/x-h265,profile=main-10 ! fakesink sync=false"
+    )).expect("native P010 NVENC encode");
+}
+
+/// Retaining the initial four export slots must not turn an active stream into repeated
+/// copies of the last image. Encoded packet counts alone miss that freeze: the encoder
+/// happily keeps encoding the old image while the producer cannot find a free slot.
+#[test]
+#[ignore = "needs a Vulkan encoder and gst-interpipe"]
+fn vulkan_interpipe_grows_past_retained_output_slots() {
+    let _gpu = init();
+    if let Some(why) = interpipe_skip_reason() {
+        skip!("{why}");
+    }
+    let Some(node) = render_node_for(&["nvidia", "amdgpu", "i915", "xe"]) else {
+        skip!("no Vulkan render node");
+    };
+    let Some(enc) = vulkan_element("h265enc", &node) else {
+        skip!("no Vulkan H.265 encoder");
+    };
+    let rig = InterpipeRig::new(
+        &node,
+        &["wolf_retained_slots"],
+        &enc,
+        "h265parse ! video/x-h265,stream-format=byte-stream",
+    );
+    rig.expect_frames(10, "warmup");
+    let held = std::sync::Arc::new(std::sync::Mutex::new((Vec::<gst::Buffer>::new(), 0usize)));
+    let observed = held.clone();
+    let pad = rig.producers[0]
+        .by_name("src")
+        .unwrap()
+        .static_pad("src")
+        .unwrap();
+    let probe = pad
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(buffer) = info.buffer() {
+                if let Some(meta) = buffer.meta::<gst::ParentBufferMeta>() {
+                    let mut state = observed.lock().unwrap();
+                    if !state.0.iter().any(|b| b.as_ptr() == meta.parent().as_ptr()) {
+                        if state.0.len() < 4 {
+                            state.0.push(meta.parent_owned());
+                        } else {
+                            state.1 += 1;
+                        }
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .unwrap();
+    rig.expect_frames(90, "retained slots");
+    pad.remove_probe(probe);
+    let state = held.lock().unwrap();
+    assert_eq!(state.0.len(), 4, "must exercise four retained Vulkan slots");
+    assert!(
+        state.1 >= 30,
+        "producer repeated held images: only {} fresh frames",
+        state.1
+    );
+}
+
 /// Wolf retargets a running session's `interpipesrc` to a lobby's producer. Every producer on
 /// the GPU must hand out images on the one device the encoder adopted, and encoding carries on.
 #[test]

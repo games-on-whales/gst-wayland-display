@@ -17,6 +17,95 @@ use std::sync::Arc;
 
 mod ffi;
 
+/// Import two-plane converter output into a pooled CUDA buffer without a CPU copy.
+pub struct CudaUploader {
+    egl: Arc<smithay::backend::egl::EGLDisplay>,
+    cache: std::sync::Mutex<std::collections::HashMap<(u64, u64), CUDAImage>>,
+}
+
+unsafe impl Send for CudaUploader {}
+
+impl CudaUploader {
+    pub fn new(render_node_path: Option<&str>) -> Self {
+        let node = render_node_path.and_then(|p| smithay::backend::drm::DrmNode::from_path(p).ok());
+        let renderer = crate::utils::renderer::setup_renderer(node);
+        Self {
+            egl: Arc::new(renderer.egl_context().display().clone()),
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn upload(
+        &self,
+        input: &gst::BufferRef,
+        info: &VideoInfoDmaDrm,
+        context: &CUDAContext,
+        pool: Option<&CUDABufferPool>,
+    ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        use smithay::backend::allocator::dmabuf::DmabufFlags;
+        use smithay::reexports::drm::buffer::DrmFourcc;
+        use smithay::reexports::gbm::Modifier;
+        use std::os::fd::BorrowedFd;
+        use std::os::unix::fs::MetadataExt;
+        let meta = input
+            .meta::<VideoMeta>()
+            .ok_or("missing two-plane video layout")?;
+        let fourcc = match meta.format() {
+            gst_video::VideoFormat::Nv12 => DrmFourcc::Nv12,
+            gst_video::VideoFormat::P01010le => DrmFourcc::P010,
+            _ => return Err("expected NV12 or P010".into()),
+        };
+        if meta.n_planes() != 2 || meta.width() != info.width() || meta.height() != info.height() {
+            return Err("inconsistent two-plane video layout".into());
+        }
+        let fd = unsafe {
+            gstreamer_allocators::ffi::gst_dmabuf_memory_get_fd(
+                input.peek_memory(0).as_ptr() as *mut _
+            )
+        };
+        if fd < 0 {
+            return Err("input is not a dmabuf".into());
+        }
+        let identity = std::fs::metadata(format!("/proc/self/fd/{fd}"))?;
+        let key = (identity.dev(), identity.ino());
+        let mut cache = self.cache.lock().unwrap();
+        if !cache.contains_key(&key) {
+            let mut builder = Dmabuf::builder(
+                (info.width() as i32, info.height() as i32),
+                fourcc,
+                Modifier::from(info.modifier()),
+                DmabufFlags::empty(),
+            );
+            for plane in 0..2usize {
+                let memory = input.peek_memory(if input.n_memory() >= 2 { plane } else { 0 });
+                let fd = unsafe {
+                    gstreamer_allocators::ffi::gst_dmabuf_memory_get_fd(memory.as_ptr() as *mut _)
+                };
+                if fd < 0 || meta.stride()[plane] <= 0 {
+                    return Err("invalid dmabuf plane".into());
+                }
+                let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+                let offset = if input.n_memory() >= 2 {
+                    0
+                } else {
+                    meta.offset()[plane] as u32
+                };
+                if !builder.add_plane(owned, offset, meta.stride()[plane] as u32) {
+                    return Err("invalid dmabuf plane layout".into());
+                }
+            }
+            let dmabuf = builder.build().ok_or("invalid dmabuf layout")?;
+            let image = EGLImage::from(&dmabuf, &self.egl.get_display_handle().handle)?;
+            cache.insert(key, CUDAImage::from(image, context)?);
+        }
+        let output = cache[&key].to_gst_buffer(info.clone(), context, pool)?;
+        // The producer can reuse its input as soon as this call returns. Complete
+        // the device-to-device copy before releasing that input buffer.
+        ffi::synchronize_stream(context)?;
+        Ok(output)
+    }
+}
+
 // Helper to load EGL extension functions
 #[derive(Debug, Clone)]
 pub struct EglExtensions {

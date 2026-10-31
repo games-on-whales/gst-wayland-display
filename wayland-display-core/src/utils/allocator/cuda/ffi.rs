@@ -113,6 +113,7 @@ pub(crate) const EGL_NONE: EGLint = 0x3038;
 unsafe extern "C" {
     // CUDA Driver API
     fn CuMemcpy2DAsync(pCopy: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult;
+    fn CuStreamSynchronize(stream: CUstream) -> CUresult;
 }
 
 // Add dynamic function pointer types for CUDA-EGL interop
@@ -458,6 +459,16 @@ pub(crate) fn acquire_or_alloc_buffer(
         tracing::info!("No buffer pool available, allocating directly");
         alloc_cuda_buffer(cuda_context, video_info)
     }
+}
+
+pub(crate) fn synchronize_stream(context: &CUDAContext) -> Result<(), String> {
+    let _guard = CudaContextGuard::new(context)?;
+    let stream = context
+        .stream()
+        .as_ref()
+        .map(|s| unsafe { gst_cuda_stream_get_handle(s.stream) })
+        .unwrap_or(std::ptr::null_mut());
+    cuda_call!(CuStreamSynchronize(stream))
 }
 
 pub(crate) fn copy_to_gst_buffer(
