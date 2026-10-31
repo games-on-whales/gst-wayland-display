@@ -86,6 +86,21 @@ Two codec-neutral fixes to the shared encode library
   instead of `>= 0`), shrinking the usable DPB by one slot for the rest of the
   session.
 
+## gstreamer-vulkan-shared-queue-lock.patch
+
+`gst_vulkan_queue_submit_lock()` belongs to a `GstVulkanQueue` wrapper, but
+`gst_vulkan_device_get_queue()` made a new wrapper on every call, and the device
+opens one queue per family. Every element and buffer pool therefore submitted to
+the same `VkQueue` under a lock of its own, so their `vkQueueSubmit`s were not
+serialised. With several sources on one GPU (Wolf's sessions and lobbies) plus an
+encoder, NVIDIA lost the device (`VK_ERROR_DEVICE_LOST`, Xid 32/69) in a few of
+every ten runs; Vulkan validation reports `Threading-MultipleThreads-Write`.
+
+The device now keeps a weak reference to the wrapper of each queue and hands the
+live one back, so all users of a queue share its submit lock. Touches
+`gstvkdevice.c` only. Validated on an RTX 5080 with the validation layers: no
+threading reports and no device loss.
+
 ## vulkanav1enc.patch
 
 Adds a Vulkan **AV1** encoder element (`vulkanav1enc`) and its `GstAV1Encoder`

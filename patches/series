@@ -4,6 +4,7 @@ vkh264enc-dpb-pool-in-new-sequence.patch
 vulkanh265enc.patch
 vkh264enc-rc-fix.patch
 gstreamer-vulkan-rc-retarget-no-reset.patch
+gstreamer-vulkan-shared-queue-lock.patch
 vulkanav1enc.patch
 gstreamer-va-hevc-color.patch
 gstreamer-va-hevc-hdr-sei.patch
