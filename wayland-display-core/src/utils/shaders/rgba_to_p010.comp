@@ -1,0 +1,51 @@
+#version 450
+// RGBA -> P010 (10-bit 4:2:0, BT.709 limited range). One invocation per 2x2 chroma block:
+// writes 4 luma samples to the Y plane and one interleaved Cb/Cr to the UV plane.
+//
+// BT.709 limited-range matrix; the storage images are 16-bit (r16 / rg16) and the P010
+// (G10X6...) format the encoder reads only looks at the top 10 bits, so each sample is
+// computed as its 10-bit code (Y 64..940, C 64..960) and stored as code << 6 (see p010()).
+//
+// Bindings:
+//   0: src     - RGBA input (sampled, imported from the compositor's dmabuf)
+//   1: yPlane  - r16  storage image, full resolution (P010 plane 0, 10 bits in the MSBs)
+//   2: uvPlane - rg16 storage image, half resolution (P010 plane 1, Cb in r, Cr in g)
+// Push constant: full-resolution size in pixels.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r16)  uniform writeonly image2D yPlane;
+layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
+
+layout(push_constant) uniform Push { ivec2 size; } pc;
+
+// Exact 10-bit limited-range code -> r16 UNORM value whose top 10 bits are that code and
+// whose low 6 bits are zero (P010 stores code << 6). Normalizing by the 8-bit range limits
+// instead would give floor(f * 1023.98): white at 943, not 940, and truncation everywhere.
+// The +0.25 keeps the result exact whichever way the float -> unorm store rounds.
+float p010(float code) { return (clamp(round(code), 0.0, 1023.0) * 64.0 + 0.25) / 65535.0; }
+const vec3 KY = vec3(0.2126, 0.7152, 0.0722); // BT.709 luma weights
+float luma(vec3 c) { return p010(64.0 + 876.0 * dot(c, KY)); }
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
+    ivec2 p  = ch * 2;                            // top-left luma coord
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    vec3 c00 = texelFetch(src, p + ivec2(0, 0), 0).rgb;
+    vec3 c10 = texelFetch(src, p + ivec2(1, 0), 0).rgb;
+    vec3 c01 = texelFetch(src, p + ivec2(0, 1), 0).rgb;
+    vec3 c11 = texelFetch(src, p + ivec2(1, 1), 0).rgb;
+
+    imageStore(yPlane, p + ivec2(0, 0), vec4(luma(c00)));
+    imageStore(yPlane, p + ivec2(1, 0), vec4(luma(c10)));
+    imageStore(yPlane, p + ivec2(0, 1), vec4(luma(c01)));
+    imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
+
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average
+    float ya = dot(a, KY);
+    float cb = p010(512.0 + 896.0 * (a.b - ya) / 1.8556);
+    float cr = p010(512.0 + 896.0 * (a.r - ya) / 1.5748);
+    imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
+}

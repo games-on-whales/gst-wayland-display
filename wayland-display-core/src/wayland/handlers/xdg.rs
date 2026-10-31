@@ -1,5 +1,4 @@
 use smithay::{
-    delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
         find_popup_root_surface, get_popup_toplevel_coords,
@@ -25,6 +24,13 @@ impl XdgShellHandler for State {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
         self.pending_windows.push(window);
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // A toplevel destroyed before it mapped must not linger in either holding list.
+        let other = |w: &Window| w.toplevel().map(|t| t != &surface).unwrap_or(true);
+        self.pending_windows.retain(other);
+        self.windows_awaiting_output.retain(other);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -116,5 +122,3 @@ impl State {
         });
     }
 }
-
-delegate_xdg_shell!(State);

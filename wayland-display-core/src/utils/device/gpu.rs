@@ -22,7 +22,10 @@ impl GPUDevice {
 impl TryFrom<DrmNode> for GPUDevice {
     type Error = Box<dyn Error>;
     fn try_from(drm_node: DrmNode) -> Result<Self, Self::Error> {
-        get_gpu_device(drm_node.dev_path().unwrap().to_str().unwrap())
+        let path = drm_node
+            .dev_path()
+            .ok_or_else(|| format!("no device path for {:?}", drm_node))?;
+        get_gpu_device(path.to_str().ok_or("device path is not valid UTF-8")?)
     }
 }
 impl std::fmt::Display for GPUDevice {

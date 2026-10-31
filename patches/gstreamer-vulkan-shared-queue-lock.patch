@@ -1,0 +1,118 @@
+# gstreamer-vulkan-shared-queue-lock.patch
+#
+# What: gst_vulkan_device_get_queue() (and so gst_vulkan_device_select_queue())
+# returns the GstVulkanQueue still alive for a VkQueue instead of a new wrapper
+# on every call (gst-libs/gst/vulkan/gstvkdevice.c only).
+#
+# Why: vkQueueSubmit() needs the VkQueue externally synchronised, and
+# gst_vulkan_queue_submit_lock() locks a mutex that belongs to the wrapper.
+# GstVulkanDevice opens one queue per family, so every element and buffer pool
+# on a device submits to the same VkQueue, each through a wrapper of its own:
+# their submits were never serialised. waylanddisplaysrc's converters, the
+# encoder's GstVulkanImageBufferPool layout transitions and other sessions'
+# converters on the shared device raced in vkQueueSubmit (validation:
+# UNASSIGNED-Threading-MultipleThreads-Write), and NVIDIA lost the device
+# (Xid 32/69, VK_ERROR_DEVICE_LOST) in a few of every ten runs of two
+# sources plus an encoder.
+#
+# How: the device keeps a weak reference per (family, index); a live wrapper
+# is returned with a new reference, otherwise a new one is made and recorded.
+# Weak, so the queue's strong reference to the device makes no cycle.
+#
+# Tested: RTX 5080 (615.71) with Vulkan validation, two waylanddisplaysrc and
+# vulkanh264enc behind interpipe: no threading reports, no device loss in 18
+# runs (previously 2-5 of 10).
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
+index afd4c59..efe183b 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
+@@ -62,8 +62,27 @@ struct _GstVulkanDevicePrivate
+   GArray *queue_family_indices;
+ 
+   GstVulkanFenceCache *fence_cache;
++
++  /* The GstVulkanQueue handed out for each VkQueue, so every user of a queue
++   * locks the same submit lock (see gst_vulkan_device_get_queue()) */
++  GMutex queue_objects_lock;
++  GPtrArray *queue_objects;
++};
++
++struct queue_object
++{
++  guint32 family;
++  guint32 index;
++  GWeakRef queue;
+ };
+ 
++static void
++queue_object_free (struct queue_object *object)
++{
++  g_weak_ref_clear (&object->queue);
++  g_free (object);
++}
++
+ static void
+ _init_debug (void)
+ {
+@@ -171,6 +190,9 @@ gst_vulkan_device_init (GstVulkanDevice * device)
+ 
+   priv->enabled_layers = g_ptr_array_new_with_free_func (g_free);
+   priv->enabled_extensions = g_ptr_array_new_with_free_func (g_free);
++  g_mutex_init (&priv->queue_objects_lock);
++  priv->queue_objects =
++      g_ptr_array_new_with_free_func ((GDestroyNotify) queue_object_free);
+ }
+ 
+ struct extension;
+@@ -413,6 +435,10 @@ gst_vulkan_device_finalize (GObject * object)
+   g_ptr_array_unref (priv->enabled_extensions);
+   priv->enabled_extensions = NULL;
+ 
++  g_ptr_array_unref (priv->queue_objects);
++  priv->queue_objects = NULL;
++  g_mutex_clear (&priv->queue_objects_lock);
++
+   G_OBJECT_CLASS (parent_class)->finalize (object);
+ }
+ 
+@@ -666,6 +692,24 @@ gst_vulkan_device_get_queue (GstVulkanDevice * device, guint32 queue_family,
+ 
+   g_return_val_if_fail (i < priv->queues->len, NULL);
+ 
++  /* vkQueueSubmit() requires external synchronisation of the VkQueue, and
++   * gst_vulkan_queue_submit_lock() is per GstVulkanQueue: hand out the
++   * GstVulkanQueue that is still alive for this VkQueue, so that every element
++   * and buffer pool submitting to it takes the same lock. */
++  g_mutex_lock (&priv->queue_objects_lock);
++  for (i = 0; i < priv->queue_objects->len; i++) {
++    struct queue_object *object = g_ptr_array_index (priv->queue_objects, i);
++    if (object->family == queue_family && object->index == queue_i) {
++      ret = g_weak_ref_get (&object->queue);
++      if (ret) {
++        g_mutex_unlock (&priv->queue_objects_lock);
++        return ret;
++      }
++      g_ptr_array_remove_index_fast (priv->queue_objects, i);
++      break;
++    }
++  }
++
+   ret = g_object_new (GST_TYPE_VULKAN_QUEUE, NULL);
+   gst_object_ref_sink (ret);
+   ret->device = gst_object_ref (device);
+@@ -674,6 +718,15 @@ gst_vulkan_device_get_queue (GstVulkanDevice * device, guint32 queue_family,
+ 
+   vkGetDeviceQueue (device->device, queue_family, queue_i, &ret->queue);
+ 
++  {
++    struct queue_object *object = g_new0 (struct queue_object, 1);
++    object->family = queue_family;
++    object->index = queue_i;
++    g_weak_ref_init (&object->queue, ret);
++    g_ptr_array_add (priv->queue_objects, object);
++  }
++  g_mutex_unlock (&priv->queue_objects_lock);
++
+   return ret;
+ }
+ 

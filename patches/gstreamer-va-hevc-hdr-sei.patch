@@ -1,0 +1,147 @@
+From d381a3467af04500b752b1021ddc2e21ba629856 Mon Sep 17 00:00:00 2001
+From: virant <jbailes@gmail.com>
+Date: Thu, 29 Oct 2026 22:28:03 +0000
+Subject: [PATCH] va: write HEVC HDR10 mastering display and content light
+ level SEI
+
+vah265enc forwards mastering-display-info and content-light-level in its
+caps but never writes them into the stream, so a decoder of a PQ stream
+has no static HDR metadata. Serialize both as one prefix SEI NAL on
+every IDR (gst_h265_bit_writer_sei() does not support prefix SEI) from
+the current input caps; caps without HDR metadata add nothing. Skipped
+when the driver takes no raw packed headers, like the AUD.
+---
+ .../gst-plugins-bad/sys/va/gstvah265color.h   | 66 +++++++++++++++++++
+ .../gst-plugins-bad/sys/va/gstvah265enc.c     | 35 ++++++++++
+ 2 files changed, 101 insertions(+)
+
+diff --git a/subprojects/gst-plugins-bad/sys/va/gstvah265color.h b/subprojects/gst-plugins-bad/sys/va/gstvah265color.h
+index 0438dbe..fea3415 100644
+--- a/subprojects/gst-plugins-bad/sys/va/gstvah265color.h
++++ b/subprojects/gst-plugins-bad/sys/va/gstvah265color.h
+@@ -24,3 +24,69 @@ gst_va_h265_fill_colorimetry (GstH265VUIParams * vui,
+       gst_video_transfer_function_to_iso (color->transfer);
+   vui->matrix_coefficients = gst_video_color_matrix_to_iso (color->matrix);
+ }
++
++/* Largest NAL gst_va_h265_hdr_sei_nal() writes. */
++#define GST_VA_H265_HDR_SEI_MAX 96
++
++static inline void
++gst_va_h265_sei_put (guint8 * rbsp, guint * len, guint32 value, guint bytes)
++{
++  while (bytes--)
++    rbsp[(*len)++] = (value >> (8 * bytes)) & 0xff;
++}
++
++/* Serialize the mastering display colour volume (D.2.28) and content light
++ * level (D.2.35) in @caps as one prefix SEI NAL with a start code, escaped,
++ * into @nal. Returns its length, 0 when @caps carry neither. Written here
++ * because gst_h265_bit_writer_sei() does not support prefix SEI. */
++static inline guint
++gst_va_h265_hdr_sei_nal (const GstCaps * caps,
++    guint8 nal[GST_VA_H265_HDR_SEI_MAX])
++{
++  GstVideoMasteringDisplayInfo minfo;
++  GstVideoContentLightLevel cll;
++  guint8 rbsp[64];
++  guint rbsp_len = 0, nal_len = 0, zeros = 0, i;
++
++  if (gst_video_mastering_display_info_from_caps (&minfo, caps)) {
++    rbsp[rbsp_len++] = GST_H265_SEI_MASTERING_DISPLAY_COLOUR_VOLUME;
++    rbsp[rbsp_len++] = 24;
++    /* GstVideoMasteringDisplayInfo is in RGB order, HEVC in GBR (D.3.28). */
++    for (i = 0; i < 3; i++) {
++      gst_va_h265_sei_put (rbsp, &rbsp_len,
++          minfo.display_primaries[(i + 1) % 3].x, 2);
++      gst_va_h265_sei_put (rbsp, &rbsp_len,
++          minfo.display_primaries[(i + 1) % 3].y, 2);
++    }
++    gst_va_h265_sei_put (rbsp, &rbsp_len, minfo.white_point.x, 2);
++    gst_va_h265_sei_put (rbsp, &rbsp_len, minfo.white_point.y, 2);
++    gst_va_h265_sei_put (rbsp, &rbsp_len,
++        minfo.max_display_mastering_luminance, 4);
++    gst_va_h265_sei_put (rbsp, &rbsp_len,
++        minfo.min_display_mastering_luminance, 4);
++  }
++  if (gst_video_content_light_level_from_caps (&cll, caps)) {
++    rbsp[rbsp_len++] = GST_H265_SEI_CONTENT_LIGHT_LEVEL;
++    rbsp[rbsp_len++] = 4;
++    gst_va_h265_sei_put (rbsp, &rbsp_len, cll.max_content_light_level, 2);
++    gst_va_h265_sei_put (rbsp, &rbsp_len, cll.max_frame_average_light_level,
++        2);
++  }
++  if (rbsp_len == 0)
++    return 0;
++  rbsp[rbsp_len++] = 0x80;      /* rbsp_trailing_bits */
++
++  /* Start code, then the NAL header: PREFIX_SEI, layer 0, TemporalId 0. */
++  gst_va_h265_sei_put (nal, &nal_len, 0x00000001, 4);
++  nal[nal_len++] = GST_H265_NAL_PREFIX_SEI << 1;
++  nal[nal_len++] = 0x01;
++  for (i = 0; i < rbsp_len; i++) {
++    if (zeros == 2 && rbsp[i] <= 3) {
++      nal[nal_len++] = 0x03;    /* emulation_prevention_three_byte */
++      zeros = 0;
++    }
++    nal[nal_len++] = rbsp[i];
++    zeros = rbsp[i] == 0 ? zeros + 1 : 0;
++  }
++  return nal_len;
++}
+diff --git a/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c b/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c
+index 12448e2..8bd38a3 100644
+--- a/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c
++++ b/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c
+@@ -1290,6 +1290,38 @@ _h265_add_aud (GstVaH265Enc * self, GstVaH265EncFrame * frame)
+   return TRUE;
+ }
+ 
++/* HDR10 static metadata as one prefix SEI NAL in every IRAP access unit, where
++ * a decoder starting at that point needs it. Caps without HDR metadata add
++ * nothing, so SDR streams are unchanged. */
++static gboolean
++_h265_add_hdr_sei (GstVaH265Enc * self, GstVaH265EncFrame * frame)
++{
++  GstVaBaseEnc *base = GST_VA_BASE_ENC (self);
++  guint8 nal[GST_VA_H265_HDR_SEI_MAX];
++  guint nal_len;
++
++  if (!base->input_state || !base->input_state->caps)
++    return TRUE;
++  nal_len = gst_va_h265_hdr_sei_nal (base->input_state->caps, nal);
++  if (nal_len == 0)
++    return TRUE;
++  /* Like the AUD: a raw packed header the driver did not enable for this
++   * configuration cannot be submitted. */
++  if (!(self->packed_headers & VA_ENC_PACKED_HEADER_RAW_DATA)) {
++    GST_WARNING_OBJECT (self, "Driver takes no raw packed headers; the HDR "
++        "metadata SEI is not written");
++    return TRUE;
++  }
++  /* The NAL carries its emulation prevention bytes; the driver must not add
++   * more. */
++  if (!gst_va_encoder_add_packed_header (base->encoder, frame->base.picture,
++          VAEncPackedHeaderRawData, nal, nal_len * 8, TRUE)) {
++    GST_ERROR_OBJECT (self, "Failed to add the HDR metadata SEI");
++    return FALSE;
++  }
++  return TRUE;
++}
++
+ /* Returns H.265 chroma_format_idc value from chroma type */
+ static guint
+ _h265_get_chroma_format_idc (guint chroma_type)
+@@ -2017,6 +2049,9 @@ _h265_encode_one_frame (GstVaH265Enc * self, GstVideoCodecFrame * gst_frame)
+       && !_h265_add_pps_header (self, frame, &pps))
+     return FALSE;
+ 
++  if (frame->poc == 0 && !_h265_add_hdr_sei (self, frame))
++    return FALSE;
++
+   if (!_h265_add_slices (self, frame, &pps,
+           list_forward, list_forward_num, list_backward, list_backward_num,
+           negative_pocs, num_negative_pics, positive_pocs, num_positive_pics))
+-- 
+2.56.0
+

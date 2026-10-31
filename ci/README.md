@@ -31,15 +31,23 @@ ci/harness.sh -v              # stream sub-command output
 |--------|--------------------|--------------|
 | AMD    | `amdgpu`           | `vah265enc` (NV12 dmabuf, LINEAR) |
 | Intel  | `i915`/`xe`        | `vah265lpenc` (NV12 dmabuf, Y-tiled; low-power only) |
-| Nvidia | `nvidia`           | `dmabuftocuda ! nvh265enc` (needs the `cuda` feature) |
+| Nvidia | `nvidia`           | `memory:CUDAMemory ! nvh265enc` (needs the `cuda` feature) |
+| any    | any with a Vulkan H.264 encoder | `vulkan=true ! vulkanh264enc` (shared-device NV12 `memory:VulkanImage`, zero-copy) |
 
 A vendor with no render node, or whose encoder element is missing, is skipped
-(reported, not failed).
+(reported, not failed). The Vulkan-encode row is vendor-agnostic — it runs
+wherever the GPU's Vulkan device has an H.264 encoder (an nvidia render node, or
+Intel with `ANV_DEBUG=video-encode` where Mesa exposes the codec extensions: Mesa
+26.2 on Alder Lake-N advertises encode operations without them, so no encoder
+registers); the `integration` phase prefers the nvidia node, or the `--node` one. On a multi-GPU host only the first Vulkan device's
+elements get the plain names; the others are `vulkanh264device1enc` and so on,
+and the harness and the encode tests pick the one on the GPU under test.
 
 ## Host prerequisites
 
 - rust toolchain (`rustup`), `gst-launch-1.0` + gst-plugins-{base,bad,vaapi}
 - build deps: `libwayland-dev libinput-dev libxkbcommon-dev libgbm-dev libegl1-mesa-dev libudev-dev libclang-dev pkg-config`
+- a C compiler (`gcc`/`clang`) and the Vulkan loader headers (`libvulkan-dev`, or `vulkan-loader-devel` on Fedora) — `build.rs` compiles `vulkan_bridge.c` against the gst Vulkan headers
 - a Vulkan driver (`mesa-vulkan-drivers` for AMD/Intel, the proprietary driver for Nvidia) — the converter queries Vulkan for NV12 export modifiers; without it the source advertises nothing and negotiation fails
 - `hwdata` (for `/usr/share/hwdata/pci.ids`) so the GPU-name lookup test passes
 - Nvidia only: the `cuda` feature links `libgstcuda-1.0`; if your distro ships it without a `.pc`, add a `gstreamer-cuda-1.0.pc` (`Libs: -lgstcuda-1.0`) and a `libgstcuda-1.0.so` dev symlink
@@ -52,3 +60,17 @@ A vendor with no render node, or whose encoder element is missing, is skipped
 - The `vulkanh265enc`/`vulkanh264enc` Tier-1 path needs a gstreamer `main` build
   with Vulkan-Headers ≥ 1.4.317 and a recent mesa radv; it is not covered by the
   default matrix.
+
+## GStreamer patch chain (`ci/gst-patches.sh`)
+
+The harness builds GStreamer without the unit tests, so it never compiles the
+tests in `patches/`.
+`ci/gst-patches.sh` clones GStreamer (`GST_VERSION`, default 1.28.4), applies
+`patches/series`, builds with the unit tests enabled and runs the Vulkan video
+tests. CI runs it via `.github/workflows/gst-patches.yml` on any change to
+`patches/`; without a GPU the device-backed tests skip, and the GPU-free AV1
+reference-model test (`libs_vkvideoencodeav1refs`) runs.
+
+```bash
+ci/gst-patches.sh               # work dir defaults to ./.gst-patches
+```

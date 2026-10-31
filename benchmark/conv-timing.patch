@@ -1,8 +1,8 @@
 diff --git a/wayland-display-core/src/utils/allocator/mod.rs b/wayland-display-core/src/utils/allocator/mod.rs
-index 03906f0..fe8336c 100644
+index 14b791d..20f6059 100644
 --- a/wayland-display-core/src/utils/allocator/mod.rs
 +++ b/wayland-display-core/src/utils/allocator/mod.rs
-@@ -24,6 +24,35 @@ use std::fs::File;
+@@ -27,6 +27,35 @@ use std::fs::File;
  use std::os::fd::{AsFd, AsRawFd, OwnedFd};
  use std::sync::{Arc, Mutex};
  
@@ -35,32 +35,32 @@ index 03906f0..fe8336c 100644
 +    }
 +}
 +
- #[derive(Debug, Clone)]
- pub struct GsGlesbuffer {
-     buffer: GlesRenderbuffer,
-@@ -396,8 +425,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
+ /// RGBA render-target fourcc for the compositor's GLES render target (which is *also* the
+ /// Vulkan converter's input dmabuf). Normally the 8-bit `Abgr8888`. When either the debug
+ /// spike (`WOLF_HDR_SPIKE`, synthetic bars) or dynamic HDR (`hdr_cm`, real HDR client
+@@ -622,8 +651,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
              }
              GsBufferType::NV12(buffer) => {
                  let mut v = buffer.vulkan.lock().unwrap();
 +                let _t = std::time::Instant::now();
-                 v.convert(&buffer.rgba)?;
+                 v.convert(&buffer.rgba, color)?;
 -                v.to_gst_buffer()
 +                let out = v.to_gst_buffer();
 +                record_convert_time(_t.elapsed());
 +                out
              }
-             #[cfg(feature = "cuda")]
-             GsBufferType::CUDA(buffer) => {
-@@ -520,8 +552,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
+             GsBufferType::VULKAN(buffer) => {
+                 let mut v = buffer.vulkan.lock().unwrap();
+@@ -757,8 +789,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
              }
              GsBufferType::NV12(buffer) => {
                  let mut v = buffer.vulkan.lock().unwrap();
 +                let _t = std::time::Instant::now();
-                 v.convert(&buffer.rgba)?;
+                 v.convert(&buffer.rgba, color)?;
 -                v.to_gst_buffer()
 +                let out = v.to_gst_buffer();
 +                record_convert_time(_t.elapsed());
 +                out
              }
-         }
-     }
+             GsBufferType::VULKAN(buffer) => {
+                 let mut v = buffer.vulkan.lock().unwrap();
