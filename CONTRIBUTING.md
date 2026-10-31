@@ -12,9 +12,11 @@ several version floors; use a recent distro or the provided container.
 | libwayland        | **1.23**  | `wl_client_set_max_buffer_size` (raised max buffer size)            |
 | rustc             | **1.94**  | `gstreamer-rs` 0.25 (≥1.92) and current `cargo-c` (≥1.94)           |
 
-The Vulkan-encode path additionally needs the bundled encoder patch
-(`patches/vkh264enc-dpb-pool-in-new-sequence.patch`), which the container applies
-to GStreamer before building it. See `patches/README.md`.
+The Vulkan-encode path (GStreamer 1.28+) additionally needs the
+GStreamer patch chain listed, in apply order, in `patches/series`: the H.264 DPB
+pool and rate-control fixes, the shared encoder's reset-free retarget, and the
+`vulkanh265enc` and `vulkanav1enc` elements. The container applies all of them
+before building GStreamer. See `patches/README.md`.
 
 ## Build with the container (recommended)
 
@@ -63,3 +65,11 @@ export PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PAT
 export RUSTFLAGS="-L /usr/local/lib/x86_64-linux-gnu -l gstcuda-1.0"
 cargo build -p gst-plugin-wayland-display --features cuda
 ```
+
+## Frame-local source color with a stable transport
+
+The devcontainer includes the CUDA converter patch from `patches/series`; use
+that patched GStreamer prefix when testing `stable-color-transport=true`.
+A distribution's unpatched `cudaconvertscale` does not consume the frame color
+contract. See [the contract and validation boundary](patches/README.md#gstreamer-cuda-frame-colorpatch).
+The existing dynamic-caps mode remains the default.

@@ -2,11 +2,9 @@
 // RGBA -> P010 (10-bit 4:2:0, BT.709 limited range). One invocation per 2x2 chroma block:
 // writes 4 luma samples to the Y plane and one interleaved Cb/Cr to the UV plane.
 //
-// BT.709 limited-range matrix; the storage images are
-// 16-bit (r16 / rg16) instead of 8-bit. We write the SAME normalized luma/chroma floats:
-// an r16 imageStore of a normalized value f writes round(f * 65535) across all 16 bits, and
-// the P010 (G10X6...) format the encoder reads only looks at the top 10 bits, so the
-// effective 10-bit sample is round(f * 65535) >> 6 ~= f * 1023 -- the correct 10-bit value.
+// BT.709 limited-range matrix; the storage images are 16-bit (r16 / rg16) and the P010
+// (G10X6...) format the encoder reads only looks at the top 10 bits, so each sample is
+// computed as its 10-bit code (Y 64..940, C 64..960) and stored as code << 6 (see p010()).
 //
 // Bindings:
 //   0: src     - RGBA input (sampled, imported from the compositor's dmabuf)
@@ -22,7 +20,13 @@ layout(binding = 2, rg16) uniform writeonly image2D uvPlane;
 
 layout(push_constant) uniform Push { ivec2 size; } pc;
 
-float luma(vec3 c) { return 0.183 * c.r + 0.614 * c.g + 0.062 * c.b + 0.0625; }
+// Exact 10-bit limited-range code -> r16 UNORM value whose top 10 bits are that code and
+// whose low 6 bits are zero (P010 stores code << 6). Normalizing by the 8-bit range limits
+// instead would give floor(f * 1023.98): white at 943, not 940, and truncation everywhere.
+// The +0.25 keeps the result exact whichever way the float -> unorm store rounds.
+float p010(float code) { return (clamp(round(code), 0.0, 1023.0) * 64.0 + 0.25) / 65535.0; }
+const vec3 KY = vec3(0.2126, 0.7152, 0.0722); // BT.709 luma weights
+float luma(vec3 c) { return p010(64.0 + 876.0 * dot(c, KY)); }
 
 void main() {
     ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
@@ -40,7 +44,8 @@ void main() {
     imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
 
     vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average
-    float cb = -0.101 * a.r - 0.339 * a.g + 0.439 * a.b + 0.5;
-    float cr =  0.439 * a.r - 0.399 * a.g - 0.040 * a.b + 0.5;
+    float ya = dot(a, KY);
+    float cb = p010(512.0 + 896.0 * (a.b - ya) / 1.8556);
+    float cr = p010(512.0 + 896.0 * (a.r - ya) / 1.5748);
     imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
 }

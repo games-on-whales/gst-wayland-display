@@ -4,6 +4,7 @@ pub mod cuda;
 use crate::DrmModifier;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::{CUDABufferPool, CUDAContext, CUDAImage, EGLImage};
+use crate::utils::color::FrameColor;
 use crate::utils::device::PCIVendor;
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::vulkan_nv12::{PixFmt, VulkanNv12};
@@ -216,10 +217,7 @@ impl GsNv12Buf {
         let (w, h) = (video_info.width(), video_info.height());
         // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under HDR modes.
         let rgba_fourcc = rgba_render_fourcc(options.hdr_cm);
-        tracing::info!(
-            "GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
-            rgba_fourcc == DrmFourcc::Abgr16161616f
-        );
+        tracing::info!("GsNv12Buf: RGBA render-target fourcc = {rgba_fourcc:?}");
         // RGBA render-target modifier candidates the GLES renderer supports (INVALID last).
         let formats =
             <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
@@ -258,8 +256,7 @@ impl GsNv12Buf {
             .to_video_info()
             .ok()
             .is_some_and(|vi| is_bt2020_matrix(&vi.colorimetry()));
-        // The converter samples the fp16 (linear) render target when it was allocated as such
-        // (the spike / dynamic HDR); the input format -- not any flag -- selects the shader.
+        // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new(
             render_node,
@@ -290,13 +287,13 @@ pub struct GsVulkanBuf {
 }
 
 impl GsVulkanBuf {
-    /// `profile` is the negotiated H.264 profile (for the encode-src image's video profile).
-    /// Returns `None` if no shared `GstVulkanDevice` has been received yet (caller then
-    /// falls back to the dmabuf path).
+    /// `codec` / `profile` are the consuming encoder's (for the encode-src image's video
+    /// profile). Returns `None` if no usable shared `GstVulkanDevice` is available.
     pub fn new(
         renderer: &mut GlesRenderer,
         render_node: DrmNode,
         video_info: VideoInfo,
+        codec: crate::utils::video_info::VulkanCodec,
         profile: String,
         vulkan_share: &crate::utils::vulkan_share::VulkanShare,
     ) -> Option<Self> {
@@ -305,10 +302,7 @@ impl GsVulkanBuf {
 
         // RGBA render-target fourcc: 8-bit Abgr8888, or fp16 Abgr16161616f under HDR modes.
         let rgba_fourcc = rgba_render_fourcc(options.hdr_cm);
-        tracing::info!(
-            "GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?} (HDR spike: {})",
-            rgba_fourcc == DrmFourcc::Abgr16161616f
-        );
+        tracing::info!("GsVulkanBuf: RGBA render-target fourcc = {rgba_fourcc:?}");
         // RGBA render-target modifier (same policy as GsNv12Buf: LINEAR except on Nvidia).
         let formats =
             <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer).unwrap_or_default();
@@ -353,11 +347,10 @@ impl GsVulkanBuf {
             .build();
         // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
         let bt2020 = is_bt2020_matrix(&video_info.colorimetry());
-        // The converter samples the fp16 (linear) render target when it was allocated as such
-        // (the spike / dynamic HDR); the input format -- not any flag -- selects the shader.
+        // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
-            dev, raw, &out_caps, &profile, w, h, fmt, bt2020, fp16_input, options,
+            dev, raw, &out_caps, codec, &profile, w, h, fmt, bt2020, fp16_input, options,
         )?;
         Some(GsVulkanBuf {
             rgba,
@@ -449,6 +442,24 @@ pub enum GsBufferType {
 }
 
 impl GsBufferType {
+    /// Raw RGB output (RAW, plain dmabuf, CUDA) leaves colour conversion to downstream, so
+    /// each buffer carries how its samples are encoded (see `utils::source_color`): PQ when
+    /// the frame was composited in PQ. NV12/P010 output is already converted and untagged.
+    fn tag_source_color(
+        &self,
+        output: Result<GstBuffer, Box<dyn std::error::Error>>,
+        color: FrameColor,
+    ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        let mut output = output?;
+        if !matches!(self, GsBufferType::NV12(_) | GsBufferType::VULKAN(_)) {
+            crate::utils::source_color::add_source_color_meta(
+                &mut output,
+                color.content == crate::utils::color::ContentTransfer::Pq,
+            )?;
+        }
+        Ok(output)
+    }
+
     /// The fourcc of the RGBA dmabuf the scene is rendered into for the Vulkan-converter buffer
     /// types (NV12/VULKAN) -- i.e. the GLES render target that is also the converter's input.
     /// `None` for buffer types without a separate RGBA render target. The HDR spike uses this to
@@ -475,7 +486,7 @@ pub trait GsBuffer<R: Renderer> {
         &self,
         target: &mut GlesTarget,
         renderer: &mut R,
-        pq_passthrough: bool,
+        color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>>;
 
     // Returns the underlying VideoInfo or VideoInfoDmaDrm
@@ -502,9 +513,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
-        pq_passthrough: bool,
+        color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
-        match self {
+        let output: Result<GstBuffer, Box<dyn std::error::Error>> = match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer.copy_framebuffer(
                     target,
@@ -611,12 +622,12 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
             GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
             #[cfg(feature = "cuda")]
@@ -631,7 +642,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     buffer_pool.as_ref(),
                 )?)
             }
-        }
+        };
+        self.tag_source_color(output, color)
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -639,9 +651,9 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
         &self,
         target: &mut GlesTarget,
         renderer: &mut GlesRenderer,
-        pq_passthrough: bool,
+        color: FrameColor,
     ) -> Result<GstBuffer, Box<dyn std::error::Error>> {
-        match self {
+        let output: Result<GstBuffer, Box<dyn std::error::Error>> = match self {
             GsBufferType::RAW(buffer) => {
                 let mapping = renderer.copy_framebuffer(
                     target,
@@ -745,15 +757,16 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
             }
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
             GsBufferType::VULKAN(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
-                v.convert(&buffer.rgba, pq_passthrough)?;
+                v.convert(&buffer.rgba, color)?;
                 v.to_gst_buffer()
             }
-        }
+        };
+        self.tag_source_color(output, color)
     }
 
     fn get_video_info(&self) -> VideoInfoTypes {
@@ -831,38 +844,13 @@ pub fn gst_video_format_to_drm_modifier(format: &VideoInfoDmaDrm) -> Option<DrmM
 mod tests {
     use super::*;
     use crate::utils::renderer::setup_renderer;
-    use crate::utils::tests::test_init;
+    use crate::utils::tests::{pick_render_node, test_init};
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
 
     /// Skip the current hardware-gated test (print why, return).
     macro_rules! skip {
         ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
-    }
-
-    /// A render node whose kernel driver is one of `drivers`, for hardware-gated
-    /// tests -- so they target the right GPU on a multi-GPU host instead of a
-    /// hardcoded `renderD12x` that may be a different vendor.
-    fn pick_render_node(drivers: &[&str]) -> Option<DrmNode> {
-        for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("renderD") {
-                continue;
-            }
-            let drv = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/uevent"))
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find_map(|l| l.strip_prefix("DRIVER=").map(str::to_owned))
-                })
-                .unwrap_or_default();
-            if drivers.iter().any(|d| *d == drv) {
-                if let Ok(node) = DrmNode::from_path(format!("/dev/dri/{name}")) {
-                    return Some(node);
-                }
-            }
-        }
-        None
     }
 
     /// Adapted from: https://github.com/games-on-whales/smithay/blob/master/examples/buffer_test.rs#L277
@@ -878,14 +866,16 @@ mod tests {
     /// │  left)  │  right) │
     /// └─────────┴─────────┘
     /// ```
-    fn render_into<R, T>(renderer: &mut R, buffer: &mut T, w: i32, h: i32)
-    where
-        R: Renderer + Bind<T>,
-    {
-        let mut framebuffer = renderer.bind(buffer).expect("Failed to bind dmabuf");
-
+    /// Draws the four test quadrants into `framebuffer`. It is the target the buffer under test
+    /// was bound to: binding its dmabuf a second time would wait on that bind's texture lock.
+    fn render_into<R: Renderer>(
+        renderer: &mut R,
+        framebuffer: &mut R::Framebuffer<'_>,
+        w: i32,
+        h: i32,
+    ) {
         let mut frame = renderer
-            .render(&mut framebuffer, (w, h).into(), Transform::Normal)
+            .render(framebuffer, (w, h).into(), Transform::Normal)
             .expect("Failed to create render frame");
         frame
             .clear(
@@ -933,12 +923,12 @@ mod tests {
         let mut buffer = GsBufferType::RAW(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
 
-        let bind_result = buffer.bind(&mut renderer);
-        assert!(bind_result.is_ok());
-
-        render_into(&mut renderer, &mut raw_buffer.unwrap().buffer, 10, 10);
+        let mut target = buffer
+            .bind(&mut renderer)
+            .expect("Failed to bind the buffer");
+        render_into(&mut renderer, &mut target, 10, 10);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
         assert!(gst_buffer.is_writable());
         assert_eq!(gst_buffer.size(), video_info.size());
@@ -1009,12 +999,12 @@ mod tests {
         let mut buffer = GsBufferType::DMA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
 
-        let bind_result = buffer.bind(&mut renderer);
-        assert!(bind_result.is_ok());
-
-        render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
+        let mut target = buffer
+            .bind(&mut renderer)
+            .expect("Failed to bind the buffer");
+        render_into(&mut renderer, &mut target, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
         let gst_buffer_size = gst_buffer.size();
         assert!(gst_buffer_size >= 4096); // There might be padding but it should at least contain our data
@@ -1141,12 +1131,12 @@ mod tests {
         let mut buffer = GsBufferType::CUDA(raw_buffer.clone().unwrap());
         let buffer_clone = buffer.clone();
 
-        let bind_result = buffer.bind(&mut renderer);
-        assert!(bind_result.is_ok());
-
-        render_into(&mut renderer, &mut raw_buffer.clone().unwrap().buffer, w, h);
+        let mut target = buffer
+            .bind(&mut renderer)
+            .expect("Failed to bind the buffer");
+        render_into(&mut renderer, &mut target, w, h);
         let gst_buffer = buffer_clone
-            .to_gs_buffer(&mut bind_result.unwrap(), &mut renderer, false)
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
 
         let gst_buffer_size = gst_buffer.size();
@@ -1295,5 +1285,24 @@ mod tests {
         // Anything not in the table (incl. non-RGB formats) falls through.
         assert_eq!(gst_video_format_name_to_drm_fourcc("NV12".into()), None);
         assert_eq!(gst_video_format_name_to_drm_fourcc("".into()), None);
+    }
+}
+
+#[cfg(test)]
+mod hdr_spike_compatibility {
+    #[test]
+    fn hdr_spike_selects_fp16_without_dynamic_hdr() {
+        if std::env::var_os("GST_HDR_SPIKE_TEST_CHILD").is_some() {
+            assert_eq!(
+                super::rgba_render_fourcc(false),
+                super::DrmFourcc::Abgr16161616f
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "utils::allocator::hdr_spike_compatibility::hdr_spike_selects_fp16_without_dynamic_hdr"])
+            .env("GST_HDR_SPIKE_TEST_CHILD", "1").env("WOLF_HDR_SPIKE", "")
+            .status().unwrap();
+        assert!(status.success());
     }
 }

@@ -10,12 +10,97 @@ pub struct CUDAParams {
     pub cuda_context: Arc<Mutex<cuda::CUDAContext>>,
 }
 
-/// NV12 `memory:VulkanImage` output on the downstream encoder's shared `GstVulkanDevice`
-/// (the Vulkan-encode/interpipe path). Carries the H.264 `profile` so the encode-src image
-/// is created with a byte-matching `VkVideoProfileListInfoKHR`.
+/// The Vulkan Video codec consuming `memory:VulkanImage` output. The encode-src image must
+/// be created with this codec's profile in its `VkVideoProfileListInfoKHR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VulkanCodec {
+    H264,
+    H265,
+    Av1,
+}
+
+impl VulkanCodec {
+    /// The codec of a gst Vulkan encoder element factory (`vulkanh264enc`, ...). On a
+    /// multi-GPU host only the first Vulkan device gets the plain name; the others register
+    /// as `vulkanh264device1enc` and so on.
+    pub fn from_encoder_factory(name: &str) -> Option<Self> {
+        let codec = name.strip_prefix("vulkan")?.strip_suffix("enc")?;
+        let codec = match codec.split_once("device") {
+            Some((codec, index))
+                if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                codec
+            }
+            Some(_) => return None,
+            None => codec,
+        };
+        Some(match codec {
+            "h264" => VulkanCodec::H264,
+            "h265" => VulkanCodec::H265,
+            "av1" => VulkanCodec::Av1,
+            _ => return None,
+        })
+    }
+
+    /// Parse the `vulkan-codec` property value.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "h264" => VulkanCodec::H264,
+            "h265" => VulkanCodec::H265,
+            "av1" => VulkanCodec::Av1,
+            _ => return None,
+        })
+    }
+
+    /// The codec assumed when neither the property nor a linked encoder names one:
+    /// H.264 for 8-bit NV12, H.265 Main-10 for P010.
+    pub fn default_for(format: gst_video::VideoFormat) -> Self {
+        if format == gst_video::VideoFormat::P01010le {
+            VulkanCodec::H265
+        } else {
+            VulkanCodec::H264
+        }
+    }
+
+    /// The profile used when none is configured or found downstream.
+    pub fn default_profile(self, format: gst_video::VideoFormat) -> &'static str {
+        match (self, format == gst_video::VideoFormat::P01010le) {
+            (VulkanCodec::H264, _) => "high",
+            (VulkanCodec::H265, false) => "main",
+            (VulkanCodec::H265, true) => "main-10",
+            (VulkanCodec::Av1, _) => "main",
+        }
+    }
+
+    /// Whether `profile` of this codec can encode `format` (NV12 or P010).
+    pub fn accepts(self, format: gst_video::VideoFormat, profile: &str) -> bool {
+        use gst_video::VideoFormat::{Nv12, P01010le};
+        match (self, format) {
+            (VulkanCodec::H264, Nv12) => matches!(
+                profile,
+                "high"
+                    | "constrained-high"
+                    | "progressive-high"
+                    | "main"
+                    | "baseline"
+                    | "constrained-baseline"
+            ),
+            (VulkanCodec::H265, Nv12) => profile == "main",
+            (VulkanCodec::H265, P01010le) => profile == "main-10",
+            // vulkanav1enc (patches/vulkanav1enc.patch) only takes 8-bit NV12 input.
+            (VulkanCodec::Av1, Nv12) => profile == "main",
+            _ => false,
+        }
+    }
+}
+
+/// NV12/P010 `memory:VulkanImage` output on the downstream encoder's shared `GstVulkanDevice`
+/// (the Vulkan-encode/interpipe path). Carries the encoder's `codec` and `profile` so the
+/// encode-src image is created with a matching `VkVideoProfileListInfoKHR`.
 #[derive(Debug, Clone)]
 pub struct VulkanParams {
     pub video_info: VideoInfo,
+    pub codec: VulkanCodec,
     pub profile: String,
 }
 
@@ -72,6 +157,25 @@ impl From<GstVideoInfo> for VideoInfo {
 mod tests {
     use super::*;
     use crate::utils::tests::test_init;
+
+    #[test]
+    fn encoder_factories_on_every_vulkan_device_map_to_their_codec() {
+        for (name, codec) in [
+            ("vulkanh264enc", Some(VulkanCodec::H264)),
+            ("vulkanh265enc", Some(VulkanCodec::H265)),
+            ("vulkanav1enc", Some(VulkanCodec::Av1)),
+            ("vulkanh264device1enc", Some(VulkanCodec::H264)),
+            ("vulkanh265device1enc", Some(VulkanCodec::H265)),
+            ("vulkanav1device12enc", Some(VulkanCodec::Av1)),
+            ("vulkanh265dec", None),
+            ("vulkanh265device1dec", None),
+            ("vulkanh265deviceenc", None),
+            ("vulkanh265devicexenc", None),
+            ("vah265enc", None),
+        ] {
+            assert_eq!(VulkanCodec::from_encoder_factory(name), codec, "{name}");
+        }
+    }
 
     #[test]
     fn raw_video_info_round_trips() {

@@ -9,11 +9,15 @@ on:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
+      - "tests/va-h265-color.c"
+      - "tests/cuda-frame-color.py"
       - ".github/workflows/gst-patches.yml"
   pull_request:
     paths:
       - "patches/**"
       - "ci/gst-patches.sh"
+      - "tests/va-h265-color.c"
+      - "tests/cuda-frame-color.py"
       - ".github/workflows/gst-patches.yml"
 
 concurrency:
@@ -36,11 +40,14 @@ jobs:
 
       - name: Build dependencies
         run: |
-          dnf install -y dnf-plugins-core 'dnf-command(builddep)'
-          dnf builddep -y gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-bad-free
-          dnf install -y git gcc gcc-c++ meson ninja-build flex bison nasm \
+          # ci/gst-patches.sh enables the Vulkan tests, not every distro codec.
+          # Install their binary build dependencies directly: builddep also loads
+          # source repositories and Cisco metadata this build does not need.
+          dnf --disablerepo='*openh264*' install -y \
+            git gcc gcc-c++ meson ninja-build flex bison nasm python3 glslc \
             pkgconf-pkg-config glib2-devel libdrm-devel vulkan-headers \
-            vulkan-loader-devel wayland-devel wayland-protocols-devel
+            vulkan-loader-devel wayland-devel wayland-protocols-devel \
+            libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel libva-devel
 
       - name: Build patched GStreamer and run the Vulkan tests
         run: bash ci/gst-patches.sh .gst-patches

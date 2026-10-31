@@ -5,7 +5,7 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Wayland Compositor producing GStreamer buffers"
-rust-version = "1.88"
+rust-version = "1.92"
 
 [lib]
 name = "waylanddisplaycore"
@@ -15,6 +15,8 @@ path = "src/lib.rs"
 [features]
 default = []
 cuda = []
+# Virtual uinput devices for other crates' hardware-gated tests.
+test-uinput = []
 
 [dependencies]
 gst.workspace = true
@@ -50,14 +52,16 @@ cc = "1"
 [dev-dependencies]
 tracing-subscriber = "0.3.18"
 wayland-client = "0.31.10"
-wayland-protocols = { version = "0.32.8", features = ["client"] }
+wayland-protocols = { version = "0.32.8", features = ["client", "staging"] }
 calloop = { version = "0.14.2", features = ["executor", "futures-io", "signals"] }
 tempfile = "3.20.0"
 test-log = { version = "0.2.18", features = ["trace"] }
 
 [dependencies.smithay]
 git = "https://github.com/games-on-whales/smithay"
-rev = "a166cf4c94b5aedc332a65aa1dd753e8148829c3"
+# Branch update/upstream-2026-10: upstream Smithay master (f581531d, 2026-10-29) plus a seat
+# leak fix in the keyboard focus destroy hook and an EGL display terminate race fix.
+rev = "a6e7e06452949a73d3f56aaefc171104626400fc"
 default-features = false
 features = [
     "backend_drm",

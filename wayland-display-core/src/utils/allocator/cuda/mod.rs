@@ -386,62 +386,37 @@ impl CUDAContext {
         })
     }
 
-    /// Make the slot's `GstCudaContext` safe for a [`CUDAContext`] wrapper to OWN.
+    /// Wrap the `GstCudaContext` in `cuda_raw_ptr` with a reference of the wrapper's OWN.
     ///
-    /// Both `gst_cuda_ensure_element_context()` and `gst_cuda_handle_set_context()` open
-    /// with the same short-circuit (gst-plugins-bad `gstcudautils.c`):
+    /// The slot is filled by `gst_cuda_ensure_element_context()` /
+    /// `gst_cuda_handle_set_context()`, which transfer ONE reference into it the first time
+    /// and afterwards short-circuit (`if (*cuda_ctx) return TRUE;`) without transferring
+    /// anything. Which call fills the slot depends on ordering: `ensure_element_context`
+    /// publishes a context it creates, and queries a downstream encoder for one it owns, and
+    /// either can re-enter `waylanddisplaysrc::set_context()` synchronously from inside the
+    /// call. So no single wrapper can tell from the slot whether it was handed that
+    /// reference: guessing (as an earlier fix did from the slot's before/after value) gets it
+    /// wrong in one order or the other, and the extra `unref` then frees the context under
+    /// the pipeline's stored `GstContext`, which `g_object_unref`s it again at dispose.
     ///
-    /// ```c
-    ///   /* If we had context already, will not replace it */
-    ///   if (*cuda_ctx)
-    ///     return TRUE;
-    /// ```
-    ///
-    /// i.e. they report SUCCESS while transferring NOTHING. Every other SUCCESS path is
-    /// `(transfer full)` into the slot. [`CUDAContext::drop`] unconditionally
-    /// `gst_object_unref()`s `self.ptr`, so a wrapper built off that short-circuit
-    /// destroys a reference it never owned.
-    ///
-    /// That is exactly what happens on the compositor's OWN context.
-    /// `new_from_gstreamer()` calls `gst_cuda_ensure_element_context()`, which creates the
-    /// context (rc=1, into the slot) and publishes it -- and that publish re-enters
-    /// `waylanddisplaysrc::set_context()` SYNCHRONOUSLY, from inside the very call, with the
-    /// context it is still in the middle of creating. Confirmed live by a leaks-tracer
-    /// creation stack showing `gst_cuda_ensure_element_context` sandwiched BETWEEN two
-    /// waylanddisplaysrc frames.
-    ///
-    /// The re-entrancy is what makes the bug stick, because it inverts which wrapper is
-    /// kept: at re-entry `settings.cuda_context` is still `None` (the outer call has not
-    /// returned yet), so it is the INNER, non-owning wrapper -- the one built off the
-    /// short-circuit -- that gets STORED, and the OUTER wrapper, holding the one legitimate
-    /// `(transfer full)` reference, that `imp.rs` drops when the outer call finally returns
-    /// and finds `settings.cuda_context` already `Some`.
-    ///
-    /// So the session runs with the context held only by the published `GstContext` (plus
-    /// any `GstCudaStream`), while `settings.cuda_context` owns nothing but believes it
-    /// does. At teardown it drops => rc hits 0 => the `GstCudaContext` is finalized while
-    /// the pipeline's stored `GstContext` still points at it. Disposing the pipeline then
-    /// walks `element->contexts`, and `_gst_context_free` -> `gst_structure_free` ->
-    /// `g_value_unset` -> `g_object_unref` lands on freed memory: **SIGSEGV in
-    /// `g_type_check_instance_is_fundamentally_a`, at the end of every session teardown**.
-    ///
-    /// It only bites when nothing else outlives the pipeline: with an application-injected
-    /// context (a host that pins one `GstCudaContext` for the process lifetime, e.g.
-    /// Quasar's NVENC path) the extra owner keeps rc >= 1 and the same defect is invisible.
-    ///
-    /// Detecting the short-circuit is unambiguous: it is the only success path that leaves
-    /// the slot pointing at the same non-NULL object it held before the call.
+    /// Instead the slot keeps the reference the helpers transfer into it (the element
+    /// releases it with its settings), and every wrapper takes its own, which
+    /// [`CUDAContext::drop`] releases.
     ///
     /// # Safety
-    /// `cuda_raw_ptr` must be a valid, readable slot, and `pre` must be the value read from
-    /// that same slot immediately before the call being adopted.
-    unsafe fn adopt_slot_ref(pre: *mut GstCudaContext, cuda_raw_ptr: *mut *mut GstCudaContext) {
-        // Edition 2024: `unsafe_op_in_unsafe_fn` warns by default, so an `unsafe fn` body
-        // still needs its own block.
+    /// `cuda_raw_ptr` must be a valid slot holding a non-NULL `GstCudaContext`.
+    unsafe fn from_slot(cuda_raw_ptr: *mut *mut GstCudaContext) -> Self {
         unsafe {
-            let post = *cuda_raw_ptr;
-            if !post.is_null() && post == pre {
-                gst::ffi::gst_object_ref(post as *mut gst::ffi::GstObject);
+            let ptr = *cuda_raw_ptr;
+            gst::ffi::gst_object_ref(ptr as *mut gst::ffi::GstObject);
+            let stream = ffi::gst_cuda_stream_new(ptr);
+            CUDAContext {
+                ptr,
+                stream: if stream.is_null() {
+                    None
+                } else {
+                    Some(StreamHandle { stream })
+                },
             }
         }
     }
@@ -451,10 +426,6 @@ impl CUDAContext {
         default_device_id: c_int,
         cuda_raw_ptr: *mut *mut GstCudaContext,
     ) -> Result<Self, String> {
-        // The slot value BEFORE the call: `gst_cuda_ensure_element_context()` starts with
-        // `if (*cuda_ctx) return TRUE;` -- it reports success WITHOUT transferring a
-        // reference when the slot is already populated. See `adopt_slot_ref` above.
-        let pre = unsafe { *cuda_raw_ptr };
         let result = unsafe {
             ffi::gst_cuda_ensure_element_context(
                 element.to_glib_none().0,
@@ -462,20 +433,10 @@ impl CUDAContext {
                 cuda_raw_ptr,
             )
         };
-
-        if result == glib_ffi::GFALSE {
+        if result == glib_ffi::GFALSE || unsafe { *cuda_raw_ptr }.is_null() {
             Err("Failed to create CUDA context".into())
         } else {
-            unsafe { Self::adopt_slot_ref(pre, cuda_raw_ptr) };
-            let stream = unsafe { ffi::gst_cuda_stream_new(*cuda_raw_ptr) };
-            Ok(CUDAContext {
-                ptr: unsafe { *cuda_raw_ptr },
-                stream: if stream.is_null() {
-                    None
-                } else {
-                    Some(StreamHandle { stream })
-                },
-            })
+            Ok(unsafe { Self::from_slot(cuda_raw_ptr) })
         }
     }
 
@@ -485,10 +446,6 @@ impl CUDAContext {
         default_device_id: c_int,
         cuda_raw_ptr: *mut *mut GstCudaContext,
     ) -> Result<Self, String> {
-        // Same short-circuit as `new_from_gstreamer` above: `gst_cuda_handle_set_context()`
-        // reports success without transferring a reference when the slot is already
-        // populated. See `adopt_slot_ref`.
-        let pre = unsafe { *cuda_raw_ptr };
         let result = unsafe {
             ffi::gst_cuda_handle_set_context(
                 element.to_glib_none().0,
@@ -497,20 +454,24 @@ impl CUDAContext {
                 cuda_raw_ptr,
             )
         };
-
-        if result == glib_ffi::GFALSE {
+        if result == glib_ffi::GFALSE || unsafe { *cuda_raw_ptr }.is_null() {
             Err("Failed to create CUDA context".into())
         } else {
-            unsafe { Self::adopt_slot_ref(pre, cuda_raw_ptr) };
-            let stream = unsafe { ffi::gst_cuda_stream_new(*cuda_raw_ptr) };
-            Ok(CUDAContext {
-                ptr: unsafe { *cuda_raw_ptr },
-                stream: if stream.is_null() {
-                    None
-                } else {
-                    Some(StreamHandle { stream })
-                },
-            })
+            Ok(unsafe { Self::from_slot(cuda_raw_ptr) })
+        }
+    }
+
+    /// Release the reference a `gst_cuda_*` helper transferred into `cuda_raw_ptr`, if any, and
+    /// empty the slot so the helpers fill it again. Wrappers keep their own references.
+    ///
+    /// # Safety
+    /// `cuda_raw_ptr` must be a valid slot that only the `gst_cuda_*` helpers have filled.
+    pub unsafe fn release_slot(cuda_raw_ptr: *mut *mut GstCudaContext) {
+        unsafe {
+            let ptr = std::mem::replace(&mut *cuda_raw_ptr, std::ptr::null_mut());
+            if !ptr.is_null() {
+                gst::ffi::gst_object_unref(ptr as *mut gst::ffi::GstObject);
+            }
         }
     }
 
@@ -610,4 +571,121 @@ pub fn gst_cuda_handle_context_query_wrapped(
         )
     };
     result == glib_ffi::GTRUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::tests::test_init;
+    use gst::prelude::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicPtr;
+
+    unsafe extern "C" {
+        fn gst_context_new_cuda_context(cuda_ctx: *mut GstCudaContext)
+        -> *mut gst::ffi::GstContext;
+    }
+
+    fn ref_count(ctx: *mut GstCudaContext) -> u32 {
+        unsafe { (*(ctx as *mut gst::glib::gobject_ffi::GObject)).ref_count }
+    }
+
+    /// An application that answers NEED_CONTEXT with one context it keeps for
+    /// every pipeline (Wolf does) gets it back with its reference count intact.
+    /// The answer re-enters the element while `new_from_gstreamer` is still in
+    /// `gst_cuda_ensure_element_context`, as `waylanddisplaysrc::set_context`
+    /// does: the slot is filled by the inner call and only found set by the outer
+    /// one.
+    #[test]
+    fn test_application_context_survives_pipelines() {
+        test_init();
+        init_cuda().expect("Failed to initialize CUDA");
+        let app_cuda = unsafe { ffi::gst_cuda_context_new(0) };
+        assert!(!app_cuda.is_null(), "Failed to create CUDA context");
+        let app_context: Context =
+            unsafe { gst::glib::translate::from_glib_full(gst_context_new_cuda_context(app_cuda)) };
+        let baseline = ref_count(app_cuda);
+
+        for _ in 0..3 {
+            let pipeline = gst::Pipeline::new();
+            let element = gst::ElementFactory::make("identity").build().unwrap();
+            pipeline.add(&element).unwrap();
+            let slot = AtomicPtr::<GstCudaContext>::new(std::ptr::null_mut());
+            let stored: Mutex<Option<CUDAContext>> = Mutex::new(None);
+
+            let bus = pipeline.bus().unwrap();
+            let handler_element = element.clone();
+            let handler_context = app_context.clone();
+            let slot_addr = slot.as_ptr() as usize;
+            let stored_addr = &stored as *const Mutex<Option<CUDAContext>> as usize;
+            bus.set_sync_handler(move |_, msg| {
+                if let gst::MessageView::NeedContext(_) = msg.view() {
+                    // Both outlive the pipeline run below.
+                    let stored = unsafe { &*(stored_addr as *const Mutex<Option<CUDAContext>>) };
+                    let ctx = CUDAContext::new_from_set_context(
+                        &handler_element,
+                        &handler_context,
+                        -1,
+                        slot_addr as *mut *mut GstCudaContext,
+                    )
+                    .unwrap();
+                    stored.lock().unwrap().get_or_insert(ctx);
+                }
+                gst::BusSyncReply::Drop
+            });
+
+            let outer = CUDAContext::new_from_gstreamer(&element, -1, slot.as_ptr()).unwrap();
+            assert_eq!(outer.as_ptr(), app_cuda);
+            assert!(
+                stored.lock().unwrap().is_some(),
+                "NEED_CONTEXT was not answered"
+            );
+            bus.unset_sync_handler();
+            drop(outer);
+            drop(stored);
+            unsafe { CUDAContext::release_slot(slot.as_ptr()) };
+            assert_eq!(ref_count(app_cuda), baseline);
+        }
+
+        drop(app_context);
+        unsafe { gst::ffi::gst_object_unref(app_cuda as *mut gst::ffi::GstObject) };
+    }
+
+    /// The slot is released (its element goes away) while a wrapper built from it
+    /// is still alive: the slot gives up its reference exactly once and the
+    /// wrapper keeps its own, so the context stays alive until the wrapper drops.
+    #[test]
+    fn test_slot_released_before_wrapper() {
+        test_init();
+        init_cuda().expect("Failed to initialize CUDA");
+        let app_cuda = unsafe { ffi::gst_cuda_context_new(0) };
+        assert!(!app_cuda.is_null(), "Failed to create CUDA context");
+        let app_context: Context =
+            unsafe { gst::glib::translate::from_glib_full(gst_context_new_cuda_context(app_cuda)) };
+        let element = gst::ElementFactory::make("identity").build().unwrap();
+        let baseline = ref_count(app_cuda);
+
+        let slot = AtomicPtr::<GstCudaContext>::new(std::ptr::null_mut());
+        let wrapper =
+            CUDAContext::new_from_set_context(&element, &app_context, -1, slot.as_ptr()).unwrap();
+        assert_eq!(wrapper.as_ptr(), app_cuda);
+        let with_both = ref_count(app_cuda);
+        assert!(
+            with_both >= baseline + 2,
+            "the slot and the wrapper each hold a reference"
+        );
+
+        unsafe { CUDAContext::release_slot(slot.as_ptr()) };
+        assert_eq!(
+            ref_count(app_cuda),
+            with_both - 1,
+            "releasing the slot drops exactly one reference"
+        );
+
+        drop(wrapper);
+        assert_eq!(ref_count(app_cuda), baseline);
+
+        drop(app_context);
+        unsafe { gst::ffi::gst_object_unref(app_cuda as *mut gst::ffi::GstObject) };
+    }
 }
