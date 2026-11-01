@@ -51,7 +51,7 @@ fn move_mouse() {
 
         // Client logic test
         let client_events = f.client.get_client_events();
-        assert!(client_events.len() >= 1);
+        assert!(!client_events.is_empty());
         // This first real motion after the map consumes the pending refocus edge trigger,
         // which cycles focus exactly once: one forced leave (plus its frame), then the
         // enter asserted below, so that a wl_pointer created after the map still learns it
@@ -97,7 +97,7 @@ fn move_mouse() {
 
         // Client logic test
         let client_events = f.client.get_client_events();
-        assert!(client_events.len() >= 1);
+        assert!(!client_events.is_empty());
         let MouseEvents::Pointer(client_event) = client_events.remove(0) else {
             panic!("Unexpected event: {:?}", client_events);
         };
@@ -128,7 +128,7 @@ fn lock_mouse() {
     f.round_trip();
     {
         let client_events = f.client.get_client_events();
-        assert!(client_events.len() >= 1);
+        assert!(!client_events.is_empty());
         clean_events(client_events);
     }
 
@@ -158,12 +158,8 @@ fn lock_mouse() {
 
         // And no Pointer Motion events
         while let Some(event) = client_events.pop() {
-            match event {
-                MouseEvents::Pointer(p_event) => match p_event {
-                    wl_pointer::Event::Motion { .. } => panic!("Unexpected event: {:?}", p_event),
-                    _ => {}
-                },
-                _ => {}
+            if let MouseEvents::Pointer(wl_pointer::Event::Motion { .. }) = event {
+                panic!("Unexpected event: {:?}", event)
             }
         }
     }
@@ -191,12 +187,8 @@ fn lock_mouse() {
 
         // And no Pointer Motion events
         while let Some(event) = client_events.pop() {
-            match event {
-                MouseEvents::Pointer(p_event) => match p_event {
-                    wl_pointer::Event::Motion { .. } => panic!("Unexpected event: {:?}", p_event),
-                    _ => {}
-                },
-                _ => {}
+            if let MouseEvents::Pointer(wl_pointer::Event::Motion { .. }) = event {
+                panic!("Unexpected event: {:?}", event)
             }
         }
     }
@@ -215,7 +207,7 @@ fn confine_mouse_absolute_movement() {
 
     {
         let client_events = f.client.get_client_events();
-        assert!(client_events.len() >= 1);
+        assert!(!client_events.is_empty());
         clean_events(client_events);
     }
 
@@ -239,24 +231,23 @@ fn confine_mouse_absolute_movement() {
         assert_eq!(client_events.len(), 3); // motion, relative_motion, frame
         while let Some(event) = client_events.pop() {
             match event {
-                MouseEvents::Pointer(p_event) => match p_event {
-                    wl_pointer::Event::Motion {
+                MouseEvents::Pointer(p_event) => {
+                    if let wl_pointer::Event::Motion {
                         surface_x,
                         surface_y,
                         ..
-                    } => {
+                    } = p_event
+                    {
                         assert_eq!(surface_x, outside_position.x);
                         assert_eq!(surface_y, outside_position.y);
                     }
-                    _ => {}
-                },
-                MouseEvents::Relative(r_event) => match r_event {
-                    zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } => {
+                }
+                MouseEvents::Relative(r_event) => {
+                    if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = r_event {
                         assert_eq!(dx, outside_position.x);
                         assert_eq!(dy, outside_position.y);
                     }
-                    _ => {}
-                },
+                }
             }
         }
     }
@@ -277,24 +268,23 @@ fn confine_mouse_absolute_movement() {
         assert_eq!(client_events.len(), 3); // motion, relative_motion, frame
         while let Some(event) = client_events.pop() {
             match event {
-                MouseEvents::Pointer(p_event) => match p_event {
-                    wl_pointer::Event::Motion {
+                MouseEvents::Pointer(p_event) => {
+                    if let wl_pointer::Event::Motion {
                         surface_x,
                         surface_y,
                         ..
-                    } => {
+                    } = p_event
+                    {
                         assert_eq!(surface_x, inside_position.x);
                         assert_eq!(surface_y, inside_position.y);
                     }
-                    _ => {}
-                },
-                MouseEvents::Relative(r_event) => match r_event {
-                    zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } => {
+                }
+                MouseEvents::Relative(r_event) => {
+                    if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = r_event {
                         assert_eq!(dx, inside_position.x - outside_position.x);
                         assert_eq!(dy, inside_position.y - outside_position.y);
                     }
-                    _ => {}
-                },
+                }
             }
         }
     }
@@ -316,18 +306,17 @@ fn confine_mouse_absolute_movement() {
         while let Some(event) = client_events.pop() {
             match event {
                 MouseEvents::Pointer(p_event) => match p_event {
-                    wl_pointer::Event::Frame { .. } => {}
+                    wl_pointer::Event::Frame => {}
                     _ => {
                         panic!("Unexpected event: {:?}", p_event)
                     }
                 },
-                MouseEvents::Relative(r_event) => match r_event {
-                    zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } => {
+                MouseEvents::Relative(r_event) => {
+                    if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = r_event {
                         assert_eq!(dx, -(inside_position.x - outside_position.x));
                         assert_eq!(dy, -(inside_position.y - outside_position.y));
                     }
-                    _ => {}
-                },
+                }
             }
         }
     }

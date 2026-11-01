@@ -1,0 +1,41 @@
+#version 450
+// RGBA -> NV12 (BT.601 limited range). One invocation per 2x2 chroma block:
+// writes 4 luma samples to the Y plane and one interleaved Cb/Cr to the UV plane.
+// Matches the matrix the GLES/VA/CUDA converters use, so output is bit-comparable.
+//
+// Bindings:
+//   0: src     - RGBA input (sampled, imported from the compositor's dmabuf)
+//   1: yPlane  - r8  storage image, full resolution (NV12 plane 0)
+//   2: uvPlane - rg8 storage image, half resolution (NV12 plane 1, Cb in r, Cr in g)
+// Push constant: full-resolution size in pixels.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r8)  uniform writeonly image2D yPlane;
+layout(binding = 2, rg8) uniform writeonly image2D uvPlane;
+
+layout(push_constant) uniform Push { ivec2 size; } pc;
+
+float luma(vec3 c) { return 0.257 * c.r + 0.504 * c.g + 0.098 * c.b + 0.0625; }
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // chroma coord (0..W/2, 0..H/2)
+    ivec2 p  = ch * 2;                            // top-left luma coord
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+
+    vec3 c00 = texelFetch(src, p + ivec2(0, 0), 0).rgb;
+    vec3 c10 = texelFetch(src, p + ivec2(1, 0), 0).rgb;
+    vec3 c01 = texelFetch(src, p + ivec2(0, 1), 0).rgb;
+    vec3 c11 = texelFetch(src, p + ivec2(1, 1), 0).rgb;
+
+    imageStore(yPlane, p + ivec2(0, 0), vec4(luma(c00)));
+    imageStore(yPlane, p + ivec2(1, 0), vec4(luma(c10)));
+    imageStore(yPlane, p + ivec2(0, 1), vec4(luma(c01)));
+    imageStore(yPlane, p + ivec2(1, 1), vec4(luma(c11)));
+
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;       // 4:2:0 average
+    float cb = -0.148 * a.r - 0.291 * a.g + 0.439 * a.b + 0.5;
+    float cr =  0.439 * a.r - 0.368 * a.g - 0.071 * a.b + 0.5;
+    imageStore(uvPlane, ch, vec4(cb, cr, 0.0, 0.0));
+}

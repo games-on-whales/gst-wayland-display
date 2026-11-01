@@ -4,7 +4,7 @@ use test_log::test;
 
 #[test]
 fn test_get_gpu_device() {
-    for path in vec![
+    for path in [
         "/dev/dri/card0",
         "/dev/dri/renderD128",
         "/dev/dri/by-path/pci-0000:2d:00.0-render",

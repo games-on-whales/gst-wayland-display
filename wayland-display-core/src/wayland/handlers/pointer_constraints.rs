@@ -1,5 +1,4 @@
 use crate::comp::State;
-use smithay::delegate_pointer_constraints;
 use smithay::input::pointer::PointerHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
@@ -44,5 +43,3 @@ impl PointerConstraintsHandler for State {
         }
     }
 }
-
-delegate_pointer_constraints!(State); // Needed by SDL in order to lock the pointer to the window

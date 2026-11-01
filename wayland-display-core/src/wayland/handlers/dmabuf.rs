@@ -1,6 +1,5 @@
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::ImportDma},
-    delegate_dmabuf,
     wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
 };
 
@@ -24,5 +23,3 @@ impl DmabufHandler for State {
         }
     }
 }
-
-delegate_dmabuf!(State);

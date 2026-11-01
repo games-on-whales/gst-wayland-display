@@ -399,7 +399,7 @@ fn alloc_cuda_buffer(
     cuda_context: &CUDAContext,
     video_info: &VideoInfoDmaDrm,
 ) -> Result<gst::Buffer, Box<dyn std::error::Error>> {
-    let mut gst_video_info = gst_dma_video_info_to_video_info(video_info)?;
+    let gst_video_info = gst_dma_video_info_to_video_info(video_info)?;
 
     // Use the stream from the context if available
     let stream = cuda_context
@@ -409,12 +409,7 @@ fn alloc_cuda_buffer(
         .unwrap_or(unsafe { std::mem::zeroed() });
 
     let gst_memory = unsafe {
-        gst_cuda_allocator_alloc(
-            ptr::null_mut(),
-            cuda_context.ptr,
-            stream,
-            &mut gst_video_info,
-        )
+        gst_cuda_allocator_alloc(ptr::null_mut(), cuda_context.ptr, stream, &gst_video_info)
     };
     if gst_memory.is_null() {
         return Err("Failed to allocate GST CUDA memory".into());

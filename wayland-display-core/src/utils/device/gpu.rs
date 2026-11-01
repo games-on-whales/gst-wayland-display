@@ -22,7 +22,10 @@ impl GPUDevice {
 impl TryFrom<DrmNode> for GPUDevice {
     type Error = Box<dyn Error>;
     fn try_from(drm_node: DrmNode) -> Result<Self, Self::Error> {
-        get_gpu_device(drm_node.dev_path().unwrap().to_str().unwrap())
+        let path = drm_node
+            .dev_path()
+            .ok_or_else(|| format!("no device path for {:?}", drm_node))?;
+        get_gpu_device(path.to_str().ok_or("device path is not valid UTF-8")?)
     }
 }
 impl std::fmt::Display for GPUDevice {
@@ -39,7 +42,7 @@ pub fn get_gpu_device(path: &str) -> Result<GPUDevice, Box<dyn Error>> {
     let card = get_card_from_render_node(path)?;
     let vendor_str = fs::read_to_string(format!("/sys/class/drm/{}/device/vendor", card))?;
     let vendor_str = vendor_str.trim_start_matches("0x").trim_end_matches('\n');
-    let vendor = u32::from_str_radix(&vendor_str, 16)?;
+    let vendor = u32::from_str_radix(vendor_str, 16)?;
 
     let device_id = fs::read_to_string(format!("/sys/class/drm/{}/device/device", card))?;
     let device_id = device_id.trim_start_matches("0x").trim_end_matches('\n');
@@ -54,7 +57,7 @@ pub fn get_gpu_device(path: &str) -> Result<GPUDevice, Box<dyn Error>> {
     };
 
     Ok(GPUDevice {
-        pci_vendor: PCIVendor::try_from(vendor)?,
+        pci_vendor: PCIVendor::from(vendor),
         device_name,
     })
 }
@@ -82,10 +85,11 @@ fn parse_pci_ids(pci_data: &str, vendor_id: &str, device_id: &str) -> Option<Str
         // Check for device lines (leading whitespace)
         let line = line.trim_start();
         let mut parts = line.splitn(2, ' ');
-        if let (Some(dev_id), Some(desc)) = (parts.next(), parts.next()) {
-            if dev_id.to_lowercase() == device_id && current_vendor == vendor_id {
-                return Some(desc.trim().to_owned());
-            }
+        if let (Some(dev_id), Some(desc)) = (parts.next(), parts.next())
+            && dev_id.to_lowercase() == device_id
+            && current_vendor == vendor_id
+        {
+            return Some(desc.trim().to_owned());
         }
     }
 

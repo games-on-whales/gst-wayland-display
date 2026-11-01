@@ -1,0 +1,78 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+index ca92d7195c..35e279b51a 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+@@ -1900,6 +1900,21 @@ gst_vulkan_av1_encoder_propose_allocation (GstVideoEncoder * venc,
+   if (!gst_video_info_from_caps (&info, caps))
+     return FALSE;
+ 
++  /* PATCH: an allocation query can arrive after CAPS but before the first
++   * frame started the encoder in new_sequence -- behind interpipesrc, whose
++   * fork forwards the producer's allocation query to every connected
++   * listener as soon as one attaches to a running pipeline. There are no
++   * profile caps then, and coded_width/height and the SPS are not
++   * initialised, so no pool can be built. Answer without a pool: the
++   * producer allocates its own buffers. */
++  profile_caps = gst_vulkan_encoder_profile_caps (self->encoder);
++  if (!profile_caps) {
++    GST_DEBUG_OBJECT (self, "allocation query before the encoder started; "
++        "proposing no pool");
++    return TRUE;
++  }
++  gst_caps_unref (profile_caps);
++
+   /* the normal size of a frame */
+   size = info.size;
+ 
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index f36fe4b9c7..72287ff167 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -1883,6 +1883,21 @@ gst_vulkan_h264_encoder_propose_allocation (GstVideoEncoder * venc,
+   if (!gst_video_info_from_caps (&info, caps))
+     return FALSE;
+ 
++  /* PATCH: an allocation query can arrive after CAPS but before the first
++   * frame started the encoder in new_sequence -- behind interpipesrc, whose
++   * fork forwards the producer's allocation query to every connected
++   * listener as soon as one attaches to a running pipeline. There are no
++   * profile caps then, and coded_width/height and the SPS are not
++   * initialised, so no pool can be built. Answer without a pool: the
++   * producer allocates its own buffers. */
++  profile_caps = gst_vulkan_encoder_profile_caps (self->encoder);
++  if (!profile_caps) {
++    GST_DEBUG_OBJECT (self, "allocation query before the encoder started; "
++        "proposing no pool");
++    return TRUE;
++  }
++  gst_caps_unref (profile_caps);
++
+   /* the normal size of a frame */
+   size = info.size;
+ 
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+index f136b01f2d..b6d28fc274 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+@@ -2357,6 +2357,21 @@ gst_vulkan_h265_encoder_propose_allocation (GstVideoEncoder * venc,
+   if (!gst_video_info_from_caps (&info, caps))
+     return FALSE;
+ 
++  /* PATCH: an allocation query can arrive after CAPS but before the first
++   * frame started the encoder in new_sequence -- behind interpipesrc, whose
++   * fork forwards the producer's allocation query to every connected
++   * listener as soon as one attaches to a running pipeline. There are no
++   * profile caps then, and coded_width/height and the SPS are not
++   * initialised, so no pool can be built. Answer without a pool: the
++   * producer allocates its own buffers. */
++  profile_caps = gst_vulkan_encoder_profile_caps (self->encoder);
++  if (!profile_caps) {
++    GST_DEBUG_OBJECT (self, "allocation query before the encoder started; "
++        "proposing no pool");
++    return TRUE;
++  }
++  gst_caps_unref (profile_caps);
++
+   /* the normal size of a frame */
+   size = info.size;
+ 
