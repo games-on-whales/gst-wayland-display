@@ -182,6 +182,13 @@ phase_lint() {
     return 0
   fi
   sh_run "$CARGO" fmt --all -- --check
+  if "$CARGO" clippy --version >/dev/null 2>&1; then
+    # Default (non-cuda) feature set; the cuda-gated paths are linted by the
+    # cuda step in .github/workflows/harness.yml.
+    sh_run "$CARGO" clippy --workspace --all-targets -- -D warnings
+  else
+    warn "clippy not installed (rustup component add clippy); skipping clippy"
+  fi
 }
 
 phase_build() {
