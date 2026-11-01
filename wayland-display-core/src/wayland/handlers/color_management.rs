@@ -453,13 +453,7 @@ fn init_ready_image_description(
     data_init: &mut DataInit<'_, State>,
 ) {
     let identity = next_identity();
-    let image_desc = data_init.init(
-        new_id,
-        ImageDescriptionData {
-            desc,
-            allow_info,
-        },
-    );
+    let image_desc = data_init.init(new_id, ImageDescriptionData { desc, allow_info });
     image_desc.ready(identity);
 }
 
