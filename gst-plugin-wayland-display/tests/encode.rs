@@ -983,7 +983,7 @@ fn overlapping_sessions_churn_on_one_gpu() {
             format!(" ! {rest}")
         };
         format!(
-            "waylanddisplaysrc render-node={node} ! {caps},width=320,height=240,framerate=30/1{rest} \
+            "waylanddisplaysrc render-node={node} ! {caps},width=384,height=240,framerate=30/1{rest} \
              ! fakesink name=sink signal-handoffs=true"
         )
     };
@@ -1252,7 +1252,7 @@ fn vulkan_encode_round_trips_the_client_colour() {
         let (y, cb, cr) = client_colour_ycbcr(
             &format!(
                 "waylanddisplaysrc render-node={node} vulkan=true {props} ! \
-                 video/x-raw(memory:VulkanImage),format={format},width=320,height=240,framerate=30/1 ! \
+                 video/x-raw(memory:VulkanImage),format={format},width=384,height=240,framerate=30/1 ! \
                  {enc} ! {codec}parse ! {dec} ! vulkandownload ! \
                  video/x-raw,format={format} ! fakesink name=s signal-handoffs=true"
             ),
