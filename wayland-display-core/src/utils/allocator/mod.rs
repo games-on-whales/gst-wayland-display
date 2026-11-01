@@ -485,7 +485,7 @@ pub enum VideoInfoTypes {
 }
 
 pub trait GsBuffer<R: Renderer> {
-    fn bind(&mut self, renderer: &mut R) -> Result<GlesTarget, R::Error>;
+    fn bind(&mut self, renderer: &mut R) -> Result<GlesTarget<'_>, R::Error>;
 
     fn to_gs_buffer(
         &self,
@@ -499,7 +499,7 @@ pub trait GsBuffer<R: Renderer> {
 }
 
 impl GsBuffer<GlesRenderer> for GsBufferType {
-    fn bind(&mut self, renderer: &mut GlesRenderer) -> Result<GlesTarget, GlesError> {
+    fn bind(&mut self, renderer: &mut GlesRenderer) -> Result<GlesTarget<'_>, GlesError> {
         match self {
             GsBufferType::RAW(buffer) => renderer.bind(&mut buffer.buffer),
             GsBufferType::DMA(buffer) => renderer.bind(&mut buffer.buffer),

@@ -613,7 +613,7 @@ impl State {
 
     pub fn create_frame(
         &mut self,
-    ) -> Result<(gst::Buffer, RenderOutputResult), OutputDamageTrackerError<GlesError>> {
+    ) -> Result<(gst::Buffer, RenderOutputResult<'_>), OutputDamageTrackerError<GlesError>> {
         assert!(self.output.is_some());
         assert!(self.dtr.is_some());
         assert!(self.video_info.is_some());

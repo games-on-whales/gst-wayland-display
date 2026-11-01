@@ -1390,7 +1390,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             } else {
                 format!("P010:0x{m:016x}")
             };
-            let mut b = gst_video::VideoCapsBuilder::new()
+            let b = gst_video::VideoCapsBuilder::new()
                 .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
                 .format(VideoFormat::DmaDrm)
                 .field("drm-format", drm)

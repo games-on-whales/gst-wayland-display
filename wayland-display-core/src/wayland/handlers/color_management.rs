@@ -251,11 +251,10 @@ const SUPPORTED_PRIMARIES: [Primaries; 2] = [Primaries::Srgb, Primaries::Bt2020]
 
 // --- per-resource user data --------------------------------------------------------
 
-/// User data of a `wp_image_description_v1`: the resolved description, its identity and
+/// User data of a `wp_image_description_v1`: the resolved description and
 /// whether `get_information` is permitted (only the output's description allows it).
 #[derive(Debug)]
 pub struct ImageDescriptionData {
-    pub identity: u32,
     pub desc: ImageDescription,
     pub allow_info: bool,
 }
@@ -359,14 +358,10 @@ pub fn surface_data_hdr_color(states: &SurfaceData) -> Option<SurfaceHdrColor> {
     })
 }
 
-/// Compatibility accessor for callers interested only in HDR detection.
+/// HDR detection for the tests: the current (committed) surface colour state.
+#[cfg(test)]
 pub fn surface_is_hdr(surface: &WlSurface) -> bool {
     surface_hdr_color(surface).is_some_and(|color| color.is_hdr())
-}
-
-/// Compatibility accessor for the active surface's mastering metadata.
-pub fn surface_mastering_caps(surface: &WlSurface) -> Option<HdrMeta> {
-    surface_hdr_color(surface).and_then(|color| color.mastering_caps())
 }
 
 /// Stage a declaration for the next surface commit (shared by wp and frog).
@@ -461,7 +456,6 @@ fn init_ready_image_description(
     let image_desc = data_init.init(
         new_id,
         ImageDescriptionData {
-            identity,
             desc,
             allow_info,
         },
