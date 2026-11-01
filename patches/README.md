@@ -286,3 +286,17 @@ warning.
 
 `tests/va-h265-color.c` parses the SEI back, including a minimum luminance whose
 bytes need an emulation prevention byte.
+
+## vulkan-encode-alloc-before-start.patch
+
+Behind `interpipesrc` (the fork forwards the producer's allocation query to
+every connected listener as soon as one attaches to a running pipeline) the
+allocation query reaches `vulkanh264enc` / `vulkanh265enc` / `vulkanav1enc`
+after CAPS but before the first frame started the encoder in `new_sequence`.
+`gst_vulkan_encoder_profile_caps()` returns `NULL` on an unstarted encoder and
+`propose_allocation` fed it straight to
+`gst_vulkan_image_buffer_pool_config_set_encode_caps()`, which asserts; the
+coded size and the SPS are uninitialised at that point too, so no pool can be
+built. The encoders now answer the query without a pool when they have not
+started: the producer allocates its own buffers either way. Deterministic on a
+Radeon RX 9070 and a RTX 3070; a race on hardware where the first frame wins.
