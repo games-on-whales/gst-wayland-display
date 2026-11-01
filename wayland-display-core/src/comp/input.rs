@@ -248,7 +248,7 @@ impl State {
                     let point = new_location - *surface_location;
                     if constraint
                         .region()
-                        .map_or(true, |region| region.contains(point.to_i32_round()))
+                        .is_none_or(|region| region.contains(point.to_i32_round()))
                     {
                         constraint.activate();
                     }
@@ -299,7 +299,7 @@ impl State {
             with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
                 Some(constraint) if constraint.is_active() => {
                     // Constraint does not apply if not within region
-                    if !constraint.region().map_or(true, |x| {
+                    if !constraint.region().is_none_or(|x| {
                         x.contains((pointer.current_location() - *surface_loc).to_i32_round())
                     }) {
                         return;
@@ -319,12 +319,11 @@ impl State {
                                 {
                                     should_motion = false;
                                 }
-                                if let Some(region) = confine.region() {
-                                    if !region
+                                if let Some(region) = confine.region()
+                                    && !region
                                         .contains((target_position - *surface_loc).to_i32_round())
-                                    {
-                                        should_motion = false;
-                                    }
+                                {
+                                    should_motion = false;
                                 }
                             }
                         }
@@ -521,7 +520,7 @@ impl State {
             self,
             &ButtonEvent {
                 button: button_code,
-                state: state.try_into().unwrap(),
+                state,
                 serial,
                 time: InputTime::from_millis(event_time_msec),
             },
@@ -627,8 +626,8 @@ impl State {
             self,
             under,
             &DownEvent {
-                slot: slot,
-                location: location,
+                slot,
+                location,
                 serial,
                 time: InputTime::from_millis(event_time_msec),
             },
@@ -643,7 +642,7 @@ impl State {
         touch.up(
             self,
             &UpEvent {
-                slot: slot,
+                slot,
                 serial,
                 time: InputTime::from_millis(event_time_msec),
             },
@@ -1354,14 +1353,14 @@ impl State {
     }
 
     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
-        if let Some(output) = self.output.as_ref() {
-            if let Some(mode) = output.current_mode() {
-                return (
-                    pos.x.max(0.0).min((mode.size.w - 2) as f64),
-                    pos.y.max(0.0).min((mode.size.h - 2) as f64),
-                )
-                    .into();
-            }
+        if let Some(output) = self.output.as_ref()
+            && let Some(mode) = output.current_mode()
+        {
+            return (
+                pos.x.max(0.0).min((mode.size.w - 2) as f64),
+                pos.y.max(0.0).min((mode.size.h - 2) as f64),
+            )
+                .into();
         }
         pos
     }
@@ -1378,16 +1377,15 @@ impl State {
         // subsurface menus (for example firefox-wayland).
         // see here for a discussion about that issue:
         // https://gitlab.freedesktop.org/wayland/wayland/-/issues/294
-        if !pointer.is_grabbed() && !keyboard.is_grabbed() {
-            if let Some((window, _)) = self
+        if !pointer.is_grabbed()
+            && !keyboard.is_grabbed()
+            && let Some((window, _)) = self
                 .space
                 .element_under(self.pointer_location)
                 .map(|(w, p)| (w.clone(), p))
-            {
-                self.space.raise_element(&window, true);
-                keyboard.set_focus(self, Some(FocusTarget::from(window)), serial);
-                return;
-            }
+        {
+            self.space.raise_element(&window, true);
+            keyboard.set_focus(self, Some(FocusTarget::from(window)), serial);
         }
     }
 }

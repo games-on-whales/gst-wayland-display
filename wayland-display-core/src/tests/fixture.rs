@@ -130,9 +130,9 @@ impl Fixture {
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
-        let dtr = OutputDamageTracker::from_output(&output);
+        let dtr = OutputDamageTracker::from_output(output);
 
-        self.server.space.map_output(&output, (0, 0));
+        self.server.space.map_output(output, (0, 0));
         self.server.dtr = Some(dtr);
         self.server
             .set_pointer_location((mode.size.w as f64 / 2.0, mode.size.h as f64 / 2.0).into());

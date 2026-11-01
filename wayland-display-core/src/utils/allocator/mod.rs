@@ -127,13 +127,15 @@ impl GsDmaBuf {
             drm_fourcc,
             &modifiers,
         );
-        if result.is_err() && workaround_modifier.is_some() {
+        if result.is_err()
+            && let Some(workaround) = workaround_modifier
+        {
             tracing::warn!(
                 "Failed to create buffer with modifier {:?}, trying workaround modifier",
                 drm_modifier
             );
             // Try the workaround modifier
-            drm_modifier = workaround_modifier.unwrap();
+            drm_modifier = workaround;
             result = dma_allocator.create_buffer(
                 video_info.width(),
                 video_info.height(),
@@ -380,6 +382,10 @@ pub struct GsCUDABuf {
 
 #[cfg(feature = "cuda")]
 impl GsCUDABuf {
+    /// The `EGLImage` handle is not dereferenced in Rust and EGL objects are usable from any
+    /// thread, so sharing it behind an `Arc` is sound even though it is neither `Send` nor
+    /// `Sync`.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
         render_node: DrmNode,
         cuda_context: Arc<Mutex<CUDAContext>>,
@@ -579,8 +585,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     let gst_buffer = gst_buffer.get_mut().unwrap();
                     buffer.buffer.handles().for_each(|handle| {
                         let fd = handle.as_raw_fd();
-                        let actual_size = seek(&handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
-                        let _ = seek(&handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
+                        let actual_size = seek(handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
+                        let _ = seek(handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
 
                         // Use the larger of the two sizes to ensure we have enough space
                         let allocation_size = required_size.max(actual_size);
@@ -714,8 +720,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     let gst_buffer = gst_buffer.get_mut().unwrap();
                     buffer.buffer.handles().for_each(|handle| {
                         let fd = handle.as_raw_fd();
-                        let actual_size = seek(&handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
-                        let _ = seek(&handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
+                        let actual_size = seek(handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
+                        let _ = seek(handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
 
                         // Use the larger of the two sizes to ensure we have enough space
                         let allocation_size = required_size.max(actual_size);
@@ -831,18 +837,7 @@ pub fn gst_video_format_to_drm_fourcc(format: &VideoInfoDmaDrm) -> Option<DrmFou
 }
 
 pub fn gst_video_format_to_drm_modifier(format: &VideoInfoDmaDrm) -> Option<DrmModifier> {
-    let full_modifier = format.modifier();
-    match Modifier::try_from(full_modifier) {
-        Ok(modifier) => Some(modifier),
-        Err(error) => {
-            tracing::warn!(
-                "Failed to convert modifier ({:?}): {:?}",
-                full_modifier,
-                error
-            );
-            None
-        }
-    }
+    Some(Modifier::from(format.modifier()))
 }
 
 #[cfg(test)]

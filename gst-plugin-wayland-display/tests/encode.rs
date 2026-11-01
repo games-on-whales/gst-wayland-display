@@ -28,14 +28,12 @@ static INIT: Once = Once::new();
 static GPU: RwLock<()> = RwLock::new(());
 
 /// Set up GStreamer and share the GPU with the other tests until the guard drops.
-#[must_use]
 fn init() -> RwLockReadGuard<'static, ()> {
     init_once();
     GPU.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Set up GStreamer and have the GPU to this test alone until the guard drops.
-#[must_use]
 fn init_exclusive() -> RwLockWriteGuard<'static, ()> {
     init_once();
     GPU.write().unwrap_or_else(PoisonError::into_inner)
@@ -1289,12 +1287,9 @@ fn client_colour_ycbcr(desc: &str, label: &str, rgb: [u8; 3], client_pq: bool) -
             else {
                 return None;
             };
-            let Some(info) = pad
+            let info = pad
                 .current_caps()
-                .and_then(|c| gst_video::VideoInfo::from_caps(&c).ok())
-            else {
-                return None;
-            };
+                .and_then(|c| gst_video::VideoInfo::from_caps(&c).ok())?;
             let p010 = info.format() == gst_video::VideoFormat::P01010le;
             let Ok(frame) = gst_video::VideoFrame::from_buffer_readable(buffer, &info) else {
                 return None;

@@ -130,7 +130,12 @@ impl VaShare {
     /// The element absorbed a gst-va display context (downstream encoder's display).
     /// Call from `ElementImpl::set_context`. `element`/`context` are the raw GstElement* /
     /// GstContext*.
-    pub fn handle_set_context(
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a valid `GstElement*` and `context` a valid `GstContext*` for the
+    /// duration of the call.
+    pub unsafe fn handle_set_context(
         &self,
         element: *mut c_void,
         context: *mut c_void,
@@ -155,7 +160,11 @@ impl VaShare {
     /// Ensure we have the gst-va display shared with downstream (uses the slot if already
     /// filled by set_context, else queries the encoder's display). Call once the element is
     /// in the pipeline (e.g. `start()`), before buffers are produced.
-    pub fn ensure_shared_display(&self, element: *mut c_void, render_path: &str) -> bool {
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a valid `GstElement*` for the duration of the call.
+    pub unsafe fn ensure_shared_display(&self, element: *mut c_void, render_path: &str) -> bool {
         let Some(lib) = valib() else { return false };
         let Ok(cpath) = CString::new(render_path) else {
             return false;

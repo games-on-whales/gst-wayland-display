@@ -83,7 +83,8 @@ pub fn import_nv12_modifier(render_node: &str) -> Option<u64> {
     if !render_node_backs_va_display(render_node) {
         return None;
     }
-    static CACHE: OnceLock<Mutex<Vec<(String, Option<u64>)>>> = OnceLock::new();
+    type NodeModifiers = OnceLock<Mutex<Vec<(String, Option<u64>)>>>;
+    static CACHE: NodeModifiers = OnceLock::new();
     let mut guard = CACHE.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
     if let Some((_, m)) = guard.iter().find(|(n, _)| n == render_node) {
         return *m;

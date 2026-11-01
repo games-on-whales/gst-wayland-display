@@ -68,6 +68,7 @@ use smithay::{
     },
 };
 use std::os::fd::OwnedFd;
+#[cfg(feature = "cuda")]
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet},
@@ -304,18 +305,18 @@ impl State {
         let clock = Clock::new();
 
         // init state
-        let compositor_state = CompositorState::new_v6::<State>(&dh);
-        let data_device_state = DataDeviceState::new::<State>(&dh);
+        let compositor_state = CompositorState::new_v6::<State>(dh);
+        let data_device_state = DataDeviceState::new::<State>(dh);
         let mut dmabuf_state = DmabufState::new();
-        let output_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
-        let presentation_state = PresentationState::new::<State>(&dh, clock.id() as _);
-        let relative_ptr_state = RelativePointerManagerState::new::<State>(&dh);
-        let pointer_constraints_state = PointerConstraintsState::new::<State>(&dh);
+        let output_state = OutputManagerState::new_with_xdg_output::<State>(dh);
+        let presentation_state = PresentationState::new::<State>(dh, clock.id() as _);
+        let relative_ptr_state = RelativePointerManagerState::new::<State>(dh);
+        let pointer_constraints_state = PointerConstraintsState::new::<State>(dh);
         let mut seat_state = SeatState::new();
-        let shell_state = XdgShellState::new::<State>(&dh);
-        let viewporter_state = ViewporterState::new::<State>(&dh);
-        let tablet_manager_state = TabletManagerState::new::<State>(&dh);
-        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+        let shell_state = XdgShellState::new::<State>(dh);
+        let viewporter_state = ViewporterState::new::<State>(dh);
+        let tablet_manager_state = TabletManagerState::new::<State>(dh);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(dh);
 
         // Color management (staging wp_color_manager_v1). Gated behind dynamic HDR:
         // advertising it makes HDR clients enable their HDR path and tags HDR surfaces,
@@ -338,7 +339,7 @@ impl State {
                 "dynamic HDR: advertising frog_color_management_v1 (gamescope HDR path)"
             );
             Some(create_frog_color_management_global::<State>(
-                &dh,
+                dh,
                 FrogGlobalData {
                     peak_nits: hdr_peak_nits,
                 },
@@ -353,7 +354,7 @@ impl State {
         // `renderer` mutably before it moves into `State`.
         let renderer = setup_renderer(render_node);
 
-        let shm_state = ShmState::new::<State>(&dh, vec![]);
+        let shm_state = ShmState::new::<State>(dh, vec![]);
         let dmabuf_global = if let RenderTarget::Hardware(node) = render_target {
             let mut formats = Bind::<Dmabuf>::supported_formats(&renderer)
                 .expect("Failed to query formats")
@@ -372,10 +373,10 @@ impl State {
                 DmabufFeedbackBuilder::new(node.dev_id(), formats.clone()).build();
 
             let dmabuf_global = if let Ok(default_feedback) = dmabuf_default_feedback {
-                dmabuf_state.create_global_with_default_feedback::<State>(&dh, &default_feedback)
+                dmabuf_state.create_global_with_default_feedback::<State>(dh, &default_feedback)
             } else {
                 tracing::warn!("Failed to create default feedback for dmabuf, falling back to v3");
-                dmabuf_state.create_global::<State>(&dh, formats.clone())
+                dmabuf_state.create_global::<State>(dh, formats.clone())
             };
 
             // No `bind_wl_display` here. Its only product is the `EGLBufferReader` behind
@@ -391,7 +392,7 @@ impl State {
 
             // wl_drm (mesa protocol, so we don't need EGL_WL_bind_display)
             let wl_drm_global = create_drm_global::<State>(
-                &dh,
+                dh,
                 node.dev_path().expect("Failed to determine DrmNode path?"),
                 formats.clone(),
                 &dmabuf_global,
@@ -413,7 +414,7 @@ impl State {
                         let device_fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
                         if supports_syncobj_eventfd(&device_fd) {
                             tracing::info!("Enabling explicit sync (linux-drm-syncobj-v1)");
-                            Some(DrmSyncobjState::new::<State>(&dh, device_fd))
+                            Some(DrmSyncobjState::new::<State>(dh, device_fd))
                         } else {
                             tracing::warn!(
                                 "DRM device does not support syncobj eventfd; explicit sync disabled"
@@ -447,7 +448,7 @@ impl State {
 
         let space = Space::default();
 
-        let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
+        let mut seat = seat_state.new_wl_seat(dh, "seat-0");
         seat.add_keyboard(XkbConfig::default(), 200, 25)
             .expect("Failed to add keyboard to seat");
         seat.add_pointer();
@@ -824,16 +825,13 @@ pub(crate) fn apply_video_info(
         output.create_global::<State>(&state.dh);
         output
     });
-    let mode = OutputMode {
-        size: size.into(),
-        refresh,
-    };
+    let mode = OutputMode { size, refresh };
     output.change_current_state(Some(mode), None, None, None);
     output.set_preferred(mode);
-    let dtr = OutputDamageTracker::from_output(&output);
+    let dtr = OutputDamageTracker::from_output(output);
 
     if !output_already_running {
-        state.space.map_output(&output, (0, 0));
+        state.space.map_output(output, (0, 0));
     }
     state.dtr = Some(dtr);
     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
@@ -1080,7 +1078,7 @@ pub(crate) fn init(
         .insert_source(command_src, move |event, _, state| {
             match event {
                 Event::Msg(Command::VideoInfo(video_info)) => {
-                    apply_video_info(state, video_info, &render_target, render_node.clone());
+                    apply_video_info(state, *video_info, &render_target, render_node);
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
@@ -1093,10 +1091,7 @@ pub(crate) fn init(
                     });
 
                     let render = move |state: &mut State, now: Instant| {
-                        let _span = match tracer {
-                            Some(ref tracer) => Some(tracer.trace("render")),
-                            None => None,
-                        };
+                        let _span = tracer.as_ref().map(|tracer| tracer.trace("render"));
                         // Derive + signal the OUTPUT HDR state every frame (no-op unless
                         // it is enabled). Runs before the buffer check so transitions
                         // are observed even on frames that fail to produce a buffer.
@@ -1115,7 +1110,7 @@ pub(crate) fn init(
                             state.should_quit = true;
                             return;
                         }
-                        if let Err(_) = match state.create_frame() {
+                        if match state.create_frame() {
                             Ok((buf, render_result)) => {
                                 let res = buffer_sender.send(Ok(buf));
                                 let rendered_states = &render_result.states;
@@ -1190,7 +1185,7 @@ pub(crate) fn init(
                                     DTRError::Rendering(err) => err.into(),
                                 }))
                             }
-                        } {
+                        }.is_err() {
                             state.should_quit = true;
                         }
                     };
@@ -1270,8 +1265,7 @@ pub(crate) fn init(
                                             f.code,
                                             BufferObjectFlags::RENDERING,
                                         )
-                                    })
-                                    .map(|f| *f)
+                                    }).copied()
                                     .collect()
                             }
                             None => FormatSet::default(),

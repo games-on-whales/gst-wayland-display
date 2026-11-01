@@ -166,36 +166,35 @@ impl CompositorHandler for State {
             if let Some(dmabuf) = maybe_dmabuf {
                 // Explicit sync: block the commit until the client's acquire timeline point
                 // signals, then order the GL context after it as well (see `wait_on_gpu`).
-                if let Some(acquire_point) = acquire_point {
-                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
-                        if let Some(client) = surface.client() {
-                            let res = state.handle.insert_source(source, move |_, _, data| {
-                                wait_on_gpu(&data.renderer, &acquire_point);
-                                let dh = data.dh.clone();
-                                data.client_compositor_state(&client)
-                                    .blocker_cleared(data, &dh);
-                                Ok(())
-                            });
-                            if res.is_ok() {
-                                add_blocker(surface, blocker);
-                                return;
-                            }
-                        }
+                if let Some(acquire_point) = acquire_point
+                    && let Ok((blocker, source)) = acquire_point.generate_blocker()
+                    && let Some(client) = surface.client()
+                {
+                    let res = state.handle.insert_source(source, move |_, _, data| {
+                        wait_on_gpu(&data.renderer, &acquire_point);
+                        let dh = data.dh.clone();
+                        data.client_compositor_state(&client)
+                            .blocker_cleared(data, &dh);
+                        Ok(())
+                    });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
+                        return;
                     }
                 }
                 // Implicit sync fallback: the client isn't using linux-drm-syncobj-v1,
                 // so block on the dmabuf's implicit read-fence instead.
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                    if let Some(client) = surface.client() {
-                        let res = state.handle.insert_source(source, move |_, _, data| {
-                            let dh = data.dh.clone();
-                            data.client_compositor_state(&client)
-                                .blocker_cleared(data, &dh);
-                            Ok(())
-                        });
-                        if res.is_ok() {
-                            add_blocker(surface, blocker);
-                        }
+                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ)
+                    && let Some(client) = surface.client()
+                {
+                    let res = state.handle.insert_source(source, move |_, _, data| {
+                        let dh = data.dh.clone();
+                        data.client_compositor_state(&client)
+                            .blocker_cleared(data, &dh);
+                        Ok(())
+                    });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
                     }
                 }
             }
@@ -321,8 +320,6 @@ impl CompositorHandler for State {
                 // allowed.
                 popup.send_configure().expect("initial configure failed");
             }
-
-            return;
-        };
+        }
     }
 }

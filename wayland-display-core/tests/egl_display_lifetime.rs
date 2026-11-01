@@ -230,7 +230,7 @@ fn vulkan_teardown_on(entry: &ash::Entry, node: &DrmNode) -> bool {
                 instance.get_physical_device_properties2(pd, &mut props);
                 props.properties.vendor_id == 0x10de
                     && drm.has_render != 0
-                    && drm.render_minor as i64 == minor as i64
+                    && drm.render_minor == minor as i64
             });
         if let Some(physical) = physical {
             let priority = [1.0f32];

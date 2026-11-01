@@ -105,7 +105,7 @@ impl MasteringDisplayInfo {
     /// Format as the gst `mastering-display-info` caps string:
     /// "Rx:Ry:Gx:Gy:Bx:By:Wx:Wy:maxLum:minLum" (same shape as the producer's
     /// hardcoded `HDR_MASTERING`).
-    pub fn to_caps_string(&self) -> String {
+    pub fn to_caps_string(self) -> String {
         let p = self.primaries;
         format!(
             "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",

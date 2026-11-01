@@ -1,9 +1,12 @@
 use crate::utils::{CAT, GstLayer};
+use gst::LibraryError;
+#[cfg(feature = "cuda")]
+use gst::LoggableError;
 use gst::message::Application;
+#[cfg(feature = "cuda")]
 use gst::query::Allocation;
 use gst::subclass::prelude::*;
 use gst::{Context, Event, Fraction, glib};
-use gst::{LibraryError, LoggableError};
 use gst::{Structure, prelude::*};
 use gst_base::prelude::BaseSrcExt;
 use gst_base::prelude::BaseSrcExtManual;
@@ -13,7 +16,9 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+#[cfg(feature = "cuda")]
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
@@ -731,18 +736,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let actual_val = value
                     .get::<Option<String>>()
                     .expect("Type checked upstream");
-                if actual_val.is_some() {
+                if let Some(device) = actual_val {
                     let mut settings = self.settings.lock().unwrap();
-                    settings.input_devices.push(actual_val.unwrap());
+                    settings.input_devices.push(device);
                 }
             }
             "keyboard" => {
                 let actual_val = value
                     .get::<Option<String>>()
                     .expect("Type checked upstream");
-                if actual_val.is_some() {
+                if let Some(device) = actual_val {
                     let mut settings = self.settings.lock().unwrap();
-                    settings.input_devices.push(actual_val.unwrap());
+                    settings.input_devices.push(device);
                 }
             }
             "disable-intel-workaround" => {
@@ -1009,8 +1014,11 @@ impl ElementImpl for WaylandDisplaySrc {
             let elem_ptr =
                 self.obj().upcast_ref::<gst::Element>().as_ptr() as *mut std::ffi::c_void;
             let ctx_ptr = context.as_ptr() as *mut std::ffi::c_void;
-            self.va_share
-                .handle_set_context(elem_ptr, ctx_ptr, &render_path);
+            // Both pointers come from the set_context arguments and are valid here.
+            unsafe {
+                self.va_share
+                    .handle_set_context(elem_ptr, ctx_ptr, &render_path)
+            };
         }
 
         #[cfg(feature = "cuda")]
@@ -1020,7 +1028,8 @@ impl ElementImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.cuda_raw_ptr.as_ptr()
             };
-            match CUDAContext::new_from_set_context(&elem, &context, -1, cuda_raw_ptr) {
+            // The slot is a valid, helpers-only storage for the whole element lifetime.
+            match unsafe { CUDAContext::new_from_set_context(&elem, context, -1, cuda_raw_ptr) } {
                 Ok(ctx) => {
                     let mut settings = self.settings.lock().unwrap();
                     if settings.cuda_context.is_none() {
@@ -1122,16 +1131,15 @@ impl WaylandDisplaySrc {
         // re-import (and radeonsi-VA then fails). Behind interpipe (`nv12=true`) a
         // LINEAR/encoder mismatch is expected -- the consumer's vapostproc imports it -- so
         // only flag it on the direct path.
-        if !prefer_nv12 {
-            if let Some(pref) = encoder_pref {
-                if pref != modifier {
-                    tracing::warn!(
-                        "waylandsrc: exporting NV12 modifier {modifier:#x} but the VA encoder \
+        if !prefer_nv12
+            && let Some(pref) = encoder_pref
+            && pref != modifier
+        {
+            tracing::warn!(
+                "waylandsrc: exporting NV12 modifier {modifier:#x} but the VA encoder \
                          on {render_path} imports {pref:#x}; a direct encode needs a vapostproc \
                          bridge"
-                    );
-                }
-            }
+            );
         }
         Ok(())
     }
@@ -1318,10 +1326,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let encoder_pref =
                 waylanddisplaycore::utils::va_query::import_nv12_modifier(&render_path);
             let mut ordered: Vec<u64> = Vec::new();
-            if let Some(p) = encoder_pref {
-                if p != DRM_FORMAT_MOD_INVALID && exportable.contains(&p) {
-                    ordered.push(p);
-                }
+            if let Some(p) = encoder_pref
+                && p != DRM_FORMAT_MOD_INVALID
+                && exportable.contains(&p)
+            {
+                ordered.push(p);
             }
             if exportable.contains(&DRM_FORMAT_MOD_LINEAR) {
                 ordered.push(DRM_FORMAT_MOD_LINEAR);
@@ -1419,7 +1428,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let s = self.settings.lock().unwrap();
             s.vulkan && s.render_node.as_deref() != Some("software")
         };
-        let vulkan_on = vulkan && self.vulkan_share.check_peer_device(&self.obj().src_pad());
+        let vulkan_on = vulkan && self.vulkan_share.check_peer_device(self.obj().src_pad());
         if vulkan_on {
             // NV12 (8-bit SDR) first so a format-agnostic interpipesink fixates on it; P010 is
             // a separate structure so the HDR fields apply ONLY to it (an `hdr` NV12 stream
@@ -1461,7 +1470,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn event(&self, event: &Event) -> bool {
-        if self.handle_event(&event) {
+        if self.handle_event(event) {
             return true;
         }
         // A pad-level flush doesn't take the state lock, so it can arrive mid-pause, where the
@@ -1538,7 +1547,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 // the over-unref is present drops the caps below its true count.
                 let caps = unsafe { gst::Caps::from_glib_none(outcaps.unwrap().as_ptr()) };
                 let stream = cuda_ctx.stream().expect("failed to get CUDA stream");
-                pool.configure(&caps, &stream, size, min, max)
+                pool.configure(&caps, stream, size, min, max)
                     .expect("failed to configure CUDA pool");
 
                 let updated_size = pool.get_updated_size().expect("failed to get updated size");
@@ -1642,7 +1651,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     video_info: base_video_info,
                     targets,
                 });
-            self.send_command(Command::VideoInfo(video_info));
+            self.send_command(Command::VideoInfo(Box::new(video_info)));
             return self.parent_set_caps(caps);
         }
 
@@ -1663,46 +1672,49 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     let settings = self.settings.lock().unwrap();
                     settings.cuda_context.clone()
                 };
-                if is_cuda && cuda_context.is_some() {
-                    // memory:CUDAMemory will only get us a base format without modifiers,
-                    // let's pick the first DRM format that matches the base format
-                    let state = self.state.lock().unwrap();
-                    let dma_formats = state
-                        .as_ref()
-                        .ok_or_else(|| {
-                            gst::loggable_error!(
-                                CAT,
-                                "Source must be started before CUDA negotiation"
-                            )
-                        })?
-                        .display
-                        .get_supported_dma_formats()
-                        .map_err(|err| {
-                            gst::loggable_error!(
-                                CAT,
-                                "Compositor did not report its DMA formats: {}",
-                                err
-                            )
-                        })?;
-                    let chosen_format =
-                        gst_video_format_name_to_drm_fourcc(base_video_info.format().to_string())
+                match (is_cuda, cuda_context) {
+                    (true, Some(cuda_context)) => {
+                        // memory:CUDAMemory will only get us a base format without modifiers,
+                        // let's pick the first DRM format that matches the base format
+                        let state = self.state.lock().unwrap();
+                        let dma_formats = state
+                            .as_ref()
                             .ok_or_else(|| {
+                                gst::loggable_error!(
+                                    CAT,
+                                    "Source must be started before CUDA negotiation"
+                                )
+                            })?
+                            .display
+                            .get_supported_dma_formats()
+                            .map_err(|err| {
+                                gst::loggable_error!(
+                                    CAT,
+                                    "Compositor did not report its DMA formats: {}",
+                                    err
+                                )
+                            })?;
+                        let chosen_format = gst_video_format_name_to_drm_fourcc(
+                            base_video_info.format().to_string(),
+                        )
+                        .ok_or_else(|| {
                             gst::loggable_error!(CAT, "Unsupported CUDA video format")
                         })?;
-                    let format = dma_formats
-                        .iter()
-                        .filter(|dma_format| dma_format.code == chosen_format)
-                        .next()
-                        .ok_or_else(|| gst::loggable_error!(CAT, "No matching CUDA DRM format"))?;
-                    let modifier: u64 = format.modifier.into();
-                    let video_info =
-                        VideoInfoDmaDrm::new(base_video_info, format.code as u32, modifier);
-                    GstVideoInfo::CUDA(CUDAParams {
-                        video_info,
-                        cuda_context: cuda_context.unwrap(),
-                    })
-                } else {
-                    GstVideoInfo::RAW(base_video_info)
+                        let format = dma_formats
+                            .iter()
+                            .find(|dma_format| dma_format.code == chosen_format)
+                            .ok_or_else(|| {
+                                gst::loggable_error!(CAT, "No matching CUDA DRM format")
+                            })?;
+                        let modifier: u64 = format.modifier.into();
+                        let video_info =
+                            VideoInfoDmaDrm::new(base_video_info, format.code as u32, modifier);
+                        GstVideoInfo::CUDA(CUDAParams {
+                            video_info,
+                            cuda_context,
+                        })
+                    }
+                    _ => GstVideoInfo::RAW(base_video_info),
                 }
             }
             #[cfg(not(feature = "cuda"))]
@@ -1712,7 +1724,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             ),
         };
 
-        self.send_command(Command::VideoInfo(video_info));
+        self.send_command(Command::VideoInfo(Box::new(video_info)));
 
         self.parent_set_caps(caps)
     }
@@ -1779,7 +1791,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             .unwrap_or_else(|| "/dev/dri/renderD128".into());
         if render_node_backs_va_display(&va_node) {
             let elem_ptr = elem.as_ptr() as *mut std::ffi::c_void;
-            self.va_share.ensure_shared_display(elem_ptr, &va_node);
+            // The element is alive for the whole start() call.
+            unsafe { self.va_share.ensure_shared_display(elem_ptr, &va_node) };
         }
 
         #[cfg(feature = "cuda")]
@@ -1789,34 +1802,33 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             settings.cuda_context.is_some()
         };
         #[cfg(feature = "cuda")]
-        match display.get_render_device() {
-            Some(render_device) => {
-                if *render_device.pci_vendor() == PCIVendor::NVIDIA && !have_cuda_context {
-                    tracing::info!(
-                        "Acquiring a CudaContext from the pipeline, you can manually set the `cuda-device-id` property to override this behavior"
-                    );
-                    let cuda_raw_ptr = {
-                        let settings = self.settings.lock().unwrap();
-                        settings.cuda_raw_ptr.as_ptr()
-                    };
-                    match CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) {
-                        Ok(cuda_context) => {
-                            let mut settings = self.settings.lock().unwrap();
-                            if settings.cuda_context.is_none() {
-                                tracing::info!("Acquired a CudaContext via new_from_gstreamer");
-                                settings.cuda_context = Some(Arc::new(Mutex::new(cuda_context)));
-                                settings.cuda_context_per_run = true;
-                            } else {
-                                tracing::info!("Acquired a CudaContext via set_context");
-                            }
-                        }
-                        Err(err) => {
-                            gst::warning!(CAT, "Failed to acquire a CudaContext: {}", err);
-                        }
+        if let Some(render_device) = display.get_render_device()
+            && *render_device.pci_vendor() == PCIVendor::NVIDIA
+            && !have_cuda_context
+        {
+            tracing::info!(
+                "Acquiring a CudaContext from the pipeline, you can manually set the `cuda-device-id` property to override this behavior"
+            );
+            let cuda_raw_ptr = {
+                let settings = self.settings.lock().unwrap();
+                settings.cuda_raw_ptr.as_ptr()
+            };
+            // The slot is a valid, helpers-only storage for the whole element lifetime.
+            match unsafe { CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) } {
+                Ok(cuda_context) => {
+                    let mut settings = self.settings.lock().unwrap();
+                    if settings.cuda_context.is_none() {
+                        tracing::info!("Acquired a CudaContext via new_from_gstreamer");
+                        settings.cuda_context = Some(Arc::new(Mutex::new(cuda_context)));
+                        settings.cuda_context_per_run = true;
+                    } else {
+                        tracing::info!("Acquired a CudaContext via set_context");
                     }
                 }
+                Err(err) => {
+                    gst::warning!(CAT, "Failed to acquire a CudaContext: {}", err);
+                }
             }
-            None => {}
         }
 
         let mut structure = Structure::builder("wayland.src");
@@ -2567,7 +2579,7 @@ mod tests {
         }
     }
 
-    fn test_init() -> () {
+    fn test_init() {
         use tracing_subscriber::Layer;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -2907,7 +2919,7 @@ mod tests {
         announce(&kept.path);
         announce(&unplugged_path);
         drop(unplugged);
-        assert_eq!(startup_devices(), [kept.path.clone()]);
+        assert_eq!(startup_devices(), std::slice::from_ref(&kept.path));
 
         // The kernel hands out the lowest free event number, so this takes the dropped one.
         let other = UinputKeyboard::new();
@@ -2916,7 +2928,7 @@ mod tests {
         let reused = UinputKeyboard::new();
         assert_eq!(
             startup_devices(),
-            [kept.path.clone()],
+            std::slice::from_ref(&kept.path),
             "re-added {} (now another device: {})",
             reused.path,
             reused.path == unplugged_path
@@ -3230,10 +3242,10 @@ mod tests {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(command) = unserviced.try_recv() {
-                if matches(&command) {
-                    return command;
-                }
+            if let Ok(command) = unserviced.try_recv()
+                && matches(&command)
+            {
+                return command;
             }
             assert!(Instant::now() < deadline, "the expected command never came");
             std::thread::sleep(Duration::from_millis(10));
@@ -3651,10 +3663,11 @@ mod tests {
                     }
                     Ok(_) => {}
                     Err(_) => {
-                        if !owed_frames.is_empty() && deliver_rx.try_recv().is_ok() {
-                            if let Command::Buffer(reply, _) = owed_frames.remove(0) {
-                                let _ = reply.send(Ok(gst::Buffer::new()));
-                            }
+                        if !owed_frames.is_empty()
+                            && deliver_rx.try_recv().is_ok()
+                            && let Command::Buffer(reply, _) = owed_frames.remove(0)
+                        {
+                            let _ = reply.send(Ok(gst::Buffer::new()));
                         }
                         std::thread::sleep(Duration::from_millis(5))
                     }

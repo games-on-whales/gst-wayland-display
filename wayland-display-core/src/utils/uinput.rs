@@ -38,6 +38,12 @@ pub struct UinputKeyboard {
     pub path: String,
 }
 
+impl Default for UinputKeyboard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UinputKeyboard {
     /// Creates the keyboard and waits until udev has tagged it, as libinput ignores untagged
     /// devices.

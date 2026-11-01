@@ -218,8 +218,8 @@ pub(crate) fn convert_solid(color: [f32; 4], to_pq: bool, ref_white_scale: f32) 
         let mut rel = mat(
             [
                 [1.660491, -0.587641, -0.072850],
-                [-0.124550, 1.132900, -0.008349],
-                [-0.018151, -0.100579, 1.118730],
+                [-0.124550, 1.132_9, -0.008349],
+                [-0.018151, -0.100579, 1.118_73],
             ],
             lin,
         )
@@ -518,6 +518,7 @@ impl Composition {
 
 /// Record `states`' surface in `composition`-to-be if it holds a buffer: PQ content, and the
 /// colour of a single-pixel buffer.
+#[allow(clippy::mutable_key_type)] // smithay's ObjectId has interior mutability that does not participate in Hash/Eq
 fn scan_surface(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     states: &smithay::wayland::compositor::SurfaceData,
@@ -569,6 +570,7 @@ impl State {
     /// with PQ content on an HDR output the frame is PQ and SDR surfaces (and the cursor) are
     /// PQ-encoded; on an SDR output it stays SDR and only the PQ surfaces are tone-mapped, so
     /// SDR content is untouched. `None`: no PQ content, or no conversion possible.
+    #[allow(clippy::mutable_key_type)] // smithay's ObjectId has interior mutability that does not participate in Hash/Eq
     fn composition(
         &mut self,
         output_hdr: bool,
@@ -672,12 +674,12 @@ impl State {
         // HDR render-path spike: prepend synthetic >1.0 brightness bars across the top of the
         // output as the topmost elements (so client surfaces never occlude them). Gated behind
         // WOLF_HDR_SPIKE -- unset = exactly the elements built above (no bars, no behavior change).
-        if crate::utils::allocator::hdr_spike() {
-            if let Some(vi) = self.video_info.as_ref() {
-                let mut bars = hdr_spike_bars(vi.width() as i32, vi.height() as i32);
-                bars.append(&mut elements);
-                elements = bars;
-            }
+        if crate::utils::allocator::hdr_spike()
+            && let Some(vi) = self.video_info.as_ref()
+        {
+            let mut bars = hdr_spike_bars(vi.width() as i32, vi.height() as i32);
+            bars.append(&mut elements);
+            elements = bars;
         }
 
         // Dynamic HDR: the committed output state picks the frame's working space (see
@@ -766,13 +768,13 @@ impl State {
         // framebuffer (after render_output, before the Vulkan converter in to_gs_buffer) and log
         // the bar-center float values -- proving whether GLES kept >1.0 or clamped. Gated behind
         // WOLF_HDR_SPIKE, only on an fp16 target, and logged once (cheap, a handful of pixels).
-        if crate::utils::allocator::hdr_spike() && render_rgba_fourcc == Some(Fourcc::Abgr16161616f)
+        if crate::utils::allocator::hdr_spike()
+            && render_rgba_fourcc == Some(Fourcc::Abgr16161616f)
+            && let Some(vi) = self.video_info.as_ref()
         {
-            if let Some(vi) = self.video_info.as_ref() {
-                let (w, h) = (vi.width() as i32, vi.height() as i32);
-                if !HDR_READBACK_DONE.swap(true, Ordering::Relaxed) {
-                    hdr_spike_gles_readback(&mut self.renderer, &target, w, h);
-                }
+            let (w, h) = (vi.width() as i32, vi.height() as i32);
+            if !HDR_READBACK_DONE.swap(true, Ordering::Relaxed) {
+                hdr_spike_gles_readback(&mut self.renderer, &target, w, h);
             }
         }
 

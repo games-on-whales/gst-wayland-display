@@ -22,7 +22,7 @@ pub mod tests {
     pub static INIT: Once = Once::new();
 
     #[cfg(test)]
-    pub fn test_init() -> () {
+    pub fn test_init() {
         INIT.call_once(|| {
             tracing_subscriber::fmt::try_init().ok();
             gst::init().expect("Failed to initialize GStreamer");
@@ -55,10 +55,11 @@ pub mod tests {
                 .write(true)
                 .open(&path)
                 .is_ok();
-            if usable && drivers.iter().any(|d| *d == drv) {
-                if let Ok(node) = DrmNode::from_path(&path) {
-                    return Some(node);
-                }
+            if usable
+                && drivers.iter().any(|d| *d == drv)
+                && let Ok(node) = DrmNode::from_path(&path)
+            {
+                return Some(node);
             }
         }
         None

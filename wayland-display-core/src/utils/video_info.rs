@@ -1,6 +1,7 @@
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda;
 use gst_video::{VideoInfo, VideoInfoDmaDrm};
+#[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]

@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FocusTarget {
-    Wayland(Window),
-    Popup(PopupKind),
+    Wayland(Box<Window>),
+    Popup(Box<PopupKind>),
 }
 
 impl IsAlive for FocusTarget {
@@ -40,13 +40,13 @@ impl IsAlive for FocusTarget {
 
 impl From<Window> for FocusTarget {
     fn from(w: Window) -> Self {
-        FocusTarget::Wayland(w)
+        FocusTarget::Wayland(Box::new(w))
     }
 }
 
 impl From<PopupKind> for FocusTarget {
     fn from(p: PopupKind) -> Self {
-        FocusTarget::Popup(p)
+        FocusTarget::Popup(Box::new(p))
     }
 }
 

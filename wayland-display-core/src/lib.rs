@@ -13,9 +13,11 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
+use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use utils::RenderTarget;
@@ -30,7 +32,7 @@ pub use crate::utils::video_info::GstVideoInfo;
 
 pub enum Command {
     InputDevice(String),
-    VideoInfo(GstVideoInfo),
+    VideoInfo(Box<GstVideoInfo>),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -159,15 +161,15 @@ impl<T: Clone> MaybeRecv<T> {
         match received {
             Some(Ok(val)) => *self = MaybeRecv::Value(val),
             Some(Err(err)) => {
-                if err == RecvTimeoutError::Timeout {
-                    if let MaybeRecv::Rx(_) = self {
-                        let MaybeRecv::Rx(recv) =
-                            std::mem::replace(self, MaybeRecv::TimedOut(mpsc::channel().1))
-                        else {
-                            unreachable!()
-                        };
-                        *self = MaybeRecv::TimedOut(recv);
-                    }
+                if err == RecvTimeoutError::Timeout
+                    && let MaybeRecv::Rx(_) = self
+                {
+                    let MaybeRecv::Rx(recv) =
+                        std::mem::replace(self, MaybeRecv::TimedOut(mpsc::channel().1))
+                    else {
+                        unreachable!()
+                    };
+                    *self = MaybeRecv::TimedOut(recv);
                 }
                 return Err(err);
             }
@@ -274,7 +276,7 @@ impl WaylandDisplay {
     }
 
     pub fn set_video_info(&self, info: GstVideoInfo) {
-        let _ = self.command_tx.send(Command::VideoInfo(info));
+        let _ = self.command_tx.send(Command::VideoInfo(Box::new(info)));
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {

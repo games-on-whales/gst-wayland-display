@@ -34,8 +34,16 @@ impl EglExtensions {
         }
 
         Some(EglExtensions {
-            create_image: unsafe { std::mem::transmute(create_image_ptr) },
-            destroy_image: unsafe { std::mem::transmute(destroy_image_ptr) },
+            create_image: unsafe {
+                std::mem::transmute::<*const std::ffi::c_void, ffi::PFN_eglCreateImageKHR>(
+                    create_image_ptr,
+                )
+            },
+            destroy_image: unsafe {
+                std::mem::transmute::<*const std::ffi::c_void, PFN_eglDestroyImageKHR>(
+                    destroy_image_ptr,
+                )
+            },
         })
     }
 
@@ -52,6 +60,9 @@ pub struct EGLImage {
 }
 
 impl EGLImage {
+    /// The raw handle is not dereferenced in Rust and EGL displays are usable from any
+    /// thread, so sharing it is sound even though a raw pointer is neither `Send` nor `Sync`.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn from(dmabuf: &Dmabuf, egl_display: &EGLDisplay) -> Result<Self, String> {
         // Get dmabuf properties
         let width = dmabuf.width();
@@ -125,7 +136,7 @@ impl EGLImage {
         if egl_image != ffi::EGL_NO_IMAGE_KHR {
             Ok(EGLImage {
                 image: egl_image,
-                egl_display: Arc::new(egl_display.clone()),
+                egl_display: Arc::new(*egl_display),
                 egl_extensions,
             })
         } else {
@@ -421,7 +432,10 @@ impl CUDAContext {
         }
     }
 
-    pub fn new_from_gstreamer(
+    /// # Safety
+    ///
+    /// `cuda_raw_ptr` must be a valid slot that only the `gst_cuda_*` helpers have filled.
+    pub unsafe fn new_from_gstreamer(
         element: &Element,
         default_device_id: c_int,
         cuda_raw_ptr: *mut *mut GstCudaContext,
@@ -440,7 +454,10 @@ impl CUDAContext {
         }
     }
 
-    pub fn new_from_set_context(
+    /// # Safety
+    ///
+    /// `cuda_raw_ptr` must be a valid slot that only the `gst_cuda_*` helpers have filled.
+    pub unsafe fn new_from_set_context(
         element: &Element,
         context: &Context,
         default_device_id: c_int,
@@ -622,19 +639,22 @@ mod tests {
                 if let gst::MessageView::NeedContext(_) = msg.view() {
                     // Both outlive the pipeline run below.
                     let stored = unsafe { &*(stored_addr as *const Mutex<Option<CUDAContext>>) };
-                    let ctx = CUDAContext::new_from_set_context(
-                        &handler_element,
-                        &handler_context,
-                        -1,
-                        slot_addr as *mut *mut GstCudaContext,
-                    )
-                    .unwrap();
+                    let ctx = unsafe {
+                        CUDAContext::new_from_set_context(
+                            &handler_element,
+                            &handler_context,
+                            -1,
+                            slot_addr as *mut *mut GstCudaContext,
+                        )
+                        .unwrap()
+                    };
                     stored.lock().unwrap().get_or_insert(ctx);
                 }
                 gst::BusSyncReply::Drop
             });
 
-            let outer = CUDAContext::new_from_gstreamer(&element, -1, slot.as_ptr()).unwrap();
+            let outer =
+                unsafe { CUDAContext::new_from_gstreamer(&element, -1, slot.as_ptr()) }.unwrap();
             assert_eq!(outer.as_ptr(), app_cuda);
             assert!(
                 stored.lock().unwrap().is_some(),
@@ -666,8 +686,9 @@ mod tests {
         let baseline = ref_count(app_cuda);
 
         let slot = AtomicPtr::<GstCudaContext>::new(std::ptr::null_mut());
-        let wrapper =
-            CUDAContext::new_from_set_context(&element, &app_context, -1, slot.as_ptr()).unwrap();
+        let wrapper = unsafe {
+            CUDAContext::new_from_set_context(&element, &app_context, -1, slot.as_ptr()).unwrap()
+        };
         assert_eq!(wrapper.as_ptr(), app_cuda);
         let with_both = ref_count(app_cuda);
         assert!(

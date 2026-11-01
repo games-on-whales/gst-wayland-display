@@ -15,8 +15,10 @@
 //! **LINEAR** NV12 modifier -- radv reports `STORAGE=false` for the tiled modifiers. But
 //! a tiled modifier *does* support `TRANSFER_DST`, and a `vkCmdCopyImage` goes through
 //! radv's tiling-maintaining path. So for a **tiled** modifier we:
-//!   1. compute RGBA -> NV12 into a LINEAR *scratch* image (storage works there), then
+//!   1. compute RGBA -> NV12 into a LINEAR *scratch* image (storage works
+//!      there), then
 //!   2. copy scratch -> the tiled export image.
+//!
 //! When the negotiated modifier is **LINEAR** the export image itself supports `STORAGE`,
 //! so the compute shader writes it **directly** -- no scratch, no copy (one fewer
 //! full-frame write of bandwidth per frame). Selected per instance in [`VulkanNv12::new`].
@@ -381,7 +383,8 @@ fn supported_modifiers(target_minor: Option<u32>, fmt: PixFmt) -> &'static [u64]
     /// frequent and each probe creates a Vulkan instance under the cache lock.
     const RETRY_FAILED: std::time::Duration = std::time::Duration::from_secs(5);
     type Probe = Result<&'static [u64], std::time::Instant>;
-    static CACHE: OnceLock<Mutex<Vec<(Option<u32>, PixFmt, Probe)>>> = OnceLock::new();
+    type ProbeCache = OnceLock<Mutex<Vec<(Option<u32>, PixFmt, Probe)>>>;
+    static CACHE: ProbeCache = OnceLock::new();
     let mut guard = CACHE.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
     let cached = guard
         .iter()
@@ -1306,7 +1309,7 @@ impl VulkanNv12 {
             }
             None => {
                 self.busy_drops = self.busy_drops.saturating_add(1);
-                if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
+                if self.busy_drops == 1 || self.busy_drops.is_multiple_of(60) {
                     tracing::warn!(
                         busy_drops = self.busy_drops,
                         changing_color,
@@ -1450,8 +1453,12 @@ impl VulkanNv12 {
             0,
             std::slice::from_raw_parts(pc.as_ptr() as *const u8, 8),
         );
-        self.device
-            .cmd_dispatch(cmd, (self.width / 2 + 7) / 8, (self.height / 2 + 7) / 8, 1);
+        self.device.cmd_dispatch(
+            cmd,
+            (self.width / 2).div_ceil(8),
+            (self.height / 2).div_ceil(8),
+            1,
+        );
 
         // Hand the RGBA import back to GLES once the compute has read it.
         let release_import = img_barrier(
@@ -3001,12 +3008,13 @@ mod conversion_tests {
 
     /// Convert a solid `rgb` frame with `color` and return every (Y, Cb, Cr) sample code
     /// (P010: the 10-bit code, after checking the low 6 bits are zero).
+    type SolidPlanes = (Vec<u16>, Vec<(u16, u16)>);
     fn convert_solid(
         node: DrmNode,
         fmt: PixFmt,
         rgb: [f32; 3],
         color: FrameColor,
-    ) -> Option<(Vec<u16>, Vec<(u16, u16)>)> {
+    ) -> Option<SolidPlanes> {
         let src = solid_fp16(node, rgb)?;
         let drm_format = match fmt {
             PixFmt::Nv12 => "NV12",
