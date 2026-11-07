@@ -1,0 +1,32 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 92e8b3d..6841983 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -755,6 +755,15 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+     return GST_FLOW_ERROR;
+   }
+ 
++  /* PATCH: create the DPB pool here (after the encoder is started) instead of in
++   * propose_allocation. Under interpipesrc the allocation query reaches the encoder before
++   * its caps/set_format event, so the encoder is not yet started and create_dpb_pool fails. */
++  if (!gst_vulkan_encoder_create_dpb_pool (self->encoder, in_state->caps)) {
++    GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
++        ("Unable to create the dpb pool"), (NULL));
++    return GST_FLOW_ERROR;
++  }
++
+   /* quality configuration */
+   {
+     self->rc.quality = gst_vulkan_encoder_quality_level (self->encoder);
+@@ -1910,11 +1919,6 @@ gst_vulkan_h264_encoder_propose_allocation (GstVideoEncoder * venc,
+   if (pool)
+     gst_object_unref (pool);
+ 
+-  if (!gst_vulkan_encoder_create_dpb_pool (self->encoder, caps)) {
+-    GST_ERROR_OBJECT (self, "Unable to create the dpb pool");
+-    return FALSE;
+-  }
+-
+   return TRUE;
+ }
+ 

@@ -1,7 +1,4 @@
-use smithay::{
-    delegate_drm_syncobj,
-    wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState},
-};
+use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
 
 use crate::comp::State;
 
@@ -10,5 +7,3 @@ impl DrmSyncobjHandler for State {
         self.drm_syncobj_state.as_mut()
     }
 }
-
-delegate_drm_syncobj!(State);

@@ -1,0 +1,75 @@
+From 994cf8fcace9253c4213557d0e3673a770d82ed6 Mon Sep 17 00:00:00 2001
+From: Eli Bosley <eli@bosley.dev>
+Date: Tue, 27 Oct 2026 14:25:38 -0400
+Subject: [PATCH] va: preserve negotiated HEVC color description and Main10
+ profile
+
+---
+ .../gst-plugins-bad/sys/va/gstvah265color.h   | 26 +++++++++++++++++++
+ .../gst-plugins-bad/sys/va/gstvah265enc.c     |  6 ++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 subprojects/gst-plugins-bad/sys/va/gstvah265color.h
+
+diff --git a/subprojects/gst-plugins-bad/sys/va/gstvah265color.h b/subprojects/gst-plugins-bad/sys/va/gstvah265color.h
+new file mode 100644
+index 0000000..0438dbe
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/va/gstvah265color.h
+@@ -0,0 +1,26 @@
++/* Internal HEVC color-description policy. LGPL-2.1-or-later. */
++#pragma once
++
++#include <gst/codecparsers/gsth265parser.h>
++#include <gst/video/video.h>
++
++static inline void
++gst_va_h265_fill_colorimetry (GstH265VUIParams * vui,
++    const GstVideoColorimetry * color)
++{
++  /* Pixel storage does not identify a transfer function. Preserve negotiated
++   * colorimetry for SDR and HDR without inventing missing mastering data. */
++  vui->colour_description_present_flag =
++      color->primaries != GST_VIDEO_COLOR_PRIMARIES_UNKNOWN ||
++      color->transfer != GST_VIDEO_TRANSFER_UNKNOWN ||
++      color->matrix != GST_VIDEO_COLOR_MATRIX_UNKNOWN;
++  vui->video_signal_type_present_flag =
++      vui->colour_description_present_flag ||
++      color->range != GST_VIDEO_COLOR_RANGE_UNKNOWN;
++  vui->video_format = 5; /* Unspecified source format. */
++  vui->video_full_range_flag = color->range == GST_VIDEO_COLOR_RANGE_0_255;
++  vui->colour_primaries = gst_video_color_primaries_to_iso (color->primaries);
++  vui->transfer_characteristics =
++      gst_video_transfer_function_to_iso (color->transfer);
++  vui->matrix_coefficients = gst_video_color_matrix_to_iso (color->matrix);
++}
+diff --git a/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c b/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c
+index ea04b9b..12448e2 100644
+--- a/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c
++++ b/subprojects/gst-plugins-bad/sys/va/gstvah265enc.c
+@@ -63,6 +63,7 @@
+ #endif
+ 
+ #include "gstvah265enc.h"
++#include "gstvah265color.h"
+ 
+ #include <gst/codecparsers/gsth265bitwriter.h>
+ #include <gst/va/gstva.h>
+@@ -901,6 +902,9 @@ _h265_fill_sps (GstVaH265Enc * self,
+   };
+   /* *INDENT-ON* */
+ 
++  gst_va_h265_fill_colorimetry (&self->sps_hdr.vui_params,
++      &GST_VA_BASE_ENC (self)->in_info.colorimetry);
++
+   if (!_h265_fill_ptl (self, seq_param, &self->sps_hdr.profile_tier_level))
+     return FALSE;
+ 
+@@ -1331,7 +1335,7 @@ _h265_fill_sequence_parameter (GstVaH265Enc * self,
+       profile_idc = GST_H265_PROFILE_IDC_MAIN;
+       break;
+     case VAProfileHEVCMain10:
+-      profile_idc = GST_H265_PROFILE_IDC_MAIN;
++      profile_idc = GST_H265_PROFILE_IDC_MAIN_10;
+       break;
+     case VAProfileHEVCMain12:
+     case VAProfileHEVCMain422_10:

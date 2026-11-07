@@ -1,0 +1,530 @@
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.cpp b/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.cpp
+index bc5c235..4c03a01 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.cpp
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.cpp
+@@ -119,8 +119,8 @@ struct _GstCudaMemoryPrivate
+ 
+   gint texture_align = 0;
+ 
+-  /* Per plane, and point/linear sampling textures respectively  */
+-  CUtexObject texture[GST_VIDEO_MAX_PLANES][2];
++  /* Per plane, point/linear sampling, and ordinary/sRGB decode. */
++  CUtexObject texture[GST_VIDEO_MAX_PLANES][2][2];
+ 
+   gboolean saw_io = FALSE;
+   gboolean from_fixed_pool = FALSE;
+@@ -394,8 +394,9 @@ gst_cuda_allocator_free (GstAllocator * allocator, GstMemory * memory)
+ 
+   for (guint i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+     for (guint j = 0; j < 2; j++) {
+-      if (priv->texture[i][j]) {
+-        CuTexObjectDestroy (priv->texture[i][j]);
++      for (guint k = 0; k < 2; k++) {
++        if (priv->texture[i][j][k])
++          CuTexObjectDestroy (priv->texture[i][j][k]);
+       }
+     }
+   }
+@@ -835,6 +836,14 @@ static const TextureFormat format_map[] = {
+ gboolean
+ gst_cuda_memory_get_texture (GstCudaMemory * mem, guint plane,
+     CUfilter_mode filter_mode, CUtexObject * texture)
++{
++  return gst_cuda_memory_get_texture_with_flags (mem, plane, filter_mode, 0,
++      texture);
++}
++
++gboolean
++gst_cuda_memory_get_texture_with_flags (GstCudaMemory * mem, guint plane,
++    CUfilter_mode filter_mode, guint texture_flags, CUtexObject * texture)
+ {
+   GstAllocator *alloc;
+   GstCudaMemoryPrivate *priv;
+@@ -844,18 +853,21 @@ gst_cuda_memory_get_texture (GstCudaMemory * mem, guint plane,
+   CUDA_TEXTURE_DESC texture_desc;
+   const TextureFormat *format = nullptr;
+   CUresult ret;
++  guint srgb_index;
+ 
+   g_return_val_if_fail (gst_is_cuda_memory ((GstMemory *) mem), FALSE);
+   g_return_val_if_fail (plane < GST_VIDEO_INFO_N_PLANES (&mem->info), FALSE);
+   g_return_val_if_fail (filter_mode == CU_TR_FILTER_MODE_POINT ||
+       filter_mode == CU_TR_FILTER_MODE_LINEAR, FALSE);
++  g_return_val_if_fail ((texture_flags & ~CU_TRSF_SRGB) == 0, FALSE);
+ 
+   alloc = mem->mem.allocator;
+   priv = mem->priv;
++  srgb_index = (texture_flags & CU_TRSF_SRGB) != 0;
+ 
+   std::lock_guard < std::mutex > lk (priv->lock);
+-  if (priv->texture[plane][filter_mode]) {
+-    *texture = priv->texture[plane][filter_mode];
++  if (priv->texture[plane][filter_mode][srgb_index]) {
++    *texture = priv->texture[plane][filter_mode][srgb_index];
+     return TRUE;
+   }
+ 
+@@ -896,7 +908,7 @@ gst_cuda_memory_get_texture (GstCudaMemory * mem, guint plane,
+   /* Will read texture value as a normalized [0, 1] float value
+    * with [0, 1) coordinates */
+   /* CU_TRSF_NORMALIZED_COORDINATES */
+-  texture_desc.flags = 0x2;
++  texture_desc.flags = CU_TRSF_NORMALIZED_COORDINATES | texture_flags;
+   /* CU_TR_ADDRESS_MODE_CLAMP */
+   texture_desc.addressMode[0] = (CUaddress_mode) 1;
+   texture_desc.addressMode[1] = (CUaddress_mode) 1;
+@@ -914,7 +926,7 @@ gst_cuda_memory_get_texture (GstCudaMemory * mem, guint plane,
+   }
+ 
+   /* Cache this texture to reuse later */
+-  priv->texture[plane][filter_mode] = tex;
++  priv->texture[plane][filter_mode][srgb_index] = tex;
+ 
+   *texture = tex;
+ 
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h b/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h
+index 6b0bed6..e3a70d7 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/cuda/gstcudamemory.h
+@@ -256,6 +256,13 @@ gboolean        gst_cuda_memory_get_texture (GstCudaMemory * mem,
+                                              CUfilter_mode filter_mode,
+                                              CUtexObject * texture);
+ 
++GST_CUDA_API
++gboolean        gst_cuda_memory_get_texture_with_flags (GstCudaMemory * mem,
++                                                        guint plane,
++                                                        CUfilter_mode filter_mode,
++                                                        guint texture_flags,
++                                                        CUtexObject * texture);
++
+ GST_CUDA_API
+ gpointer        gst_cuda_memory_get_user_data (GstCudaMemory * mem);
+ 
+@@ -405,4 +412,3 @@ void                   gst_cuda_register_allocator_need_pool_callback (GstCudaMe
+                                                                        GDestroyNotify notify);
+ 
+ G_END_DECLS
+-
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/cuda/stub/cuda.h b/subprojects/gst-plugins-bad/gst-libs/gst/cuda/stub/cuda.h
+index 0cef000..798ea52 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/cuda/stub/cuda.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/cuda/stub/cuda.h
+@@ -121,6 +121,7 @@ typedef enum
+ {
+   CU_AD_FORMAT_UNSIGNED_INT8  = 1,
+   CU_AD_FORMAT_UNSIGNED_INT16 = 2,
++  CU_AD_FORMAT_FLOAT = 0x20,
+ } CUarray_format;
+ 
+ typedef enum
+@@ -506,7 +507,9 @@ typedef struct
+ 
+ #define cuEventDestroy cuEventDestroy_v2
+ 
+-#define CU_TRSF_READ_AS_INTEGER 1
++#define CU_TRSF_READ_AS_INTEGER 0x01
++#define CU_TRSF_NORMALIZED_COORDINATES 0x02
++#define CU_TRSF_SRGB 0x10
+ 
+ G_END_DECLS
+ 
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstcudaconverter.cpp b/subprojects/gst-plugins-bad/sys/nvcodec/gstcudaconverter.cpp
+index 1d40bdb..162aacb 100644
+--- a/subprojects/gst-plugins-bad/sys/nvcodec/gstcudaconverter.cpp
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstcudaconverter.cpp
+@@ -24,6 +24,9 @@
+ #include "gstcudaconverter.h"
+ #include <gst/cuda/gstcuda-private.h>
+ #include <gst/cuda/gstcudanvrtc-private.h>
++#include <algorithm>
++#include <array>
++#include <cmath>
+ #include <string.h>
+ #include <mutex>
+ #include <unordered_map>
+@@ -50,6 +53,23 @@ GST_DEBUG_CATEGORY_STATIC (gst_cuda_converter_debug);
+ #define CUDA_BLOCK_Y 16
+ #define DIV_UP(size,block) (((size) + ((block) - 1)) / (block))
+ 
++#define PQ_TRANSFER_LUT_SIZE 1024
++
++static constexpr float BT2408_GRAPHICS_WHITE = 203.0f / 10000.0f;
++
++static float
++pq_oetf_reference (float value)
++{
++  constexpr float m1 = 0.1593017578125f;
++  constexpr float m2 = 78.84375f;
++  constexpr float c1 = 0.8359375f;
++  constexpr float c2 = 18.8515625f;
++  constexpr float c3 = 18.6875f;
++  float p = std::pow (std::max (value, 0.0f), m1);
++
++  return std::pow ((c1 + c2 * p) / (1.0f + c3 * p), m2);
++}
++
+ /* from GstD3D11 */
+ struct GstCudaColorMatrix
+ {
+@@ -646,6 +666,7 @@ struct ConstBuffer
+   float alpha;
+   int do_blend;
+   int do_convert;
++  int transfer_mode;
+   float transform_u[2];
+   float transform_v[2];
+   float transform_offset[2];
+@@ -786,6 +807,10 @@ struct _GstCudaConverterPrivate
+   CUmodule unpack_module = nullptr;
+   CUfunction unpack_func = nullptr;
+ 
++  CUdeviceptr pq_transfer_lut = 0;
++  gsize pq_transfer_lut_pitch = 0;
++  CUtexObject pq_transfer_texture = 0;
++
+   gboolean update_const_buf = FALSE;
+   gint prev_src_width = 0;
+   gint prev_src_height = 0;
+@@ -889,6 +914,16 @@ gst_cuda_converter_dispose (GObject * object)
+   auto stream = gst_cuda_stream_get_handle (priv->stream);
+ 
+   if (self->context && gst_cuda_context_push (self->context)) {
++    if (priv->pq_transfer_texture) {
++      CuTexObjectDestroy (priv->pq_transfer_texture);
++      priv->pq_transfer_texture = 0;
++    }
++
++    if (priv->pq_transfer_lut) {
++      CuMemFree (priv->pq_transfer_lut);
++      priv->pq_transfer_lut = 0;
++    }
++
+     if (priv->unpack_module) {
+       CuModuleUnload (priv->unpack_module);
+       priv->unpack_module = nullptr;
+@@ -913,6 +948,63 @@ gst_cuda_converter_dispose (GObject * object)
+   G_OBJECT_CLASS (parent_class)->dispose (object);
+ }
+ 
++static gboolean
++gst_cuda_converter_upload_pq_transfer_texture (GstCudaConverter * self)
++{
++  auto priv = self->priv;
++  std::array < float, PQ_TRANSFER_LUT_SIZE > pq_lut;
++  CUDA_RESOURCE_DESC resource_desc = { };
++  CUDA_TEXTURE_DESC texture_desc = { };
++
++  if (priv->pq_transfer_texture)
++    return TRUE;
++
++  for (size_t i = 0; i < pq_lut.size (); i++) {
++    float coordinate = (float) i / (pq_lut.size () - 1);
++    pq_lut[i] = pq_oetf_reference (BT2408_GRAPHICS_WHITE * coordinate *
++        coordinate);
++  }
++
++  if (!gst_cuda_result (CuMemAllocPitch (&priv->pq_transfer_lut,
++              &priv->pq_transfer_lut_pitch, sizeof (pq_lut), 1,
++              sizeof (float)))) {
++    GST_ERROR_OBJECT (self, "Could not allocate the PQ transfer LUT");
++    return FALSE;
++  }
++
++  if (!gst_cuda_result (CuMemcpyHtoD (priv->pq_transfer_lut,
++              pq_lut.data (), sizeof (pq_lut)))) {
++    GST_ERROR_OBJECT (self, "Could not upload the PQ transfer LUT");
++    CuMemFree (priv->pq_transfer_lut);
++    priv->pq_transfer_lut = 0;
++    return FALSE;
++  }
++
++  resource_desc.resType = CU_RESOURCE_TYPE_PITCH2D;
++  resource_desc.res.pitch2D.format = CU_AD_FORMAT_FLOAT;
++  resource_desc.res.pitch2D.numChannels = 1;
++  resource_desc.res.pitch2D.width = pq_lut.size ();
++  resource_desc.res.pitch2D.height = 1;
++  resource_desc.res.pitch2D.pitchInBytes = priv->pq_transfer_lut_pitch;
++  resource_desc.res.pitch2D.devPtr = priv->pq_transfer_lut;
++
++  texture_desc.filterMode = CU_TR_FILTER_MODE_LINEAR;
++  texture_desc.flags = CU_TRSF_NORMALIZED_COORDINATES;
++  texture_desc.addressMode[0] = CU_TR_ADDRESS_MODE_CLAMP;
++  texture_desc.addressMode[1] = CU_TR_ADDRESS_MODE_CLAMP;
++
++  if (!gst_cuda_result (CuTexObjectCreate (&priv->pq_transfer_texture,
++              &resource_desc, &texture_desc, nullptr))) {
++    GST_ERROR_OBJECT (self, "Could not create the PQ transfer texture");
++    CuMemFree (priv->pq_transfer_lut);
++    priv->pq_transfer_lut = 0;
++    return FALSE;
++  }
++
++  GST_INFO_OBJECT (self, "Uploaded hardware-interpolated PQ transfer texture");
++  return TRUE;
++}
++
+ static void
+ gst_cuda_converter_finalize (GObject * object)
+ {
+@@ -1422,7 +1514,21 @@ gst_cuda_converter_setup (GstCudaConverter * self)
+         border_color_matrix.min[i], border_color_matrix.max[i]);
+   }
+ 
+-  /* FIXME: handle primaries and transfer functions */
++  /*
++   * NVENC accepts P010, but a matrix-only RGB -> YUV conversion cannot turn
++   * an sRGB compositor frame into an HDR10 signal. Select the matching CUDA
++   * transfer/gamut stage when an HDR transport requests BT.2100/PQ output.
++   * Already-PQ input remains a strict passthrough.
++   */
++  priv->const_buf->transfer_mode = 0;
++  if (out_color->transfer == GST_VIDEO_TRANSFER_SMPTE2084 &&
++      in_color->transfer != GST_VIDEO_TRANSFER_SMPTE2084 &&
++      GST_VIDEO_INFO_IS_RGB (texture_info)) {
++    priv->const_buf->transfer_mode = 1;
++    GST_INFO_OBJECT (self,
++        "Enabling sRGB/BT.709 to BT.2020/PQ CUDA conversion");
++  }
++
+   priv->const_buf->do_convert = 0;
+   if (GST_VIDEO_INFO_IS_RGB (texture_info)) {
+     if (GST_VIDEO_INFO_IS_RGB (out_info)) {
+@@ -1782,6 +1888,14 @@ gst_cuda_converter_new (const GstVideoInfo * in_info,
+   if (!gst_cuda_converter_setup (self))
+     goto error;
+ 
++  if (!gst_cuda_context_push (context))
++    goto error;
++  if (!gst_cuda_converter_upload_pq_transfer_texture (self)) {
++    gst_cuda_context_pop (nullptr);
++    goto error;
++  }
++  gst_cuda_context_pop (nullptr);
++
+   priv->texture_align = gst_cuda_context_get_texture_alignment (context);
+ 
+   gst_object_ref_sink (self);
+@@ -1835,7 +1949,8 @@ gst_cuda_converter_unpack_rgb (GstCudaConverter * self,
+ 
+ static gboolean
+ gst_cuda_converter_copy_to_fallback (GstCudaConverter * self,
+-    GstVideoFrame * in_frame, CUstream stream, CUtexObject * texture)
++    GstVideoFrame * in_frame, CUstream stream, guint texture_flags,
++    CUtexObject * texture)
+ {
+   auto priv = self->priv;
+   gboolean ret = FALSE;
+@@ -1867,8 +1982,8 @@ gst_cuda_converter_copy_to_fallback (GstCudaConverter * self,
+       goto out;
+     }
+ 
+-    if (!gst_cuda_memory_get_texture (priv->fallback_mem, 0, priv->filter_mode,
+-            &texture[i])) {
++    if (!gst_cuda_memory_get_texture_with_flags (priv->fallback_mem, 0,
++            priv->filter_mode, i == 0 ? texture_flags : 0, &texture[i])) {
+       GST_ERROR_OBJECT (self, "Couldn't get texture %d", i);
+       goto out;
+     }
+@@ -1899,6 +2014,7 @@ gst_cuda_converter_convert_frame (GstCudaConverter * converter,
+   GstCudaMemory *cmem;
+   gint off_x = 0;
+   gint off_y = 0;
++  guint texture_flags = 0;
+ 
+   g_return_val_if_fail (GST_IS_CUDA_CONVERTER (converter), FALSE);
+   g_return_val_if_fail (src_frame != nullptr, FALSE);
+@@ -1910,12 +2026,35 @@ gst_cuda_converter_convert_frame (GstCudaConverter * converter,
+   g_assert (format);
+ 
+   std::lock_guard < std::mutex > lk (priv->lock);
++
++  /*
++   * Unraid Beam keeps CUDA allocation caps stable across SDR/PQ content
++   * transitions. Prefer its per-frame transfer metadata when present so the
++   * same converter and pool can safely alternate SDR->PQ conversion and
++   * already-PQ passthrough without renegotiation.
++   */
++  /* Source metadata selects conversion only within an HDR RGB transport.
++   * Applying SDR->PQ to an SDR output stores PQ values under SDR VUI, lifting
++   * blacks and dimming whites even when the client negotiated HDR off. */
++  if (priv->out_info.colorimetry.transfer == GST_VIDEO_TRANSFER_SMPTE2084 &&
++      GST_VIDEO_INFO_IS_RGB (&priv->texture_info)) {
++    if (GstCustomMeta *meta = gst_buffer_get_custom_meta (src_frame->buffer,
++            "UnraidBeamSourceColorMeta")) {
++      const GstStructure *s = gst_custom_meta_get_structure (meta);
++      gboolean pq_passthrough = FALSE;
++      if (gst_structure_get_boolean (s, "pq-passthrough", &pq_passthrough))
++        priv->const_buf->transfer_mode = pq_passthrough ? 0 : 1;
++    }
++  }
++  if (priv->const_buf->transfer_mode == 1)
++    texture_flags = CU_TRSF_SRGB;
++
+   if (!priv->fill_border && (priv->dest_width <= 0 || priv->dest_height <= 0))
+     return TRUE;
+ 
+   gpointer args[] = { &texture[0], &texture[1], &texture[2], &texture[3],
+     &dst[0], &dst[1], &dst[2], &dst[3], &stride[0], &stride[1],
+-    priv->const_buf, &off_x, &off_y
++    priv->const_buf, &priv->pq_transfer_texture, &off_x, &off_y
+   };
+ 
+   cmem = (GstCudaMemory *) gst_buffer_peek_memory (src_frame->buffer, 0);
+@@ -1974,8 +2113,8 @@ gst_cuda_converter_convert_frame (GstCudaConverter * converter,
+       }
+     }
+ 
+-    if (!gst_cuda_memory_get_texture (priv->fallback_mem, 0, priv->filter_mode,
+-            &texture[0])) {
++    if (!gst_cuda_memory_get_texture_with_flags (priv->fallback_mem, 0,
++            priv->filter_mode, texture_flags, &texture[0])) {
+       GST_ERROR_OBJECT (converter, "Couldn't get unpack texture");
+       goto out;
+     }
+@@ -1985,8 +2124,9 @@ gst_cuda_converter_convert_frame (GstCudaConverter * converter,
+   } else {
+     gboolean need_fallback = FALSE;
+     for (i = 0; i < GST_VIDEO_FRAME_N_PLANES (src_frame); i++) {
+-      if (!gst_cuda_memory_get_texture (cmem,
+-              i, priv->filter_mode, &texture[i])) {
++      if (!gst_cuda_memory_get_texture_with_flags (cmem,
++              i, priv->filter_mode, i == 0 ? texture_flags : 0,
++              &texture[i])) {
+         need_fallback = TRUE;
+         need_sync = TRUE;
+         break;
+@@ -2017,7 +2157,7 @@ gst_cuda_converter_convert_frame (GstCudaConverter * converter,
+       }
+ 
+       if (!gst_cuda_converter_copy_to_fallback (converter,
+-              src_frame, stream, texture)) {
++              src_frame, stream, texture_flags, texture)) {
+         goto out;
+       }
+     }
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/kernel/gstcudaconverter.cu b/subprojects/gst-plugins-bad/sys/nvcodec/kernel/gstcudaconverter.cu
+index ec484d5..3dca67c 100644
+--- a/subprojects/gst-plugins-bad/sys/nvcodec/kernel/gstcudaconverter.cu
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/kernel/gstcudaconverter.cu
+@@ -47,6 +47,7 @@ struct ConstBuffer
+   float alpha;
+   int do_blend;
+   int do_convert;
++  int transfer_mode;
+   float transform_u[2];
+   float transform_v[2];
+   float transform_offset[2];
+@@ -72,6 +73,31 @@ clamp3 (float3 val, const float min_val[3], const float max_val[3])
+       clamp (val.z, min_val[1], max_val[2]));
+ }
+ 
++__device__ inline float
++pq_oetf (cudaTextureObject_t pq_transfer_texture, float value)
++{
++  const float size = 1024.0f;
++  float coordinate = sqrtf (clamp (value, 0.0f, 1.0f));
++  float texel = (coordinate * (size - 1.0f) + 0.5f) / size;
++  return tex2D<float> (pq_transfer_texture, texel, 0.5f);
++}
++
++__device__ inline float3
++linear_bt709_to_bt2100_pq (float3 sample,
++    cudaTextureObject_t pq_transfer_texture)
++{
++  /* CU_TRSF_SRGB already decoded the sampled RGB into linear light. */
++  float3 bt2020 = make_float3 (
++      0.6274040f * sample.x + 0.3292820f * sample.y + 0.0433136f * sample.z,
++      0.0690970f * sample.x + 0.9195400f * sample.y + 0.0113612f * sample.z,
++      0.0163916f * sample.x + 0.0880132f * sample.y + 0.8955950f * sample.z);
++
++  /* BT.2408 graphics white: SDR 1.0 is 203 nits in a 10,000-nit PQ code space. */
++  return make_float3 (pq_oetf (pq_transfer_texture, bt2020.x),
++      pq_oetf (pq_transfer_texture, bt2020.y),
++      pq_oetf (pq_transfer_texture, bt2020.z));
++}
++
+ __device__ inline unsigned char
+ scale_to_2bits (float val)
+ {
+@@ -1358,7 +1384,8 @@ __global__ void
+ GstCudaConverterMain (cudaTextureObject_t tex0, cudaTextureObject_t tex1,
+     cudaTextureObject_t tex2, cudaTextureObject_t tex3, unsigned char * dst0,
+     unsigned char * dst1, unsigned char * dst2, unsigned char * dst3,
+-    int stride0, int stride1, ConstBuffer const_buf, int off_x, int off_y)
++    int stride0, int stride1, ConstBuffer const_buf,
++    cudaTextureObject_t pq_transfer_texture, int off_x, int off_y)
+ {
+   ConvertSimple g_converter;
+   SAMPLER g_sampler;
+@@ -1389,6 +1416,8 @@ GstCudaConverterMain (cudaTextureObject_t tex0, cudaTextureObject_t tex1,
+         fmaf (y, const_buf.transform_v[1], const_buf.transform_offset[1]));
+     float4 s = g_sampler.Execute (tex0, tex1, tex2, tex3, rotated.x, rotated.y);
+     float3 rgb = make_float3 (s.x, s.y, s.z);
++    if (const_buf.transfer_mode == 1)
++      rgb = linear_bt709_to_bt2100_pq (rgb, pq_transfer_texture);
+     float3 yuv;
+     if (const_buf.do_convert)
+       yuv = g_converter.Execute (rgb, &const_buf.matrix);
+@@ -1435,6 +1464,7 @@ static const char GstCudaConverterMain_str[] =
+ "  float alpha;\n"
+ "  int do_blend;\n"
+ "  int do_convert;\n"
++"  int transfer_mode;\n"
+ "  float transform_u[2];\n"
+ "  float transform_v[2];\n"
+ "  float transform_offset[2];\n"
+@@ -1460,6 +1490,28 @@ static const char GstCudaConverterMain_str[] =
+ "      clamp (val.z, min_val[1], max_val[2]));\n"
+ "}\n"
+ "\n"
++"__device__ inline float\n"
++"pq_oetf (cudaTextureObject_t pq_transfer_texture, float value)\n"
++"{\n"
++"  const float size = 1024.0f;\n"
++"  float coordinate = sqrtf (clamp (value, 0.0f, 1.0f));\n"
++"  float texel = (coordinate * (size - 1.0f) + 0.5f) / size;\n"
++"  return tex2D<float> (pq_transfer_texture, texel, 0.5f);\n"
++"}\n"
++"\n"
++"__device__ inline float3\n"
++"linear_bt709_to_bt2100_pq (float3 sample,\n"
++"    cudaTextureObject_t pq_transfer_texture)\n"
++"{\n"
++"  float3 bt2020 = make_float3 (\n"
++"      0.6274040f * sample.x + 0.3292820f * sample.y + 0.0433136f * sample.z,\n"
++"      0.0690970f * sample.x + 0.9195400f * sample.y + 0.0113612f * sample.z,\n"
++"      0.0163916f * sample.x + 0.0880132f * sample.y + 0.8955950f * sample.z);\n"
++"  return make_float3 (pq_oetf (pq_transfer_texture, bt2020.x),\n"
++"      pq_oetf (pq_transfer_texture, bt2020.y),\n"
++"      pq_oetf (pq_transfer_texture, bt2020.z));\n"
++"}\n"
++"\n"
+ "__device__ inline unsigned char\n"
+ "scale_to_2bits (float val)\n"
+ "{\n"
+@@ -2746,7 +2798,8 @@ static const char GstCudaConverterMain_str[] =
+ "GstCudaConverterMain (cudaTextureObject_t tex0, cudaTextureObject_t tex1,\n"
+ "    cudaTextureObject_t tex2, cudaTextureObject_t tex3, unsigned char * dst0,\n"
+ "    unsigned char * dst1, unsigned char * dst2, unsigned char * dst3,\n"
+-"    int stride0, int stride1, ConstBuffer const_buf, int off_x, int off_y)\n"
++"    int stride0, int stride1, ConstBuffer const_buf,\n"
++"    cudaTextureObject_t pq_transfer_texture, int off_x, int off_y)\n"
+ "{\n"
+ "  ConvertSimple g_converter;\n"
+ "  SAMPLER g_sampler;\n"
+@@ -2777,6 +2830,8 @@ static const char GstCudaConverterMain_str[] =
+ "        fmaf (y, const_buf.transform_v[1], const_buf.transform_offset[1]));\n"
+ "    float4 s = g_sampler.Execute (tex0, tex1, tex2, tex3, rotated.x, rotated.y);\n"
+ "    float3 rgb = make_float3 (s.x, s.y, s.z);\n"
++"    if (const_buf.transfer_mode == 1)\n"
++"      rgb = linear_bt709_to_bt2100_pq (rgb, pq_transfer_texture);\n"
+ "    float3 yuv;\n"
+ "    if (const_buf.do_convert)\n"
+ "      yuv = g_converter.Execute (rgb, &const_buf.matrix);\n"
+@@ -2793,4 +2848,4 @@ static const char GstCudaConverterMain_str[] =
+ "}\n"
+ "}\n"
+ "\n";
+-#endif
+\ No newline at end of file
++#endif

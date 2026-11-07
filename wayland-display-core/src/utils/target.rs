@@ -22,18 +22,18 @@ impl FromStr for RenderTarget {
     }
 }
 
-impl Into<Option<DrmNode>> for RenderTarget {
-    fn into(self) -> Option<DrmNode> {
-        match self {
+impl From<RenderTarget> for Option<DrmNode> {
+    fn from(val: RenderTarget) -> Self {
+        match val {
             RenderTarget::Hardware(node) => Some(node),
             RenderTarget::Software => None,
         }
     }
 }
 
-impl Into<RenderTarget> for DrmNode {
-    fn into(self) -> RenderTarget {
-        RenderTarget::Hardware(self)
+impl From<DrmNode> for RenderTarget {
+    fn from(val: DrmNode) -> Self {
+        RenderTarget::Hardware(val)
     }
 }
 
@@ -61,12 +61,12 @@ impl RenderTarget {
                 {
                     // no idea how match nvidia device nodes to kms/dri-nodes, so lets map all nvidia-nodes to be sure
                     for entry in std::fs::read_dir("/dev").expect("Unable to access /dev") {
-                        if let Ok(entry) = entry {
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.is_file() && major(metadata.dev()) == NVIDIA_MAJOR {
-                                    devices.push(entry.path());
-                                }
-                            }
+                        if let Ok(entry) = entry
+                            && let Ok(metadata) = entry.metadata()
+                            && metadata.is_file()
+                            && major(metadata.dev()) == NVIDIA_MAJOR
+                        {
+                            devices.push(entry.path());
                         }
                     }
                 }

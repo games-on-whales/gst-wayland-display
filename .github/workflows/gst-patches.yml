@@ -1,0 +1,61 @@
+name: gstreamer patches
+
+# Builds GStreamer with the patches/ chain applied and the GStreamer unit tests
+# enabled, then runs the Vulkan tests (ci/gst-patches.sh). Without a GPU the
+# device-backed tests skip; the GPU-free ones run.
+
+on:
+  push:
+    paths:
+      - "patches/**"
+      - "ci/gst-patches.sh"
+      - "tests/va-h265-color.c"
+      - "tests/cuda-frame-color.py"
+      - ".github/workflows/gst-patches.yml"
+  pull_request:
+    paths:
+      - "patches/**"
+      - "ci/gst-patches.sh"
+      - "tests/va-h265-color.c"
+      - "tests/cuda-frame-color.py"
+      - ".github/workflows/gst-patches.yml"
+
+concurrency:
+  group: gst-patches-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gst-patches:
+    name: patch chain · build · vulkan tests
+    runs-on: ubuntu-latest
+    container:
+      # Fedora: recent enough meson/wayland/vulkan-headers to build the patched
+      # GStreamer 1.28 chain directly.
+      image: ghcr.io/games-on-whales/base-app:fedora
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          # ci/gst-patches.sh enables the Vulkan tests, not every distro codec.
+          # Install their binary build dependencies directly: builddep also loads
+          # source repositories and Cisco metadata this build does not need.
+          dnf --disablerepo='*openh264*' install -y \
+            git gcc gcc-c++ meson ninja-build flex bison nasm python3 glslc \
+            pkgconf-pkg-config glib2-devel libdrm-devel vulkan-headers \
+            vulkan-loader-devel wayland-devel wayland-protocols-devel \
+            libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel libva-devel
+
+      - name: Build patched GStreamer and run the Vulkan tests
+        run: bash ci/gst-patches.sh .gst-patches
+
+      - name: Test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gst-patches-testlog
+          path: .gst-patches/build/meson-logs/
+          if-no-files-found: ignore

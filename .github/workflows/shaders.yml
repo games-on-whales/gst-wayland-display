@@ -1,0 +1,23 @@
+name: shader sources
+on:
+  push:
+    paths: ['wayland-display-core/src/utils/shaders/**', 'ci/shaders.sh', '.github/workflows/shaders.yml']
+  pull_request:
+    paths: ['wayland-display-core/src/utils/shaders/**', 'ci/shaders.sh', '.github/workflows/shaders.yml']
+jobs:
+  shaders:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      # diffutils (cmp) is not in the archlinux:base image. The committed .spv
+      # files are byte-compared by ci/shaders.sh, so they must be checked with the
+      # glslc that generated them. Arch only keeps the current shaderc, so a
+      # version pin breaks on its next update: install from a dated Arch Linux
+      # Archive snapshot instead (shaderc 2026.4-1, glslang/spirv-tools
+      # 1.4.363.0). Move the date together with running `ci/shaders.sh --update`.
+      - run: |
+          echo 'Server = https://archive.archlinux.org/repos/2026/10/15/$repo/os/$arch' \
+            > /etc/pacman.d/mirrorlist
+          pacman -Syyuu --noconfirm git diffutils shaderc
+      - uses: actions/checkout@v4
+      - run: bash ci/shaders.sh

@@ -41,12 +41,12 @@ where
 
         CAT.log(
             Option::<&crate::waylandsrc::WaylandDisplaySrc>::None,
-            match event.metadata().level() {
-                &tracing::Level::ERROR => gst::DebugLevel::Error,
-                &tracing::Level::WARN => gst::DebugLevel::Warning,
-                &tracing::Level::INFO => gst::DebugLevel::Info,
-                &tracing::Level::DEBUG => gst::DebugLevel::Debug,
-                &tracing::Level::TRACE => gst::DebugLevel::Trace,
+            match *event.metadata().level() {
+                tracing::Level::ERROR => gst::DebugLevel::Error,
+                tracing::Level::WARN => gst::DebugLevel::Warning,
+                tracing::Level::INFO => gst::DebugLevel::Info,
+                tracing::Level::DEBUG => gst::DebugLevel::Debug,
+                tracing::Level::TRACE => gst::DebugLevel::Trace,
             },
             glib::GString::from(event.metadata().file().unwrap_or("<unknown file>")).as_gstr(),
             event.metadata().module_path().unwrap_or("<unknown module>"),

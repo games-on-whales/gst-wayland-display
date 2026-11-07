@@ -77,6 +77,24 @@ gst-launch-1.0 waylanddisplaysrc ! 'video/x-raw(memory:DMABuf),width=1920,height
 gst-launch-1.0 waylanddisplaysrc  ! 'video/x-raw(memory:DMABuf),width=1920,height=1080,framerate=60/1' ! glupload ! glcolorconvert ! 'video/x-raw(memory:GLMemory), format=NV12' ! nvh265enc ! nvh265dec ! autovideosink
 ```
 
+### NV12 / P010 dmabuf output
+
+The source can also convert to **NV12** (8-bit) or **P010** (10-bit) dmabufs itself, with a
+Vulkan compute shader, so a VA encoder or `dmabuftocuda` imports them with no `vapostproc` /
+`glcolorconvert` step. These formats are offered after RGBA and picked when downstream asks for
+them. It advertises every modifier the GPU's Vulkan can export, and negotiation lands on one the
+encoder accepts. NV12 uses the BT.601 limited-range matrix and its caps say so
+(`colorimetry=2:4:5:1`). P010 SDR output is BT.709.
+
+```bash
+gst-launch-1.0 waylanddisplaysrc ! 'video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1920,height=1080' \
+  ! vah265enc ! fakesink
+```
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `nv12` | false | Offer the NV12 dmabuf formats **first**, so a format-agnostic downstream (an unconstrained `interpipesink`) negotiates NV12 instead of RGBA, and pin the LINEAR modifier, the one a consumer behind interpipe can always import. RGBA stays offered as a fallback. |
+
 ### Support for Nvidia CUDAMemory
 
 > [!IMPORTANT]
@@ -100,6 +118,170 @@ gst-launch-1.0 waylanddisplaysrc cuda-device-id=0 ! 'video/x-raw(memory:CUDAMemo
 In order to support this we leverage `gst-cuda-1.0` which adds a single build dependency to this project.
 At runtime, you'll need to have access to `libcuda.so` but only to access and use `CUDAMemory`; you can still use
 `DMABuf` when running this plugin on a platform that doesn't support it.
+
+## Vulkan encode
+
+Vulkan encode requires GStreamer 1.28+ with the `patches/` chain applied.
+
+Setting `vulkan=true` offers NV12 and P010 as `memory:VulkanImage`. The source answers the
+downstream encoder's `gst.vulkan.device` context query with the `GstVulkanDevice` of its render
+node's GPU, and makes its output images on that device, so `vulkanh264enc` (NV12),
+`vulkanh265enc` (NV12 Main, P010 Main-10) and `vulkanav1enc` (NV12 Main) view them with no copy.
+The RGBA to NV12/P010 conversion runs as a Vulkan compute shader on that device, submitted
+through gst's own queue lock.
+
+Every source on a GPU shares that GPU's one device for the life of the process, so an encoder
+switched from one source to another (`interpipesrc listen-to=...`, as Wolf does when a session
+joins a lobby) keeps receiving images on the device it adopted. A device found lost is replaced
+for later sessions. Behind interpipe the encoder reaches the device through interpipe's
+context-query forwarding ([games-on-whales/gst-interpipe](https://github.com/games-on-whales/gst-interpipe)).
+The source never falls back to another GPU than its render node's: without a video-encode
+capable device there, `memory:VulkanImage` is unavailable.
+
+If a device offered through `set_context` lacks the converter's extensions, or a directly linked
+encoder runs on a different `VkDevice`, `memory:VulkanImage` is withdrawn and negotiation falls
+back to the dmabuf/RGBA caps (when downstream accepts them).
+
+```bash
+gst-launch-1.0 waylanddisplaysrc vulkan=true render-node=/dev/dri/renderD128 \
+  ! 'video/x-raw(memory:VulkanImage),format=NV12,width=1920,height=1080' \
+  ! vulkanh264enc ! h264parse ! fakesink
+```
+
+> [!IMPORTANT]
+> `vulkanh265enc` and `vulkanav1enc` are not upstream GStreamer elements. They ship in `patches/`
+> and have to be applied to the GStreamer tree before building; see `patches/README.md`. The
+> devcontainer applies the full patch chain for you.
+
+Pin `width` and `height` in the caps. Left open, the source fixates to 1x1 and negotiation settles
+on whatever minimum the chosen encoder advertises, which is codec-specific: `vulkanh264enc` accepts
+from 128x128 and `vulkanh265enc` from 130x128 on this driver. Both produce a valid stream, just not
+at the size you probably wanted.
+
+## HDR output
+
+HDR is delivered as a 10-bit **P010** stream tagged BT.2100 (BT.2020 primaries, SMPTE 2084 PQ
+transfer, limited range) plus static metadata, so a downstream `vulkanh265enc` (Main-10) emits the
+matching VUI and mastering-display / content-light-level SEI. NV12 (8-bit) output is never tagged
+HDR. The RGBA → P010 conversion, the tone-maps and the PQ passthrough all live in the Vulkan
+compute converter, so HDR is available on its two P010 outputs: `memory:VulkanImage` (the
+supported path, into `vulkanh265enc`) and the P010 dmabuf, whose caps are tagged the same way.
+`vah265enc` encodes the P010 dmabuf as Main-10 (give it the tiled modifier it advertises; it
+does not take LINEAR P010), but as of GStreamer 1.28 it writes neither the colour description nor
+the mastering / content-light-level SEI from its input caps, so the stream is not signalled as
+HDR. There is no HDR over the RGBA or CUDA outputs.
+
+There are two modes:
+
+| Mode | How | What it does |
+| --- | --- | --- |
+| Static | `hdr=true` | Tags the P010 caps as BT.2100 PQ with the default (or overridden) static metadata and converts with the BT.2020 matrix, and posts `wolf-hdr-state` (`hdr=true`) when those caps are negotiated (`false` if a renegotiation goes back to SDR). One-way; no client detection. The compositor content is SDR, so this is signalling plus an SDR→PQ tone-map, not new highlight detail. |
+| Dynamic | `dynamic-hdr=true` | Full dynamic HDR: the compositor detects the client's HDR state and flips the P010 colorimetry mid-stream between BT.2100 PQ (HDR content) and BT.709 (SDR content), following the active surface. Set before starting the pipeline — the Wayland globals below are created at start. |
+| Stable transport | `dynamic-hdr=true stable-color-transport=true` | Client detection as in Dynamic, but the output colour caps stay fixed at the static `hdr` setting (and the `mastering-display-info` / `content-light-level` properties) instead of being retagged: every frame is converted for that fixed output, raw RGB frames carry their own transfer (below), and `wolf-hdr-state` still reports the source's state. |
+
+Both are **per-element properties, not environment variables**, which matters when one process
+serves an HDR client and an SDR client at the same time: environment variables are process-global
+and cannot differ per session, properties can.
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `hdr` | false | Static HDR tagging of the P010 caps (see the modes table). |
+| `dynamic-hdr` | false | Dynamic HDR (see the modes table). Read once at start; set before the pipeline starts. |
+| `stable-color-transport` | false | With `dynamic-hdr`: keep the output colour caps fixed at `hdr` (see the modes table). Read once at start. |
+| `mastering-display-info` | null | Override the mastering-display caps string; empty = default or, under `dynamic-hdr`, the game's metadata. |
+| `content-light-level` | null | Override the content-light-level caps string; empty = default or, under `dynamic-hdr`, the game's metadata. |
+| `sdr-reference-white` | 203 | SDR diffuse white in nits for the SDR→PQ tone-map (see the Vulkan conversion table). The patched CUDA converter always uses 203, so leave it at the default with the CUDA stable transport. |
+| `hdr-peak-luminance` | 1000 | Peak luminance in nits of the HDR display presented to clients (frog's preferred metadata and the `wp_color_management_v1` output description, which games calibrate to) and of the default mastering-display-info (`<peak>` max) and content-light-level (`<peak>:<40% of peak>`). Match it to the target TV. |
+
+### Wayland protocols involved
+
+Under `dynamic-hdr` the compositor advertises two color-management protocols and writes what it
+learns from either into one shared per-surface HDR state:
+
+- **`wp_color_management_v1`** (the standard staging protocol, spoken by sway and other
+  desktop compositors). The output is advertised as BT.2100 PQ so HDR clients enable their HDR
+  path, and clients attach a parametric image description (transfer function, primaries,
+  mastering primaries/luminance, MaxCLL/MaxFALL) to their surface. Only what the converter can
+  render is advertised: transfer functions sRGB, gamma 2.2 and ST 2084 PQ, primaries sRGB and
+  BT.2020. Anything else is refused with `invalid_tf` / `invalid_primaries_named`, and
+  luminances are validated. Unset mastering luminance defaults to the primary volume (10000 nits
+  for PQ), never 0.
+- **`frog_color_management_v1`** (gamescope/Steam Deck protocol, vendored XML). gamescope
+  does **not** speak `wp_color_management_v1`; through frog it declares its transfer function
+  (ST 2084 PQ) and the game's mastering metadata.
+
+An explicit client color declaration takes precedence, including SDR on a 10-bit buffer.
+For clients without a declaration, the existing 10-bit packed-RGB PQ fallback is retained.
+Colour state is double-buffered surface state, applied on the
+`wl_surface.commit` that carries the buffer it describes. The output state is read from the
+**topmost** mapped window (with Steam and a game both mapped, the game, not Steam), from the
+first HDR surface with a buffer in its tree: a browser that keeps its UI sRGB while presenting
+PQ video on a subsurface is HDR, with the video's metadata. When the HDR client exits the state
+is gone with its surface.
+
+Mixed SDR and PQ content is composited per surface in the output's transfer: on an HDR output
+the SDR surfaces (and the cursor, and single-pixel-buffer surfaces) are PQ-encoded at
+`sdr-reference-white` and PQ surfaces drawn as-is; on an SDR output SDR content is untouched
+and only the PQ surfaces are tone-mapped to SDR. This holds for raw RGB output too, which is
+not converted here: every such buffer (`video/x-raw` RGBx/BGRx, plain RGB dmabufs, CUDA)
+carries a `GstCustomMeta` named `UnraidBeamSourceColorMeta` with a boolean `pq-passthrough`,
+`true` when its samples are BT.2020 PQ and `false` for sRGB/BT.709. The name is the deployed
+ABI of the CUDA consumer in `patches/gstreamer-cuda-frame-color.patch`, which converts per
+frame from it.
+
+### How it works end to end
+
+1. **Detection**: right before each frame the compositor derives the output state from the
+   active surface. A candidate HDR↔SDR flip must hold for 600 ms (debounce) before it commits,
+   so a brief transition cannot blank the TV with a mode switch.
+2. **Signalling**: on a committed flip the compositor sends the new state (plus the game's
+   mastering/CLL metadata when it provided any) to the source. While HDR, updated metadata is
+   sent too. The source drains this after receiving the frame rendered in the new state and
+   (a) posts a `wolf-hdr-state` application message (boolean `hdr` field) on the bus
+   on a flip, and (b) re-sends the current caps with only the colour fields changed, **before
+   pushing that frame**, so pixels and caps switch on the same buffer.
+3. **Renegotiation**: the new caps carry BT.2100 PQ + mastering-display-info +
+   content-light-level when HDR, plain BT.709 when SDR; format and size are unchanged, so the
+   converter is kept. The encoder re-emits its VUI and HDR SEI at the next IDR (the VA HEVC
+   encoder needs `patches/gstreamer-va-hevc-color.patch` and `gstreamer-va-hevc-hdr-sei.patch`
+   for that; unpatched, it writes neither). If downstream refuses the HDR caps, the source falls
+   back to the SDR caps, the compositor stays SDR until the output is renegotiated, and the
+   frame is re-rendered as SDR, instead of ending with `not-negotiated`. NV12 output cannot
+   carry HDR: on NV12 caps (in either transport mode) the source never reports an HDR flip and
+   the compositor stays SDR, tone-mapping PQ content. Raw RGB output has no colour caps to
+   retag; it reports flips and tags each frame instead (see `UnraidBeamSourceColorMeta`).
+4. **Conversion**: the render target is fp16 (`Abgr16161616f`) so client values reach the
+   converter unclamped. The compositor also advertises fp16/10-bit dmabuf formats to clients.
+   The shader is picked per frame from the committed output state (the colorimetry the frame
+   is tagged with) and the frame's composited content (see above):
+
+   | Content | Output tagged BT.2100 PQ | Output tagged BT.709 |
+   | --- | --- | --- |
+   | SDR (sRGB) | SDR→PQ tone-map: sRGB EOTF → BT.2020 → `sdr-reference-white` nits → PQ | BT.709 Y'CbCr |
+   | PQ | Y'CbCr matrix only (already PQ) | PQ → BT.709 tone-map with highlight roll-off |
+
+   The compositor already tone-maps PQ surfaces for a BT.709-tagged frame, so it hands the
+   converter SDR content there; the PQ → BT.709 pipeline remains for a PQ frame tagged BT.709.
+   All pipelines are pre-built, so a flip never rebuilds the converter.
+
+The static metadata defaults (BT.2020 primaries, `hdr-peak-luminance` master and CLL) can be
+overridden per element with the `mastering-display-info` and `content-light-level` properties
+(gst caps string format); under `dynamic-hdr` the game's own values take precedence unless
+overridden.
+
+## Environment variables
+
+The dump settings are read once; `WOLF_HDR_SPIKE` enables the existing render diagnostic.
+Streaming settings use per-element properties (see the tables above and the
+[HDR section](#hdr-output)); the peak-luminance and reference-white variables supply defaults.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `WOLF_VULKAN_DUMP` | unset | Path to write one raw NV12/P010 frame of the converter's output, taken from the compute output before encoding. Also captures one frame whenever `<path>.now` exists. Distinguishes conversion corruption from downstream corruption. |
+| `WOLF_VULKAN_DUMP_FRAME` | `20` | Which frame `WOLF_VULKAN_DUMP` captures. Raise it to let a client connect and paint first. |
+| `WOLF_HDR_SPIKE` | unset | Draw synthetic above-1.0 brightness bars and read the fp16 framebuffer back once to check whether GLES preserved or clamped them. Forces the fp16 render target even without `dynamic-hdr`; changes the rendered image. |
+| `WOLF_HDR_PEAK_NITS` | `1000` | Existing default for HDR peak luminance (positive nits, capped at 65535); the per-element `hdr-peak-luminance` property overrides it. |
+| `WOLF_SDR_REFERENCE_WHITE` | `203` | Default SDR reference white in nits (1–10000) for SDR → PQ conversion; Wolf sets it from its config. The per-element `sdr-reference-white` property overrides it. |
 
 ## Run without a GPU
 
@@ -178,3 +360,62 @@ while(true){
 
 display_finish(w_state); // Cleanup
 ```
+### Vulkan conversion configuration
+
+Use explicit dimensions when connecting a Vulkan encoder; NVENC rejects the
+small test dimensions selected by an unconstrained pipeline. For example:
+
+```sh
+gst-launch-1.0 waylanddisplaysrc render-node=/dev/dri/renderD128 vulkan=true \
+  ring-depth=4 ! 'video/x-raw(memory:VulkanImage),width=1280,height=720,framerate=60/1' \
+  ! vulkanh264enc ! fakesink
+```
+
+Set these properties before starting the pipeline. They belong to each source,
+so independent sessions may use different values:
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `ring-depth` | 4 | Initial conversion slots, 2–4 (`1` is raised to 2). A slot is reused only once every downstream consumer has released it. The `memory:VulkanImage` ring adds a slot, up to 12, whenever downstream holds them all: Wolf's interpipe topology holds about five frames, and a fixed 4-slot ring dropped about half of a 60 fps stream. The dmabuf ring stays at its initial size and, when no slot is free, drops the new frame and re-emits the previous output. |
+| `linear-encode-src` | false | Prefer LINEAR Vulkan encode images, with OPTIMAL allocation fallback. Works around a radv GFX12/RDNA4 bug that corrupts a LINEAR-to-tiled `vkCmdCopyImage`. |
+| `sdr-reference-white` | 203 | SDR white level in nits for SDR → PQ conversion, 1–10000. |
+| `vulkan-codec` | auto | Codec of the consuming encoder: `h264`, `h265` or `av1`. Empty = the directly linked encoder's, else every codec. |
+| `vulkan-profile` | auto | Profile of the consuming encoder: H.264 `high`, `main`, `baseline`, `constrained-baseline`, `constrained-high`, `progressive-high` for NV12; H.265 `main` for NV12 and `main-10` for P010; AV1 `main` (NV12 only). Empty = the directly linked encoder's fixed profile, else every profile of the codec. |
+
+An encoder only reads images created for its own profile. A directly connected Vulkan
+encoder's codec and fixed output profile are discovered through simple filters and queues,
+and the images are created for exactly that profile. Raw caps cannot express an encoder's
+codec/profile across interpipe, and one producer may feed several sessions with different
+codecs, so unless `vulkan-codec` / `vulkan-profile` narrow it, the images are created for
+every profile that can encode the format and that the device supports (H.264 High, Main and
+Baseline, H.265 Main and AV1 Main for NV12; H.265 Main-10 for P010). The source creates raw
+frames, and encoding remains downstream so lobbies can fan out to multiple consumers.
+
+NV12 and P010 output needs an even width and height (4:2:0 chroma); odd sizes fail
+negotiation. `render-node` can only change while the source is stopped.
+
+LINEAR Vulkan images carry their real plane offsets and strides in `VideoMeta`.
+OPTIMAL-tiled Vulkan images have no portable byte layout: their `VideoMeta`
+describes logical planes only and **must not be used for CPU row addressing**.
+Consumers must use the VkImage and a Vulkan-aware conversion/download element.
+The converter waits for GPU completion on the Vulkan encode path before exposing
+an image, paying that synchronization latency per frame. Encode-src images are
+shared CONCURRENTly between the graphics and video-encode queue families; VA dmabuf output uses
+implicit synchronization where the driver supports it.
+
+The plugin does not change process environment variables when loaded. If a host
+hits a lavapipe/Mesa LLVM initialization collision, configure
+`VK_LOADER_DRIVERS_DISABLE='*lvp_icd*'` in the launching process before it starts.
+Software Vulkan remains available to embedding applications by default.
+
+HDR — including the `dynamic-hdr`, `mastering-display-info` and `content-light-level`
+properties and the Wayland protocols behind them — has its own section above; see
+[HDR output](#hdr-output). The diagnostic knobs `WOLF_VULKAN_DUMP` and
+`WOLF_VULKAN_DUMP_FRAME` remain environment variables (documented above). Regenerate
+committed SPIR-V with `bash ci/shaders.sh --update`; CI recompiles and compares every
+shader with its GLSL source.
+
+The current unified build requires **GStreamer Vulkan >= 1.28** and Vulkan loader
+headers, even when only the CUDA/VA path is used. The bindings' Vulkan `v1_28`
+feature and header-compiled bridge enforce this; older distro GStreamer needs a
+newer installation prefix. See [CONTRIBUTING.md](CONTRIBUTING.md).

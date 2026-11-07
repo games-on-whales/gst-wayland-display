@@ -25,6 +25,21 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::with_hdr(false)
+    }
+
+    /// A fixture whose compositor advertises the dynamic-HDR colour-management globals.
+    pub fn with_hdr(hdr_cm: bool) -> Self {
+        Self::build(hdr_cm, true)
+    }
+
+    /// A fixture whose compositor has no output yet, as before the first caps
+    /// negotiation.
+    pub fn without_output() -> Self {
+        Self::build(false, false)
+    }
+
+    fn build(hdr_cm: bool, with_output: bool) -> Self {
         INIT.call_once(|| {
             gst::init().expect("Failed to initialize GStreamer");
         });
@@ -39,6 +54,8 @@ impl Fixture {
             &dh,
             &libinput_context,
             event_loop.handle(),
+            hdr_cm,
+            crate::utils::vulkan_nv12::ConversionOptions::default().hdr_peak_nits,
         );
 
         let source = ListeningSocketSource::new_auto().unwrap();
@@ -76,13 +93,17 @@ impl Fixture {
             UnixStream::connect(format!("{}/{}", runtime_dir, socket_name)).unwrap(),
         );
 
+        let mut server_state = server_state;
+        server_state.hdr_cm = hdr_cm;
         let mut f = Fixture {
             client: wclient,
             server: server_state,
             server_event_loop: event_loop,
         };
 
-        f.create_server_output();
+        if with_output {
+            f.create_server_output();
+        }
         f.round_trip();
 
         f
@@ -95,6 +116,7 @@ impl Fixture {
                 PhysicalProperties {
                     make: "Virtual".into(),
                     model: "Wolf".into(),
+                    serial_number: String::new(),
                     size: (0, 0).into(),
                     subpixel: Subpixel::Unknown,
                 },
@@ -108,9 +130,9 @@ impl Fixture {
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
-        let dtr = OutputDamageTracker::from_output(&output);
+        let dtr = OutputDamageTracker::from_output(output);
 
-        self.server.space.map_output(&output, (0, 0));
+        self.server.space.map_output(output, (0, 0));
         self.server.dtr = Some(dtr);
         self.server
             .set_pointer_location((mode.size.w as f64 / 2.0, mode.size.h as f64 / 2.0).into());
