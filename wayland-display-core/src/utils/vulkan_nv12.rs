@@ -656,6 +656,13 @@ impl Nv12Out {
 
 /// Owns the Vulkan device, the compute pipeline, and the NV12 export ring.
 pub struct VulkanNv12 {
+    /// Import the compositor's dmabuf once per converter rather than once per ring slot.
+    /// On NVIDIA, repeat imports of one dmabuf on a device reused from an earlier session can
+    /// succeed in Vulkan while the kernel mapping failed, leaving that slot sampling black.
+    /// Only set where every frame is CPU-waited, so the single import's per-frame layout
+    /// transitions cannot overlap.
+    share_import: bool,
+    shared_import: Option<((u64, u64), Import)>,
     _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
@@ -918,6 +925,8 @@ impl VulkanNv12 {
         }
 
         // Binary semaphore exported per submit as the dmabuf write-fence (implicit path).
+        // No fence pipelining means every frame is CPU-waited, so one import is enough.
+        this.share_import = !implicit_sync;
         if implicit_sync {
             let mut exp = vk::ExportSemaphoreCreateInfo::default()
                 .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
@@ -968,6 +977,8 @@ impl VulkanNv12 {
             sync_sem: vk::Semaphore::null(),
             sem_fd: None,
             sync_sem_stuck: false,
+            share_import: false,
+            shared_import: None,
             implicit_sync: false,
             direct: false,
             encode_src: false,
@@ -1176,6 +1187,12 @@ impl VulkanNv12 {
         this._shared_device = Some(device_gst.clone());
         this.build_compute(fmt, bt2020, fp16_input, &options, raw.gfx_queue_family)?;
 
+        // This path CPU-waits every frame on all vendors; only NVIDIA needs the single import.
+        this.share_import = this
+            .instance
+            .get_physical_device_properties(raw.physical)
+            .vendor_id
+            == VENDOR_NVIDIA;
         // ---- encode-src output ring: NV12 VIDEO_ENCODE_SRC GstVulkanImageMemory images
         // allocated directly on the shared device (bypasses the pool's generic-format check).
         for _ in 0..ring_depth(&options) {
@@ -1339,8 +1356,21 @@ impl VulkanNv12 {
         // serialised by the slot fence and never races another in-flight frame.
         let stale = !matches!(&self.outputs[idx].import, Some((identity, _)) if *identity == key);
         if stale {
-            self.free_import(idx);
-            let import = self.create_import(rgba)?;
+            let import = if self.share_import {
+                self.outputs[idx].import = None;
+                match self.shared_import {
+                    Some((identity, import)) if identity == key => import,
+                    _ => {
+                        self.free_shared_import();
+                        let import = self.create_import(rgba)?;
+                        self.shared_import = Some((key, import));
+                        import
+                    }
+                }
+            } else {
+                self.free_import(idx);
+                self.create_import(rgba)?
+            };
             self.outputs[idx].import = Some((key, import));
         }
         let (import_img, _import_mem, view) = self.outputs[idx].import.as_ref().unwrap().1;
@@ -2077,7 +2107,20 @@ impl VulkanNv12 {
         }
     }
 
+    unsafe fn free_shared_import(&mut self) {
+        if let Some((_, (img, mem, view))) = self.shared_import.take() {
+            self.device.destroy_image_view(view, None);
+            self.device.destroy_image(img, None);
+            self.device.free_memory(mem, None);
+        }
+    }
+
     unsafe fn free_import(&mut self, idx: usize) {
+        if self.share_import {
+            // The slot only borrows the converter's import; free_shared_import owns it.
+            self.outputs[idx].import = None;
+            return;
+        }
         if let Some((_, (img, mem, view))) = self.outputs[idx].import.take() {
             self.device.destroy_image_view(view, None);
             self.device.destroy_image(img, None);
@@ -2144,6 +2187,7 @@ impl VulkanNv12 {
         for idx in 0..self.outputs.len() {
             self.free_import(idx);
         }
+        self.free_shared_import();
         // On the encode-src path the output image + memory belong to the gst pool (freed
         // when the buffer/pool drop) and there is no export fd to close.
         let owns_image = !self.encode_src;
