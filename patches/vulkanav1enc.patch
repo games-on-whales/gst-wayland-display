@@ -36,6 +36,12 @@
 # gstreamer-vulkan-rc-retarget-no-reset.patch (reset-free live retarget).
 # Applies last in the chain.
 #
+# RADV fix folded in 2026-11-11: the picture info's pCDEF/pLoopFilter are
+# now filled in every rate-control mode, not only CQP. The Vulkan spec gives
+# pCDEF no NULL escape when the sequence header enables CDEF, and RADV
+# (VCN >= 5) dereferences it unconditionally, so CBR/VBR segfaulted on the
+# first frame (issue #84); NVIDIA silently substituted defaults for NULL.
+#
 # Live-pipeline fix folded in 2026-08-21: input VulkanImage buffers are
 # released at encode completion (references need only the DPB reconstruction,
 # never the source image). Without it the VBI pinned up to 8 compositor
@@ -1852,7 +1858,7 @@ new file mode 100644
 index 0000000..ca92d71
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
-@@ -0,0 +1,2358 @@
+@@ -0,0 +1,2368 @@
 +/* GStreamer
 + * Copyright (C) 2026 Igalia, S.L.
 + *
@@ -3381,15 +3387,25 @@ index 0000000..ca92d71
 +
 +  _av1_fill_tile_info (self, vk_frame);
 +
-+  /* quality substructures: only meaningful in constant-QP mode; in CBR/VBR
-+   * the driver's rate controller computes them per frame (NULL lets the
-+   * driver fill in), following the gstvaav1enc policy. */
-+  if (rc_disabled) {
-+    _av1_fill_loop_filter (self, vk_frame, cqp);
++  /* quality substructures, always filled. The Vulkan spec defines the
++   * members of the CDEF structure "if enable_cdef is set in the active
++   * sequence header ... the structure pointed to by pCDEF", with no NULL
++   * escape hatch (unlike pTileInfo, where NULL explicitly defers to the
++   * implementation). RADV (VCN >= 5) dereferences pCDEF unconditionally
++   * when the sequence header enables CDEF, so a NULL pointer segfaults the
++   * first CBR/VBR frame; NVIDIA silently substituted its own defaults for
++   * NULL, masking this. Under rate control constantQIndex must be 0 and the
++   * per-frame Q index is unknown, so derive the tables from a nominal
++   * mid-band Q index; the driver's rate controller remains free to adapt
++   * around them. */
++  {
++    guint32 nominal_qindex = rc_disabled ? cqp : 128;
++
++    _av1_fill_loop_filter (self, vk_frame, nominal_qindex);
 +    vk_frame->pic_info.pLoopFilter = &vk_frame->loop_filter;
 +
 +    if (self->hw.enable_cdef) {
-+      _av1_fill_cdef (self, vk_frame, cqp, self->coded_width,
++      _av1_fill_cdef (self, vk_frame, nominal_qindex, self->coded_width,
 +          self->coded_height);
 +      vk_frame->pic_info.pCDEF = &vk_frame->cdef;
 +    }
