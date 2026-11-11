@@ -206,13 +206,6 @@ fn rgba_modifier_order(mods: &[Modifier], is_nvidia: bool) -> Vec<Modifier> {
         .collect()
 }
 
-/// True when the negotiated colorimetry uses the BT.2020 matrix (i.e. HDR / BT.2100-PQ
-/// output): the RGBA->P010 converter must then use the BT.2020 luma/chroma matrix so the
-/// samples match the `matrix=bt2020` caps the encoder signals. SDR (BT.601/709) -> false.
-fn is_bt2020_matrix(colorimetry: &gst_video::VideoColorimetry) -> bool {
-    colorimetry.matrix() == gst_video::VideoColorMatrix::Bt2020
-}
-
 impl GsNv12Buf {
     pub fn new(
         renderer: &mut GlesRenderer,
@@ -259,18 +252,20 @@ impl GsNv12Buf {
             "GsNv12Buf: nvidia={is_nvidia} RGBA render target modifier = {:?}",
             rgba.format().modifier
         );
-        // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
-        let bt2020 = video_info
+        // The converter's matrix follows the caps: BT.2020 (HDR) on P010, BT.709 or the
+        // BT.601 default on NV12.
+        let matrix = video_info
             .to_video_info()
-            .ok()
-            .is_some_and(|vi| is_bt2020_matrix(&vi.colorimetry()));
+            .map_or(gst_video::VideoColorMatrix::Unknown, |vi| {
+                vi.colorimetry().matrix()
+            });
         // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new(
             render_node,
             video_info.clone(),
             fmt,
-            bt2020,
+            matrix,
             fp16_input,
             va_share,
             options,
@@ -352,12 +347,13 @@ impl GsVulkanBuf {
             .field("height", h as i32)
             .field("framerate", video_info.fps())
             .build();
-        // P010 only: pick the BT.2020 matrix shader when the caps signal HDR (matrix=bt2020).
-        let bt2020 = is_bt2020_matrix(&video_info.colorimetry());
+        // The converter's matrix follows the caps: BT.2020 (HDR) on P010, BT.709 or the
+        // BT.601 default on NV12.
+        let matrix = video_info.colorimetry().matrix();
         // The converter samples the fp16 render target when dynamic HDR allocated it as such.
         let fp16_input = rgba.format().code == DrmFourcc::Abgr16161616f;
         let vulkan = VulkanNv12::new_on_shared(
-            dev, raw, &out_caps, targets, w, h, fmt, bt2020, fp16_input, options,
+            dev, raw, &out_caps, targets, w, h, fmt, matrix, fp16_input, options,
         )?;
         Some(GsVulkanBuf {
             rgba,
