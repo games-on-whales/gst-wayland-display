@@ -21,6 +21,7 @@ use smithay::{
             Bind,
             damage::{Error as DTRError, OutputDamageTracker},
             element::memory::{MemoryBuffer, MemoryRenderBuffer},
+            utils::with_renderer_surface_state,
         },
     },
     desktop::{
@@ -51,7 +52,8 @@ use smithay::{
         },
     },
     utils::{
-        Clock, DeviceFd, Logical, Monotonic, Physical, Point, SERIAL_COUNTER, Size, Transform,
+        Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, SERIAL_COUNTER, Size,
+        Transform,
     },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
@@ -1136,6 +1138,7 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         .as_ref()
         .map(|vi| (vi.width() as i32, vi.height() as i32).into())
         .unwrap_or(size);
+
     state.dtr = Some(OutputDamageTracker::new(
         encode_size,
         output.current_scale().fractional_scale(),
@@ -1150,6 +1153,143 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     remap_pointer(state, old_logical, new_size);
     announce_ui_scale(state);
     configure_toplevels(state, new_size);
+}
+
+/// The aspect-preserving scale plus centring offset that maps content of size `surface`
+/// into the `configured` box it was told to fill — the fullscreen fit.
+///
+/// This is the ONE definition, shared by the two sides that must agree exactly: compositing
+/// ([`crate::comp::rendering`], which scales the window's render elements by it) and input
+/// ([`State::pointer_focus`], which maps pointer positions back through its inverse). A
+/// second, independently-derived copy of this arithmetic would silently drift the cursor
+/// away from what it points at.
+///
+/// Returns `(1.0, (0.0, 0.0))` — an exact identity — for a degenerate size or when the two
+/// already match, which is every window that fills its configure.
+///
+/// The fit is deliberately **symmetric**: content LARGER than its configure is scaled *down*
+/// by the same rule. The spec's rule is internal ≤ external, so that direction should not
+/// arise in a well-behaved session — but a client that overshoots its configure (a race
+/// around a mode change, a client that ignores the configure outright) would otherwise be
+/// cropped by the framebuffer, losing whatever fell outside. Shrinking it keeps all of it on
+/// screen and keeps the inverse used by input total. Guarding it to smaller-only would buy
+/// nothing and reintroduce that cliff.
+pub(crate) fn fullscreen_fit(
+    configured: Size<i32, Logical>,
+    surface: Size<i32, Logical>,
+) -> (f64, Point<f64, Logical>) {
+    if surface.w <= 0
+        || surface.h <= 0
+        || configured.w <= 0
+        || configured.h <= 0
+        || surface == configured
+    {
+        return (1.0, Point::from((0.0, 0.0)));
+    }
+    let scale = f64::min(
+        configured.w as f64 / surface.w as f64,
+        configured.h as f64 / surface.h as f64,
+    );
+    let offset = Point::from((
+        (configured.w as f64 - surface.w as f64 * scale) / 2.0,
+        (configured.h as f64 - surface.h as f64 * scale) / 2.0,
+    ));
+    (scale, offset)
+}
+
+/// Snap a fit's centring offset to the PHYSICAL pixel grid the renderer composites on.
+///
+/// Compositing can only place an element on whole physical pixels, so the offset is rounded
+/// there. Input inverts the same transform in logical f64, and would otherwise invert an
+/// offset up to half a physical pixel away from the one actually drawn. Both sides round
+/// here, once, so the two are the same number by construction.
+pub(crate) fn fit_offset_physical(
+    offset: Point<f64, Logical>,
+    output_scale: f64,
+) -> Point<i32, Physical> {
+    Point::from((
+        (offset.x * output_scale).round() as i32,
+        (offset.y * output_scale).round() as i32,
+    ))
+}
+
+/// [`fit_offset_physical`] converted back to logical, for the input side: the same snapped
+/// offset compositing uses, expressed in the space pointer positions live in.
+pub(crate) fn fit_offset_snapped(
+    offset: Point<f64, Logical>,
+    output_scale: f64,
+) -> Point<f64, Logical> {
+    let physical = fit_offset_physical(offset, output_scale);
+    Point::from((
+        physical.x as f64 / output_scale,
+        physical.y as f64 / output_scale,
+    ))
+}
+
+/// [`fullscreen_fit`] resolved for a mapped `window`: identity unless the window is a
+/// toplevel whose CURRENT (acked) state is `Fullscreen`.
+///
+/// The committed size is read from the toplevel's OWN surface state
+/// (`RendererSurfaceState::surface_size`), NOT from `Window::geometry()`/`bbox()`. Two
+/// reasons: the window bbox is popup-INCLUSIVE when the client sets no xdg window geometry
+/// (`SpaceElement::bbox` is `bbox_with_popups`), so the fit scale would jump every time a
+/// popup opened or closed; and the surface size is already post-`wp_viewport` (smithay's
+/// `SurfaceView::dst` is the viewport destination when one is set), so a viewporter-aware
+/// client is measured by what it actually presents — which is exactly right, and means a
+/// client whose destination already equals its configure lands on the `surface == configured`
+/// identity with no special-casing.
+///
+/// `output_logical` is the fallback configured size for a toplevel whose current state
+/// carries none.
+pub(crate) fn window_fullscreen_fit(
+    window: &Window,
+    output_logical: Size<i32, Logical>,
+) -> (f64, Point<f64, Logical>) {
+    let identity = (1.0, Point::from((0.0, 0.0)));
+    let Some(toplevel) = window.toplevel() else {
+        return identity;
+    };
+    // Only the two fields that matter, read in place: `ToplevelSurface::current_state()`
+    // would CLONE the whole `ToplevelState` (including the `Vec` inside its state set), and
+    // this runs on the input hot path -- once per mapped window per pointer event. The
+    // committed state is what the client last acked before its current commit.
+    let Some((fullscreen, configured)) = toplevel.with_committed_state(|state| {
+        state.map(|state| (state.states.contains(XdgState::Fullscreen), state.size))
+    }) else {
+        return identity;
+    };
+    if !fullscreen {
+        return identity;
+    }
+    let Some(surface_size) =
+        with_renderer_surface_state(toplevel.wl_surface(), |state| state.surface_size()).flatten()
+    else {
+        return identity;
+    };
+
+    // The scale is derived from the ROOT surface, but what gets scaled is the whole surface
+    // TREE -- and hit-testing runs against the window bbox, which is the tree too. A client
+    // whose root buffer is small while its subsurfaces cover the output (this compositor
+    // explicitly expects such clients: see "a launcher rendering via subsurfaces" in
+    // `wayland/handlers/compositor.rs`) would otherwise be blown up by the ratio between the
+    // two -- unbounded, and wrong in both compositing and input.
+    //
+    // So: only fit a window whose visible content actually fits inside its root surface.
+    // `Window::bbox()` is subsurface-inclusive and popup-EXCLUSIVE (unlike
+    // `SpaceElement::bbox`, which is `bbox_with_popups` -- using that here would make the
+    // scale jump on every popup open/close). A single-surface game has bbox == root exactly,
+    // and so do gamescope and kwin, so the intended cases are untouched; anything else bails
+    // to the identity, i.e. today's unscaled behaviour rather than a guessed scale.
+    let bbox = window.bbox();
+    if !Rectangle::from_size(surface_size).contains_rect(bbox) {
+        tracing::trace!(
+            ?bbox,
+            ?surface_size,
+            "Not fitting a fullscreen window whose content extends beyond its root surface",
+        );
+        return identity;
+    }
+    fullscreen_fit(configured.unwrap_or(output_logical), surface_size)
 }
 
 /// Move the pointer from a `old`-sized logical extent into a `new`-sized one, keeping it at
@@ -1919,5 +2059,56 @@ mod frame_timing_tests {
         let interval = refresh_interval(refresh_mhz(Fraction::new(60, 1))).unwrap();
         assert!((interval.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9);
         assert_eq!(refresh_interval(0), None);
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fullscreen_fit;
+    use smithay::utils::{Logical, Point, Size};
+
+    #[track_caller]
+    fn check(configured: (i32, i32), surface: (i32, i32), scale: f64, offset: (f64, f64)) {
+        let c: Size<i32, Logical> = configured.into();
+        let s: Size<i32, Logical> = surface.into();
+        let (got_scale, got_offset) = fullscreen_fit(c, s);
+        assert!(
+            (got_scale - scale).abs() < 1e-9,
+            "{c:?} <- {s:?}: expected scale {scale}, got {got_scale}",
+        );
+        let want = Point::<f64, Logical>::from(offset);
+        assert!(
+            (got_offset.x - want.x).abs() < 1e-9 && (got_offset.y - want.y).abs() < 1e-9,
+            "{c:?} <- {s:?}: expected offset {want:?}, got {got_offset:?}",
+        );
+    }
+
+    #[test]
+    fn fullscreen_fit_table() {
+        // The window fills its configure: the exact identity every unscaled session relies
+        // on -- including gamescope/KWin, whose viewport destination equals the configure.
+        check((1920, 1080), (1920, 1080), 1.0, (0.0, 0.0));
+        // Degenerate sizes are the identity too (nothing sensible to scale).
+        check((1920, 1080), (0, 0), 1.0, (0.0, 0.0));
+        check((0, 0), (960, 540), 1.0, (0.0, 0.0));
+
+        // Same aspect: fills the configure, no bars.
+        check((1920, 1080), (960, 540), 2.0, (0.0, 0.0));
+        check((1920, 1080), (1280, 720), 1.5, (0.0, 0.0));
+
+        // 4:3 into 16:9 -> width-limited by height, PILLARbox (bars left/right).
+        check((1920, 1080), (1440, 1080), 1.0, (240.0, 0.0));
+        check((1920, 1080), (640, 480), 2.25, (240.0, 0.0));
+        // Wider than the configure -> height-limited, LETTERbox (bars top/bottom).
+        check((1920, 1080), (1920, 800), 1.0, (0.0, 140.0));
+
+        // A surface LARGER than its configure is scaled DOWN by the same rule -- the fit is
+        // symmetric, which is what keeps a client that overshoots on screen.
+        check((1280, 720), (1920, 1080), 2.0 / 3.0, (0.0, 0.0));
+
+        // Non-integer scale keeps a fractional offset: the offset is only rounded where it
+        // is converted to physical pixels, so the two consumers (compositing and input)
+        // never disagree by a rounding step.
+        check((1920, 1080), (1000, 540), 1.92, (0.0, 21.6));
     }
 }

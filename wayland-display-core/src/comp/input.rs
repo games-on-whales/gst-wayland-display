@@ -2,6 +2,7 @@ use super::{State, focus::FocusTarget};
 use smithay::backend::input::InputTime;
 use smithay::backend::input::Keycode;
 use smithay::backend::libinput::LibinputInputBackend;
+use smithay::desktop::{Window, space::SpaceElement};
 use smithay::input::keyboard::{Keysym, KeysymHandle, XkbConfig};
 use smithay::input::tablet::tool::{
     AxisFrame as ToolAxisFrame, ButtonEvent as ToolButtonEvent, DownEvent as ToolDownEvent,
@@ -155,6 +156,29 @@ pub(crate) struct TabletInput {
     saved_pointer_image: Option<CursorImageStatus>,
 }
 
+/// Map a RENDER-space position back into the coordinate space a window is composited from:
+/// the exact inverse of the `Rescale`-about-`origin` + `Relocate`-by-`offset` pair
+/// `create_frame` applies to that window's render elements.
+///
+/// An identity fit (`scale == 1.0`, zero offset — every window that fills its configure)
+/// returns `pos` untouched, bit for bit.
+fn unfit(
+    pos: Point<f64, Logical>,
+    origin: Point<f64, Logical>,
+    scale: f64,
+    offset: Point<f64, Logical>,
+) -> Point<f64, Logical> {
+    if scale == 1.0 && offset.x == 0.0 && offset.y == 0.0 {
+        return pos;
+    }
+    origin + (pos - origin - offset).downscale(scale)
+}
+
+/// What [`State::pointer_focus`] resolves: the window under an input position (with its
+/// origin, as smithay's focus tuple wants it) and that position expressed in the window's
+/// own coordinate space.
+type PointerFocus = (Option<(Window, Point<f64, Logical>)>, Point<f64, Logical>);
+
 pub struct NixInterface;
 
 impl LibinputInterface for NixInterface {
@@ -265,6 +289,84 @@ impl State {
         );
     }
 
+    /// Resolve a RENDER-space input position against the mapped windows, mapping it back
+    /// through each window's fullscreen fit before hit-testing: returns the focus target
+    /// (with its origin) plus **the position expressed in that window's own coordinate
+    /// space**, which is the one to hand smithay.
+    ///
+    /// This is the input half of the fullscreen fit ([`super::window_fullscreen_fit`]).
+    /// Compositing scales a smaller fullscreen surface up to fill the output; without the
+    /// inverse map here, hit-testing would still run against the client's UNSCALED geometry,
+    /// so a 960x540 client scaled 2x onto a 1920x1080 output would take pointer input over
+    /// only the top-left quarter of the frame and report every position at twice the
+    /// coordinate the user is actually pointing at.
+    ///
+    /// The map is `local = loc + (pos - loc - offset) / scale`, the exact inverse of what
+    /// `create_frame` applies (`Rescale` about the window's origin, then `Relocate` by the
+    /// centring offset). Both sides read the same
+    /// [`super::fullscreen_fit`], so they cannot drift. Every window that fills its
+    /// configure yields the identity, i.e. an unscaled session behaves exactly as before.
+    ///
+    /// The returned position is what must be used as the event location: smithay derives the
+    /// surface-local coordinate as `location - target_origin`, and the origin here is the
+    /// window's location in its OWN space.
+    pub(crate) fn pointer_focus(&self, pos: Point<f64, Logical>) -> PointerFocus {
+        // Top to bottom, like `Space::element_under`.
+        for window in self.space.elements().rev() {
+            let (Some(bbox), Some(location)) = (
+                self.space.element_bbox(window),
+                self.space.element_location(window),
+            ) else {
+                continue;
+            };
+            let origin = (location - window.geometry().loc).to_f64();
+            let (scale, offset) = self.window_fit(window);
+            let local = unfit(pos, origin, scale, offset);
+            if bbox.to_f64().contains(local) && window.is_in_input_region(&(local - origin)) {
+                return (Some((window.clone(), origin)), local);
+            }
+        }
+        (None, pos)
+    }
+
+    /// The output's LOGICAL extent — the space every window's fit is resolved against.
+    fn output_logical_size(&self) -> Size<i32, Logical> {
+        self.output
+            .as_ref()
+            .and_then(|o| self.space.output_geometry(o))
+            .map(|geo| geo.size)
+            .unwrap_or_default()
+    }
+
+    /// The fullscreen fit of the mapped window backing `target`, for mapping a position into
+    /// the space of a focus that was resolved at some *earlier* position (the pointer-motion
+    /// path resolves focus before the move and delivers the location after it — both must be
+    /// expressed against the same window).
+    fn fit_of(&self, target: &FocusTarget) -> (f64, Point<f64, Logical>) {
+        target
+            .wl_surface()
+            .and_then(|surface| {
+                self.space
+                    .elements()
+                    .find(|w| w.wl_surface().map(|s| *s == *surface).unwrap_or(false))
+            })
+            .map(|window| self.window_fit(window))
+            .unwrap_or((1.0, Point::from((0.0, 0.0))))
+    }
+
+    /// A window's fullscreen fit with its centring offset snapped to the same physical pixel
+    /// grid compositing rounds it to, so the inverse applied here is the exact inverse of
+    /// what was drawn rather than one up to half a pixel away.
+    pub(crate) fn window_fit(&self, window: &Window) -> (f64, Point<f64, Logical>) {
+        let (scale, offset) = super::window_fullscreen_fit(window, self.output_logical_size());
+        let output_scale = self
+            .output
+            .as_ref()
+            .map(|o| o.current_scale().fractional_scale())
+            .unwrap_or(1.0);
+        (scale, super::fit_offset_snapped(offset, output_scale))
+    }
+
     pub(crate) fn maybe_activate_pointer_constraint(
         &self,
         new_under: &Option<(FocusTarget, Point<f64, Logical>)>,
@@ -291,16 +393,17 @@ impl State {
         }
     }
 
+    /// `target_position` is in RENDER space; constraint regions are against surface origins,
+    /// which live in the focused window's own (post-inverse-fit) space, so it is mapped first.
     fn can_pointer_move(
         &self,
         under: &Option<(FocusTarget, Point<f64, Logical>)>,
         target_position: Point<f64, Logical>,
     ) -> bool {
         let should_motion = self.constraint_allows_move(under, target_position);
-        let new_under = self
-            .space
-            .element_under(target_position)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        let (new_under, target_position) = self.pointer_focus(target_position);
+        let new_under: Option<(FocusTarget, Point<f64, Logical>)> =
+            new_under.map(|(w, pos)| (w.into(), pos));
         // If pointer is now in a constraint region, activate it
         self.maybe_activate_pointer_constraint(&new_under, target_position);
         should_motion
@@ -317,10 +420,9 @@ impl State {
         let pointer = self.seat.get_pointer().unwrap();
         let mut should_motion = true;
 
-        let new_under = self
-            .space
-            .element_under(target_position)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        let (new_under, target_position) = self.pointer_focus(target_position);
+        let new_under: Option<(FocusTarget, Point<f64, Logical>)> =
+            new_under.map(|(w, pos)| (w.into(), pos));
 
         if let Some((surface, surface_loc)) =
             under
@@ -374,6 +476,7 @@ impl State {
     fn refocus_pointer_if_pending(
         &mut self,
         under: &Option<(FocusTarget, Point<f64, Logical>)>,
+        location: Point<f64, Logical>,
         time: u32,
     ) {
         let pointer = self.seat.get_pointer().unwrap();
@@ -401,7 +504,7 @@ impl State {
                     self,
                     None,
                     &MotionEvent {
-                        location: self.pointer_location,
+                        location,
                         serial: SERIAL_COUNTER.next_serial(),
                         time: InputTime::from_millis(time),
                     },
@@ -421,10 +524,12 @@ impl State {
         // The mouse moves: the cursor is the pointer's again, not a pen's.
         self.restore_pointer_cursor_image();
         let pointer = self.seat.get_pointer().unwrap();
-        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
-            .space
-            .element_under(self.pointer_location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        // Focus is resolved at the pre-move position (as it always was); `under_pos` is that
+        // position mapped into the focused window's own space, which is what the client must
+        // be told -- see `pointer_focus`.
+        let (focus, under_pos) = self.pointer_focus(self.pointer_location);
+        let under: Option<(FocusTarget, Point<f64, Logical>)> =
+            focus.map(|(w, pos)| (w.into(), pos));
 
         // Edge-triggered pointer refocus.
         //
@@ -445,13 +550,37 @@ impl State {
         // there is nothing to refocus onto yet -- and while the pointer is grabbed, since
         // smithay's default click grab is active for as long as a button is held and a
         // forced leave mid-click-drag would break the drag.
-        self.refocus_pointer_if_pending(&under, event_time_msec);
+        self.refocus_pointer_if_pending(&under, under_pos, event_time_msec);
 
         // Allocated AFTER the refocus block: the re-emitted wl_pointer.enter below must carry
         // a serial NEWER than the forced leave's, since clients echo enter serials back.
         let serial = SERIAL_COUNTER.next_serial();
 
         let possible_pos = self.clamp_coords(self.pointer_location + delta);
+
+        // `pointer_location` stays RENDER space -- it is where the cursor is drawn and what
+        // `clamp_coords` bounds. What the CLIENT is told is that position mapped through the
+        // inverse fit of the window `under` refers to, so the origin in `under` and the
+        // location below are expressed in the same space (smithay derives the surface-local
+        // coordinate as `location - origin`).
+        let fit = under.as_ref().map(|(target, _)| self.fit_of(target));
+        let event_pos = match (&under, fit) {
+            (Some((_, origin)), Some((scale, offset))) => {
+                unfit(possible_pos, *origin, scale, offset)
+            }
+            _ => possible_pos,
+        };
+
+        // zwp_relative_pointer_v1: `dx`/`dy` are in the SAME coordinate space as
+        // wl_pointer.motion, so once the absolute coordinates above are client-space the
+        // deltas must be too -- otherwise a pointer-locked client under a 2x fit sees double
+        // sensitivity while its absolute position moves at 1x. `dx_unaccel`/`dy_unaccel` are
+        // the documented exception: raw device motion, no compositor transform, so they are
+        // forwarded untouched.
+        let relative_delta = match fit {
+            Some((scale, _)) if scale != 1.0 => delta.downscale(scale),
+            _ => delta,
+        };
 
         // Pointer should only move if it's not locked or confined (and going out of bounds)
         if self.can_pointer_move(&under, possible_pos) {
@@ -463,7 +592,7 @@ impl State {
                 self,
                 under.clone(),
                 &MotionEvent {
-                    location: self.pointer_location,
+                    location: event_pos,
                     serial,
                     time: InputTime::from_millis(event_time_msec),
                 },
@@ -475,7 +604,7 @@ impl State {
             self,
             under.map(|(w, pos)| (w, pos.to_f64())),
             &RelativeMotionEvent {
-                delta,
+                delta: relative_delta,
                 delta_unaccel: delta_unaccelerated,
                 time: InputTime::from_micros(event_time_usec),
             },
@@ -650,10 +779,9 @@ impl State {
     ) {
         let serial = SERIAL_COUNTER.next_serial();
         let touch = self.seat.get_touch().unwrap();
-        let under = self
-            .space
-            .element_under(location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        let (focus, location) = self.pointer_focus(location);
+        let under: Option<(FocusTarget, Point<f64, Logical>)> =
+            focus.map(|(w, pos)| (w.into(), pos));
 
         touch.down(
             self,
@@ -690,10 +818,9 @@ impl State {
         location: Point<f64, Logical>,
     ) {
         let touch = self.seat.get_touch().unwrap();
-        let under = self
-            .space
-            .element_under(location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        let (focus, location) = self.pointer_focus(location);
+        let under: Option<(FocusTarget, Point<f64, Logical>)> =
+            focus.map(|(w, pos)| (w.into(), pos));
 
         touch.motion(
             self,
@@ -992,9 +1119,9 @@ impl State {
     /// pointer the next mouse motion starts from, letting the mouse escape the lock.
     fn tablet_cursor_only_motion(&mut self, location: Point<f64, Logical>) {
         let current: Option<(FocusTarget, Point<f64, Logical>)> = self
-            .space
-            .element_under(self.pointer_location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+            .pointer_focus(self.pointer_location)
+            .0
+            .map(|(w, pos)| (w.into(), pos));
         if !self.constraint_allows_move(&current, location) {
             return;
         }
@@ -1153,26 +1280,26 @@ impl State {
         self.last_pointer_movement = Instant::now();
         let pointer = self.seat.get_pointer().unwrap();
         let current: Option<(FocusTarget, Point<f64, Logical>)> = self
-            .space
-            .element_under(self.pointer_location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+            .pointer_focus(self.pointer_location)
+            .0
+            .map(|(w, pos)| (w.into(), pos));
         // A locked (or confining) pointer constraint holds the pointer as it does for the
         // mouse: the pen's emulated input then goes to the constrained surface.
         if !self.can_pointer_move(&current, location) {
             return;
         }
-        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
-            .space
-            .element_under(location)
-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+        // Through the fullscreen fit, like mouse motion: `local` is the client-space position.
+        let (focus, local) = self.pointer_focus(location);
+        let under: Option<(FocusTarget, Point<f64, Logical>)> =
+            focus.map(|(w, pos)| (w.into(), pos));
         // Same late-`wl_pointer` refocus as mouse motion.
-        self.refocus_pointer_if_pending(&under, time);
+        self.refocus_pointer_if_pending(&under, local, time);
         self.set_pointer_location(location);
         pointer.motion(
             self,
             under,
             &MotionEvent {
-                location,
+                location: local,
                 serial: SERIAL_COUNTER.next_serial(),
                 time: InputTime::from_millis(time),
             },
@@ -1389,7 +1516,7 @@ impl State {
     /// `mode.size` is physical, so it must be converted first: with a UI scale of 2 the
     /// logical extent is half the mode, and clamping against the raw mode would let the
     /// cursor run off the desktop by a factor of the scale.
-    pub(super) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+    pub(crate) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
         if let Some(output) = self.output.as_ref()
             && let Some(mode) = output.current_mode()
         {
@@ -1421,10 +1548,7 @@ impl State {
         // https://gitlab.freedesktop.org/wayland/wayland/-/issues/294
         if !pointer.is_grabbed()
             && !keyboard.is_grabbed()
-            && let Some((window, _)) = self
-                .space
-                .element_under(self.pointer_location)
-                .map(|(w, p)| (w.clone(), p))
+            && let Some((window, _)) = self.pointer_focus(self.pointer_location).0
         {
             self.space.raise_element(&window, true);
             keyboard.set_focus(self, Some(FocusTarget::from(window)), serial);

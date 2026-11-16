@@ -226,6 +226,26 @@ impl Fixture {
         self.finish_solid_window();
     }
 
+    /// [`Fixture::create_solid_window`] for a plain fullscreen app: the toplevel acks the
+    /// initial (fullscreen, output-sized) configure and commits a `buf_w`x`buf_h` buffer
+    /// with **no** `wp_viewport` destination — i.e. it just picked its own internal
+    /// resolution. This is the shape the compositor's fullscreen fit-to-output scaling
+    /// applies to.
+    pub fn create_solid_window_fullscreen(&mut self, buf_w: u16, buf_h: u16, rgb: u32) {
+        self.client.create_window();
+        self.round_trip();
+        self.client
+            .setup_window_solid_no_viewport(buf_w, buf_h, rgb);
+        self.finish_solid_window();
+    }
+
+    /// Attach a solid subsurface to the current window and let the compositor settle, so the
+    /// window's bbox picks it up.
+    pub fn add_solid_subsurface(&mut self, x: i32, y: i32, w: u16, h: u16, rgb: u32) {
+        self.client.add_solid_subsurface(x, y, w, h, rgb);
+        self.finish_solid_window();
+    }
+
     fn finish_solid_window(&mut self) {
         self.round_trip();
         self.round_trip();

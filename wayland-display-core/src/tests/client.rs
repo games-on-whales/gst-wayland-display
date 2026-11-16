@@ -78,6 +78,9 @@ struct State {
     /// Backing files for buffers created by [`WaylandClient::setup_window_solid`]. The
     /// compositor mmaps these for the lifetime of the pool, so they must outlive the test.
     solid_files: Vec<File>,
+    /// Subsurfaces created by [`WaylandClient::add_solid_subsurface`]. Held so they (and
+    /// their surfaces) stay alive for the lifetime of the client.
+    solid_subsurfaces: Vec<(wl_surface::WlSurface, wl_subsurface::WlSubsurface)>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     viewporter: Option<WpViewporter>,
     fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
@@ -298,6 +301,7 @@ impl WaylandClient {
             shm: None,
             buffer: None,
             solid_files: Vec::new(),
+            solid_subsurfaces: Vec::new(),
             wm_base: None,
             viewporter: None,
             fractional_scale_manager: None,
@@ -508,18 +512,10 @@ impl WaylandClient {
         self.setup_window_solid_dst(width, height, width, height, rgb);
     }
 
-    /// [`WaylandClient::setup_window_solid`] with the buffer size and the viewport destination
-    /// decoupled: a `buf_w`x`buf_h` buffer presented at a `dst_w`x`dst_h` LOGICAL size. That is
-    /// what a HiDPI-aware client does — buffer = logical x scale — so it exercises the UI-scale
-    /// path where the compositor must sample the dense buffer 1:1 rather than downsampling it.
-    pub fn setup_window_solid_dst(
-        &mut self,
-        buf_w: u16,
-        buf_h: u16,
-        dst_w: u16,
-        dst_h: u16,
-        rgb: u32,
-    ) {
+    /// Allocate a `buf_w`x`buf_h` shm buffer filled with a single opaque colour
+    /// (`0xRRGGBB`). The backing file is kept alive for the lifetime of the client (the
+    /// compositor mmaps the pool), so callers only deal in the `wl_buffer`.
+    fn make_solid_buffer(&mut self, buf_w: u16, buf_h: u16, rgb: u32) -> wl_buffer::WlBuffer {
         let qh = self.qh.clone();
         let (w, h) = (u32::from(buf_w), u32::from(buf_h));
 
@@ -549,12 +545,69 @@ impl WaylandClient {
             (),
         );
         self.state.solid_files.push(file);
+        buffer
+    }
+
+    /// [`WaylandClient::setup_window_solid`] with the buffer size and the viewport destination
+    /// decoupled: a `buf_w`x`buf_h` buffer presented at a `dst_w`x`dst_h` LOGICAL size. That is
+    /// what a HiDPI-aware client does — buffer = logical x scale — so it exercises the UI-scale
+    /// path where the compositor must sample the dense buffer 1:1 rather than downsampling it.
+    pub fn setup_window_solid_dst(
+        &mut self,
+        buf_w: u16,
+        buf_h: u16,
+        dst_w: u16,
+        dst_h: u16,
+        rgb: u32,
+    ) {
+        let buffer = self.make_solid_buffer(buf_w, buf_h, rgb);
 
         let window = self.state.windows.last_mut().unwrap();
         window.set_title("Solid");
         window.attach_new_buffer(&buffer);
         window.set_size(dst_w, dst_h);
         window.ack_last_and_commit();
+    }
+
+    /// Like [`WaylandClient::setup_window_solid`], but WITHOUT a `wp_viewport` destination:
+    /// the surface's size is simply its buffer size. That is what a plain fullscreen app
+    /// (a native Wayland game that picked its own internal resolution) commits, and it is
+    /// the case the compositor's fullscreen fit-to-output scaling exists for — a client
+    /// that *does* set a viewport destination has stated the size it wants to be presented
+    /// at, and is left alone.
+    pub fn setup_window_solid_no_viewport(&mut self, buf_w: u16, buf_h: u16, rgb: u32) {
+        let buffer = self.make_solid_buffer(buf_w, buf_h, rgb);
+        let window = self.state.windows.last_mut().unwrap();
+        window.set_title("Solid (no viewport)");
+        window.attach_new_buffer(&buffer);
+        window.ack_last_and_commit();
+    }
+
+    /// Attach a `w`x`h` solid subsurface at `(x, y)` to the current window's toplevel
+    /// surface and commit both. The parent's bbox then covers the subsurface too, which is
+    /// what a launcher that renders through subsurfaces looks like — and what the fullscreen
+    /// fit must refuse to derive a scale from (the root buffer is not the visible content).
+    pub fn add_solid_subsurface(&mut self, x: i32, y: i32, w: u16, h: u16, rgb: u32) {
+        let qh = self.qh.clone();
+        let buffer = self.make_solid_buffer(w, h, rgb);
+        let parent = self.state.windows.last().expect("a window").surface.clone();
+        let surface = self
+            .state
+            .compositor
+            .as_ref()
+            .expect("wl_compositor not bound")
+            .create_surface(&qh, ());
+        let subsurface = self
+            .state
+            .subcompositor
+            .as_ref()
+            .expect("wl_subcompositor not bound")
+            .get_subsurface(&surface, &parent, &qh, ());
+        subsurface.set_position(x, y);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        parent.commit();
+        self.state.solid_subsurfaces.push((surface, subsurface));
     }
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
