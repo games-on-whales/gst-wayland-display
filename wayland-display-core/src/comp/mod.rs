@@ -87,6 +87,7 @@ use tracing::debug;
 mod focus;
 mod input;
 pub(crate) mod rendering;
+mod test_picture;
 
 pub use self::focus::*;
 pub use self::input::*;
@@ -252,6 +253,8 @@ pub struct State {
     /// SHM/other) is handled successfully, since that proves the client is alive and any
     /// earlier failure was transient.
     renderer_degraded_active: Option<Instant>,
+    /// The `test-picture` property: draw `test_picture` while no client surface is mapped.
+    pub(crate) test_picture: bool,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -584,6 +587,7 @@ impl State {
             last_hdr_meta: None,
             hdr_refused: false,
             hdr_programs: None,
+            test_picture: false,
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
             app_surface_commits: Arc::new(AtomicU64::new(0)),
@@ -1774,6 +1778,9 @@ pub(crate) fn init(
                 Event::Msg(Command::UiScale(scale)) => {
                     tracing::info!(scale, "Applying requested UI scale");
                     apply_ui_scale(state, scale);
+                }
+                Event::Msg(Command::TestPicture(on)) => {
+                    state.test_picture = on;
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");

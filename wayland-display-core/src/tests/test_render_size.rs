@@ -815,3 +815,41 @@ fn pointer_motion_absolute_clamps_to_the_render_extent() {
         "absolute pointer input must clamp into the render extent, not the encode extent",
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The test picture: present only with the property on and no client surface
+// mapped.
+// ---------------------------------------------------------------------------------------
+
+/// The picture's sRGB bytes at the centre of cell (`col`, `row`) of a 1280x720 frame.
+fn test_picture_cell(px: &[u8], stride: usize, col: usize, row: usize) -> [u8; 3] {
+    pixel(px, stride, col * 80 + 40, row * 80 + 40)
+}
+
+#[test]
+fn the_test_picture_shows_only_while_no_client_surface_is_mapped() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+    apply_encode(&mut f, 1280, 720, 60);
+
+    let (px, stride) = frame_pixels(&mut f);
+    assert_dark(&px, stride, 40, 40);
+
+    f.server.test_picture = true;
+    let (px, stride) = frame_pixels(&mut f);
+    // GRID row 0 starts 3, 0, 1 and row 8 ends 3, 1.
+    assert_eq!(test_picture_cell(&px, stride, 0, 0), [224, 80, 32]);
+    assert_eq!(test_picture_cell(&px, stride, 1, 0), [80, 176, 224]);
+    assert_eq!(test_picture_cell(&px, stride, 2, 0), [128, 32, 224]);
+    assert_eq!(test_picture_cell(&px, stride, 14, 8), [224, 80, 32]);
+    assert_eq!(test_picture_cell(&px, stride, 15, 8), [128, 32, 224]);
+    // Flat to the cell edge: the pixel either side of a boundary is its own cell's colour.
+    assert_eq!(pixel(&px, stride, 79, 40), [224, 80, 32]);
+    assert_eq!(pixel(&px, stride, 80, 40), [80, 176, 224]);
+
+    f.create_solid_window(1280, 720, WHITE);
+    let (px, stride) = frame_pixels(&mut f);
+    for (x, y) in [(40, 40), (120, 40), (1240, 680)] {
+        assert_lit(&px, stride, x, y);
+    }
+}

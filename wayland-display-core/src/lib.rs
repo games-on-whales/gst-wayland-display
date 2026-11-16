@@ -60,6 +60,9 @@ pub enum Command {
     /// PREFERRED mode stay the render size regardless. An empty list advertises no extra
     /// modes (the historical behaviour). Sticky across caps re-negotiation.
     ModeLadder(Vec<(i32, i32)>),
+    /// Element -> compositor: show the test picture (`comp::test_picture`) while no client
+    /// surface is mapped. Off by default.
+    TestPicture(bool),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -343,6 +346,11 @@ impl WaylandDisplay {
     /// at full density. The encode size is untouched. Clamped to `[1.0, 3.0]`.
     pub fn set_ui_scale(&self, scale: f64) {
         let _ = self.command_tx.send(Command::UiScale(scale));
+    }
+
+    /// Show the fixed test picture while no client surface is mapped (default off).
+    pub fn set_test_picture(&self, on: bool) {
+        let _ = self.command_tx.send(Command::TestPicture(on));
     }
 
     /// Advertise a ladder of additional `wl_output` modes (`[(width, height), ...]`), so a

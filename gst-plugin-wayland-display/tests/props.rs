@@ -248,3 +248,11 @@ fn render_size_bounds() {
     assert_eq!(spec.minimum(), 1.0);
     assert_eq!(spec.maximum(), 3.0);
 }
+
+#[test]
+fn test_picture_is_off_by_default_and_reads_back() {
+    let src = make_src();
+    assert!(!src.property::<bool>("test-picture"));
+    src.set_property("test-picture", true);
+    assert!(src.property::<bool>("test-picture"));
+}

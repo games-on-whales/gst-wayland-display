@@ -1,7 +1,9 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::{State, effective_render_size, fit_offset_physical, window_fullscreen_fit};
+use super::{
+    State, effective_render_size, fit_offset_physical, test_picture, window_fullscreen_fit,
+};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
@@ -908,6 +910,21 @@ impl State {
                 Relocate::Relative,
             ))
         }));
+        // Bottom-most and in encode space: the test picture, only while no client surface is
+        // mapped, so a real session never shows it.
+        if self.test_picture && self.space.elements().next().is_none() {
+            elements.extend(test_picture::cells(encode_size.w, encode_size.h).map(
+                |(geo, [r, g, b])| {
+                    OutputElement::Overlay(CursorElement::Solid(SolidColorRenderElement::new(
+                        Id::new(),
+                        geo,
+                        CommitCounter::default(),
+                        Color32F::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0),
+                        Kind::Unspecified,
+                    )))
+                },
+            ));
+        }
 
         // The damage tracker is Static at the encode size (see `apply_output_mode`), which is
         // what sizes the GL viewport/projection here -- the letterbox bars are this clear
