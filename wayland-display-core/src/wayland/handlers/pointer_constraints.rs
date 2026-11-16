@@ -12,11 +12,15 @@ impl PointerConstraintsHandler for State {
             .map(|x| &*(x.wl_surface().unwrap()) == surface)
             .unwrap_or(false)
         {
-            let under = self
-                .space
-                .element_under(self.pointer_location)
-                .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
-            self.maybe_activate_pointer_constraint(&under, self.pointer_location);
+            // Resolved through `pointer_focus`, not `Space::element_under`: with a
+            // fullscreen fit active the raw (render-space) pointer position misses the
+            // window entirely outside its unscaled bbox, and the constraint's region would
+            // be evaluated off by the fit scale. This is the lock-before-map path (SDL,
+            // nested gamescope with --force-grab-cursor), so it must agree with the motion
+            // path that activates constraints later.
+            let (focus, position) = self.pointer_focus(self.pointer_location);
+            let under = focus.map(|(window, origin)| (window.into(), origin));
+            self.maybe_activate_pointer_constraint(&under, position);
         }
     }
 
@@ -29,17 +33,33 @@ impl PointerConstraintsHandler for State {
         if with_pointer_constraint(surface, pointer, |constraint| {
             constraint.is_some_and(|c| c.is_active())
         }) {
-            let origin = self
+            let hinted = self
                 .space
                 .elements()
-                .find_map(|window| {
-                    (window.wl_surface().as_deref() == Some(surface)).then(|| window.geometry())
-                })
-                .unwrap_or_default()
-                .loc
-                .to_f64();
+                .find(|window| window.wl_surface().as_deref() == Some(surface))
+                .map(|window| {
+                    // `origin` matches `pointer_focus`'s: the window's location in its own
+                    // (unfit) coordinate space.
+                    let origin = (self.space.element_location(window).unwrap_or_default()
+                        - window.geometry().loc)
+                        .to_f64();
+                    let (scale, offset) = self.window_fit(window);
+                    // `location` is surface-local, i.e. already in the CLIENT's space -- the
+                    // space smithay's pointer location lives in since the fit landed, so the
+                    // handle is set without any transform. `pointer_location` is the
+                    // compositor's own RENDER-space position (where the cursor is drawn and
+                    // what `clamp_coords` bounds), so it takes the FORWARD fit -- the exact
+                    // inverse of `unfit`. Without this the hint silently half-lands under a
+                    // 2x fit, and the next relative motion accumulates from the stale spot:
+                    // the unlock position for exactly the SDL-style games that lock the
+                    // pointer in the first place.
+                    (origin + location, origin + offset + location.upscale(scale))
+                });
 
-            pointer.set_location(origin + location);
+            if let Some((client_pos, render_pos)) = hinted {
+                pointer.set_location(client_pos);
+                self.set_pointer_location(self.clamp_coords(render_pos));
+            }
         }
     }
 }

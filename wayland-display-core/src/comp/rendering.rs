@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::{State, effective_render_size};
+use super::{State, effective_render_size, fit_offset_physical, window_fullscreen_fit};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
@@ -14,7 +14,7 @@ use smithay::{
         Color32F, ExportMem, ImportAll, ImportMem, Renderer,
         damage::{Error as OutputDamageTrackerError, RenderOutputResult},
         element::{
-            Element, Id, Kind, RenderElement, UnderlyingStorage,
+            AsRenderElements, Element, Id, Kind, RenderElement, UnderlyingStorage,
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
             surface::WaylandSurfaceRenderElement,
@@ -22,10 +22,10 @@ use smithay::{
         },
         utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
-    desktop::space::{SpaceRenderElements, space_render_elements},
+    desktop::Window,
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     render_elements,
-    utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::compositor::with_states,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +40,8 @@ render_elements! {
     Solid=SolidColorRenderElement
 }
 
-type SpaceElement = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+/// A window's surface elements, through its fullscreen fit (see [`WindowElements`]).
+type SpaceElement = WindowElements;
 
 render_elements! {
     FrameElement<=GlesRenderer>;
@@ -347,6 +348,25 @@ render_elements! {
     Overlay=CursorElement<GlesRenderer>,
 }
 
+/// One mapped window's surface tree (plus its popups), mapped from the size the client
+/// actually committed into the size it was configured at — see
+/// [`super::window_fullscreen_fit`]. The wrappers are an exact identity for every window
+/// that already fills its configure.
+type WindowElements =
+    RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>;
+
+/// One mapped window, resolved for this frame: where its elements are built and how they
+/// are mapped into its configured box. Snapshotted out of the space *before* the renderer
+/// is borrowed mutably to build the elements.
+struct FitWindow {
+    window: Window,
+    /// The window's render location, relative to the output's region (render space).
+    loc: Point<i32, Logical>,
+    /// Aspect-preserving fit scale and centring offset — see [`window_fit_physical`].
+    scale: f64,
+    offset: Point<i32, Physical>,
+}
+
 /// How to map a `render`-sized scene into an `encode`-sized framebuffer: an aspect-preserving
 /// upscale plus the centring offset that turns the leftover into symmetric letterbox/pillarbox
 /// bars (painted by the clear colour).
@@ -371,6 +391,24 @@ fn scene_transform(
         ((encode.h as f64 - render.h as f64 * scale) / 2.0).round() as i32,
     ));
     (scale, offset)
+}
+
+/// [`super::window_fullscreen_fit`] for one window, with the centring offset converted from
+/// logical into the PHYSICAL pixels the render elements live in.
+///
+/// The problem the fit solves: a fullscreen toplevel that commits a surface SMALLER than its
+/// configured size — a native Wayland game whose in-menu "resolution" setting picked, say,
+/// 1280x720 on a 1920x1080 output — is composited by the space at that size at its map
+/// location, i.e. 1:1 in the top-left corner with black everywhere else. Every other
+/// compositor scales it to fill the output; gwd did not, which is what made an in-app
+/// resolution choice look broken.
+fn window_fit_physical(
+    window: &Window,
+    output_logical: Size<i32, Logical>,
+    output_scale: f64,
+) -> (f64, Point<i32, Physical>) {
+    let (scale, offset) = window_fullscreen_fit(window, output_logical);
+    (scale, fit_offset_physical(offset, output_scale))
 }
 
 /// HDR render-path spike: linear brightness levels (multiples of SDR reference white) for the
@@ -773,17 +811,67 @@ impl State {
             .bind(&mut self.renderer)
             .map_err(OutputDamageTrackerError::Rendering)?;
 
-        // What smithay's `desktop::space::render_output` does (custom elements on top of the
-        // space's), with each space element converted as above.
-        let space_elements = space_render_elements(
-            &mut self.renderer,
-            [&self.space],
-            self.output.as_ref().unwrap(),
-            1.0,
-        )
-        .map_err(OutputDamageTrackerError::OutputNoMode)?;
+        // Client surfaces, in render space. Built per window (rather than via
+        // `desktop::space::space_render_elements` / `render_output`) so each window's
+        // elements can be wrapped in its OWN fit transform before the whole scene is wrapped
+        // in the render->encode one, and so they can be grouped with the cursor.
+        //
+        // The traversal mirrors `Space::render_elements_for_region`, which this replaces:
+        // z-order back-to-front from `space.elements()`, reversed so the topmost window's
+        // elements come first (render-element lists are front-to-back), each window's
+        // location taken relative to the output's region. gwd maps exactly one output at
+        // (0,0) and uses no layer-shell surfaces, so nothing else `space_render_elements`
+        // does applies here.
+        let output = self.output.clone().expect("output not set");
+        let region = self.space.output_geometry(&output);
+        let windows: Vec<FitWindow> = match region {
+            Some(region) => self
+                .space
+                .elements()
+                .rev()
+                .filter_map(|window| {
+                    let bbox = self.space.element_bbox(window)?;
+                    if !region.overlaps(bbox) {
+                        return None;
+                    }
+                    let loc = self.space.element_location(window)?
+                        - smithay::desktop::space::SpaceElement::geometry(window).loc
+                        - region.loc;
+                    let (scale, offset) = window_fit_physical(window, region.size, output_scale);
+                    Some(FitWindow {
+                        window: window.clone(),
+                        loc,
+                        scale,
+                        offset,
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let mut window_elements: Vec<WindowElements> = Vec::new();
+        for fit in windows {
+            let origin: Point<i32, Physical> = fit.loc.to_physical_precise_round(output_scale);
+            let elements = fit
+                .window
+                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                    &mut self.renderer,
+                    origin,
+                    Scale::from(output_scale),
+                    // alpha
+                    1.0,
+                );
+            window_elements.extend(elements.into_iter().map(|e| {
+                RelocateRenderElement::from_element(
+                    RescaleRenderElement::from_element(e, origin, fit.scale),
+                    fit.offset,
+                    Relocate::Relative,
+                )
+            }));
+        }
+
         frame_elements.extend(
-            space_elements
+            window_elements
                 .into_iter()
                 .map(|element| match &composition {
                     None => FrameElement::Space(element),
