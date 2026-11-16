@@ -24,6 +24,9 @@ use wayland_protocols::{
             wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
             wp_image_description_v1::WpImageDescriptionV1,
         },
+        fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        fractional_scale::v1::client::wp_fractional_scale_v1,
+        fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
         pointer_constraints::zv1::{
             client::zwp_confined_pointer_v1, client::zwp_locked_pointer_v1::ZwpLockedPointerV1,
             client::zwp_pointer_constraints_v1,
@@ -70,9 +73,14 @@ struct State {
     qh: QueueHandle<State>,
 
     compositor: Option<wl_compositor::WlCompositor>,
+    shm: Option<wl_shm::WlShm>,
     buffer: Option<wl_buffer::WlBuffer>,
+    /// Backing files for buffers created by [`WaylandClient::setup_window_solid`]. The
+    /// compositor mmaps these for the lifetime of the pool, so they must outlive the test.
+    solid_files: Vec<File>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     viewporter: Option<WpViewporter>,
+    fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     pointer_constraints: Option<ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
@@ -149,6 +157,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         (),
                     );
                     state.buffer = Some(buffer.clone());
+                    state.shm = Some(shm);
                 }
                 "wl_seat" => {
                     state.seat =
@@ -162,6 +171,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wp_viewporter" => {
                     state.viewporter =
                         Some(registry.bind::<WpViewporter, _, _>(name, version, qh, ()));
+                }
+                "wp_fractional_scale_manager_v1" => {
+                    state.fractional_scale_manager = Some(
+                        registry.bind::<WpFractionalScaleManagerV1, _, _>(name, version, qh, ()),
+                    );
                 }
                 "zwp_pointer_constraints_v1" => {
                     state.pointer_constraints =
@@ -265,6 +279,7 @@ impl Dispatch<ZwpTabletToolV2, ()> for State {
         state.tablet_events.push(TabletEvents::Tool(event));
     }
 }
+delegate_noop!(State: ignore WpFractionalScaleManagerV1);
 
 impl WaylandClient {
     pub fn new(w_socket: UnixStream) -> Self {
@@ -280,9 +295,12 @@ impl WaylandClient {
             qh: qh.clone(),
 
             compositor: None,
+            shm: None,
             buffer: None,
+            solid_files: Vec::new(),
             wm_base: None,
             viewporter: None,
+            fractional_scale_manager: None,
             seat: None,
             pointer_constraints: None,
             relative_pointer_manager: None,
@@ -338,6 +356,28 @@ impl WaylandClient {
     /// Create a toplevel but hold back its initial commit (see `commit_window`).
     pub fn create_window_uncommitted(&mut self) {
         self.state.create_window_uncommitted();
+    }
+
+    /// Like [`WaylandClient::create_window`], but also creates a `wp_fractional_scale_v1`
+    /// for the new surface (before the first commit), so `preferred_scale` events for it
+    /// are recorded. Returns the surface, for use with
+    /// [`WaylandClient::last_preferred_scale`].
+    pub fn map_toplevel_with_fractional_scale(&mut self) -> wl_surface::WlSurface {
+        self.state.create_window_uncommitted_with(true);
+        let window = self.state.windows.last().unwrap();
+        window.commit();
+        window.surface.clone()
+    }
+
+    /// The most recent `wp_fractional_scale_v1::preferred_scale` for `surface`, in the
+    /// protocol's 1/120ths (so `2.0` arrives as `240`). `None` when the surface has no
+    /// fractional-scale object or has not been told a scale yet.
+    pub fn last_preferred_scale(&self, surface: &wl_surface::WlSurface) -> Option<u32> {
+        self.state
+            .windows
+            .iter()
+            .find(|w| w.surface == *surface)
+            .and_then(|w| w.preferred_scales.last().copied())
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
@@ -460,6 +500,63 @@ impl WaylandClient {
         surface.commit();
     }
 
+    /// Like [`WaylandClient::setup_window`], but attaches a freshly allocated `width`x`height`
+    /// shm buffer filled with a single opaque colour (`0xRRGGBB`), 1:1 with the viewport
+    /// destination. Used by the render-size compositing tests, which assert on pixels read
+    /// back out of the compositor's framebuffer.
+    pub fn setup_window_solid(&mut self, width: u16, height: u16, rgb: u32) {
+        self.setup_window_solid_dst(width, height, width, height, rgb);
+    }
+
+    /// [`WaylandClient::setup_window_solid`] with the buffer size and the viewport destination
+    /// decoupled: a `buf_w`x`buf_h` buffer presented at a `dst_w`x`dst_h` LOGICAL size. That is
+    /// what a HiDPI-aware client does — buffer = logical x scale — so it exercises the UI-scale
+    /// path where the compositor must sample the dense buffer 1:1 rather than downsampling it.
+    pub fn setup_window_solid_dst(
+        &mut self,
+        buf_w: u16,
+        buf_h: u16,
+        dst_w: u16,
+        dst_h: u16,
+        rgb: u32,
+    ) {
+        let qh = self.qh.clone();
+        let (w, h) = (u32::from(buf_w), u32::from(buf_h));
+
+        let mut file = tempfile::tempfile().unwrap();
+        {
+            use std::io::Write;
+            let px = (0xFF00_0000u32 | (rgb & 0x00FF_FFFF)).to_ne_bytes();
+            let mut buf = std::io::BufWriter::new(&mut file);
+            for _ in 0..(w * h) {
+                buf.write_all(&px).unwrap();
+            }
+            buf.flush().unwrap();
+        }
+        let pool = self
+            .state
+            .shm
+            .as_ref()
+            .expect("wl_shm not bound")
+            .create_pool(file.as_fd(), (w * h * 4) as i32, &qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            (w * 4) as i32,
+            wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
+        self.state.solid_files.push(file);
+
+        let window = self.state.windows.last_mut().unwrap();
+        window.set_title("Solid");
+        window.attach_new_buffer(&buffer);
+        window.set_size(dst_w, dst_h);
+        window.ack_last_and_commit();
+    }
+
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
         self.state.mouse_events.as_mut()
     }
@@ -530,6 +627,16 @@ impl WaylandClient {
         }
         let seat = self.state.seat.as_ref().expect("no wl_seat bound").clone();
         self.state.pointer = Some(seat.get_pointer(&qh, ()));
+    }
+
+    /// Size carried by the most recent toplevel `configure` on the first window — the LOGICAL
+    /// size the compositor wants the client to be. `(0, 0)` means "you decide".
+    pub fn last_configure_size(&self) -> Option<(i32, i32)> {
+        self.state
+            .windows
+            .first()
+            .and_then(|w| w.configures_received.last())
+            .map(|(_, c)| c.size)
     }
 
     /// Call this to start receiving Relative events in `get_client_events()`
@@ -608,6 +715,11 @@ impl WaylandClient {
 impl State {
     /// Create a toplevel without its initial commit.
     pub fn create_window_uncommitted(&mut self) {
+        self.create_window_uncommitted_with(false);
+    }
+
+    /// [`State::create_window_uncommitted`], optionally with a `wp_fractional_scale_v1`.
+    pub fn create_window_uncommitted_with(&mut self, with_fractional_scale: bool) {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.wm_base.as_ref().unwrap();
         let viewporter = self.viewporter.as_ref().unwrap();
@@ -616,12 +728,20 @@ impl State {
         let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
         let xdg_toplevel = xdg_surface.get_toplevel(&self.qh, ());
         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+        let fractional_scale = with_fractional_scale.then(|| {
+            self.fractional_scale_manager
+                .as_ref()
+                .expect("compositor does not advertise wp_fractional_scale_manager_v1")
+                .get_fractional_scale(&surface, &self.qh, ())
+        });
 
         self.windows.push(Window {
             surface,
             xdg_surface,
             xdg_toplevel,
             viewport,
+            fractional_scale,
+            preferred_scales: Vec::new(),
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
@@ -652,6 +772,11 @@ pub struct Window {
     pub xdg_surface: xdg_surface::XdgSurface,
     pub xdg_toplevel: xdg_toplevel::XdgToplevel,
     pub viewport: WpViewport,
+    /// `wp_fractional_scale_v1` for this surface, when the window was created with one.
+    /// Held alive for the lifetime of the window: destroying it stops `preferred_scale`.
+    pub fractional_scale: Option<WpFractionalScaleV1>,
+    /// Every `preferred_scale` received for this surface, in 1/120ths.
+    pub preferred_scales: Vec<u32>,
     pub pending_configure: Configure,
     pub configures_received: Vec<(u32, Configure)>,
     pub close_requested: bool,
@@ -843,6 +968,27 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
     ) {
         tracing::debug!("{:?}", event);
         state.output_events.push(event);
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && let Some(window) = state
+                .windows
+                .iter_mut()
+                .find(|w| w.fractional_scale.as_ref() == Some(proxy))
+        {
+            window.preferred_scales.push(scale);
+        }
     }
 }
 
