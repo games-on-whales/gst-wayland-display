@@ -168,6 +168,9 @@ type Err = Box<dyn std::error::Error>;
 /// An imported RGBA dmabuf (image/memory/view) kept alive until its frame's GPU work ends.
 type Import = (vk::Image, vk::DeviceMemory, vk::ImageView);
 
+/// Imports of the RGBA dmabuf tried before a conversion gives up.
+const IMPORT_TRIES: usize = 3;
+
 /// Output pixel format the converter targets. NV12 is the 8-bit 4:2:0 default; P010 is the
 /// 10-bit 4:2:0 path (for `vulkanh265enc` Main-10). Identical compute math and pipeline
 /// topology -- P010 just swaps the multiplanar image format and per-plane storage views for
@@ -676,6 +679,8 @@ pub struct VulkanNv12 {
     /// device has VK_EXT_queue_family_foreign, else QUEUE_FAMILY_EXTERNAL.
     foreign_qf: u32,
     cmd_pool: vk::CommandPool,
+    /// The physical device, for the import read-back format query (`import_copyable`).
+    physical: vk::PhysicalDevice,
     pipeline: vk::Pipeline,
     /// Per-frame pipelines for dynamic HDR (fp16 input only); `convert` picks one from the
     /// frame's [`FrameColor`] instead of `pipeline`.
@@ -899,6 +904,7 @@ impl VulkanNv12 {
             fmt,
         );
         let (qfi, implicit_sync) = (opened.qfi, opened.implicit_sync);
+        this.physical = opened.pd;
         this.pool_return = Some((target_minor, opened));
         this.build_compute(fmt, bt2020, fp16_input, &options, qfi)?;
 
@@ -967,6 +973,7 @@ impl VulkanNv12 {
             qfi,
             foreign_qf,
             cmd_pool: vk::CommandPool::null(),
+            physical: vk::PhysicalDevice::null(),
             pipeline: vk::Pipeline::null(),
             dynamic: None,
             pipeline_layout: vk::PipelineLayout::null(),
@@ -1183,6 +1190,7 @@ impl VulkanNv12 {
             fmt,
         );
         this.encode_src = true;
+        this.physical = raw.physical;
         this.gst_queue = Some(raw.gfx_queue);
         this._shared_device = Some(device_gst.clone());
         this.build_compute(fmt, bt2020, fp16_input, &options, raw.gfx_queue_family)?;
@@ -1362,14 +1370,14 @@ impl VulkanNv12 {
                     Some((identity, import)) if identity == key => import,
                     _ => {
                         self.free_shared_import();
-                        let import = self.create_import(rgba)?;
+                        let import = self.create_checked_import(idx, rgba)?;
                         self.shared_import = Some((key, import));
                         import
                     }
                 }
             } else {
                 self.free_import(idx);
-                self.create_import(rgba)?
+                self.create_checked_import(idx, rgba)?
             };
             self.outputs[idx].import = Some((key, import));
         }
@@ -1907,11 +1915,249 @@ impl VulkanNv12 {
         self.device.queue_submit(self.queue, submits, fence)
     }
 
+    /// How many RGBA imports the converter holds, and whether the ring shares one.
+    #[cfg(test)]
+    pub(crate) fn held_imports(&self) -> (usize, bool) {
+        let shared = usize::from(self.shared_import.is_some());
+        let own = if self.share_import {
+            0
+        } else {
+            self.outputs.iter().filter(|o| o.import.is_some()).count()
+        };
+        (shared + own, self.share_import)
+    }
+
+    /// `create_import`, read back before use where the modifier can be a copy source. NVIDIA
+    /// can fail an import's GPU mapping and still return VK_SUCCESS; that image reads 0 at
+    /// every texel. The compositor renders with buffer age 0, so every pixel no
+    /// opaque element covers is its opaque black clear: a sound import has a non-zero byte.
+    /// A refused read-back usage imports again without it, unchecked; running out of memory
+    /// or objects does not (`copy_source_refused`).
+    unsafe fn create_checked_import(&self, held: usize, rgba: &Dmabuf) -> Result<Import, Err> {
+        let format = rgba_vk_format(rgba.format().code).ok_or("unsupported RGBA fourcc")?;
+        let modifier: u64 = rgba.format().modifier.into();
+        let checkable = std::cell::Cell::new(self.import_copyable(format, modifier));
+        let attempt = std::cell::Cell::new(0);
+        first_sound(
+            IMPORT_TRIES,
+            || {
+                attempt.set(attempt.get() + 1);
+                if checkable.get() {
+                    match self.create_import(rgba, true) {
+                        Ok(import) => return Ok(import),
+                        // Running out is not a refusal: the conversion fails, as any failed
+                        // import does, rather than stream an import nobody checked.
+                        Err(e) if !copy_source_refused(&e) => {
+                            tracing::warn!(
+                                token = "vulkan-import-copy-source-exhausted",
+                                slot = held,
+                                modifier = format!("{modifier:#x}"),
+                                "VulkanNv12: RGBA import with read-back ran out of memory or objects ({e}); failing the conversion"
+                            );
+                            return Err(e);
+                        }
+                        // The format query said yes but the driver refused the usage: a
+                        // refused flag must never fail a launch, so import as before, unchecked.
+                        Err(e) => {
+                            tracing::warn!(
+                                token = "vulkan-import-copy-source-refused",
+                                slot = held,
+                                modifier = format!("{modifier:#x}"),
+                                "VulkanNv12: RGBA import with read-back refused ({e}); importing it unchecked (running out of memory or objects fails the conversion instead)"
+                            );
+                            checkable.set(false);
+                        }
+                    }
+                }
+                self.create_import(rgba, false)
+            },
+            |import| {
+                let sound = if checkable.get() {
+                    match self.probe_import(import.0, format) {
+                        Ok(bytes) => Some(bytes.iter().any(|&b| b != 0)),
+                        Err(e) => {
+                            tracing::warn!(
+                                token = "vulkan-import-probe-failed",
+                                slot = held,
+                                "VulkanNv12: RGBA import read-back failed: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                tracing::info!(
+                    token = "vulkan-import-checked",
+                    slot = held,
+                    checkable = checkable.get(),
+                    attempt = attempt.get(),
+                    verdict = match sound {
+                        Some(true) => "sound",
+                        Some(false) => "zero",
+                        None => "unjudged",
+                    },
+                    "VulkanNv12: RGBA import"
+                );
+                if sound == Some(false) {
+                    tracing::warn!(
+                        token = "vulkan-import-reads-nothing",
+                        slot = held,
+                        attempt = attempt.get(),
+                        tries = IMPORT_TRIES,
+                        "VulkanNv12: RGBA import reads 0 at every probed texel, the driver failed its mapping; {}",
+                        if attempt.get() >= IMPORT_TRIES {
+                            "giving up"
+                        } else {
+                            "importing again"
+                        }
+                    );
+                }
+                sound
+            },
+            |import| self.destroy_import(import),
+        )
+    }
+
+    /// Whether an import of `format` with `modifier` can also be a copy source (the read-back).
+    unsafe fn import_copyable(&self, format: vk::Format, modifier: u64) -> bool {
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .push_next(&mut drm)
+            .push_next(&mut ext);
+        let mut ext_props = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+        self.instance
+            .get_physical_device_image_format_properties2(self.physical, &info, &mut props)
+            .is_ok()
+    }
+
+    /// Copy five texels (corners and centre) of `img` to host memory.
+    unsafe fn probe_import(&self, img: vk::Image, format: vk::Format) -> Result<Vec<u8>, Err> {
+        let texel: u64 = if format == vk::Format::R16G16B16A16_SFLOAT {
+            8
+        } else {
+            4
+        };
+        let (w, h) = (self.width, self.height);
+        let points = [
+            (0, 0),
+            (w - 1, 0),
+            (w / 2, h / 2),
+            (0, h - 1),
+            (w - 1, h - 1),
+        ];
+        let size = texel * points.len() as u64;
+        let (mut buf, mut mem) = (vk::Buffer::null(), vk::DeviceMemory::null());
+        let (mut cmd, mut fence) = (vk::CommandBuffer::null(), vk::Fence::null());
+        let result = (|| -> Result<Vec<u8>, Err> {
+            buf = self.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST),
+                None,
+            )?;
+            let mr = self.device.get_buffer_memory_requirements(buf);
+            let mt = mem_type(
+                &self.memp,
+                mr.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            mem = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(mr.size)
+                    .memory_type_index(mt),
+                None,
+            )?;
+            self.device.bind_buffer_memory(buf, mem, 0)?;
+            cmd = self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .command_buffer_count(1),
+            )?[0];
+            fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+            self.device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+            // The same old layout as the per-frame barrier in `convert`, so this reads what
+            // the conversion samples.
+            let to_src = img_barrier(
+                img,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_src],
+            );
+            let regions: Vec<vk::BufferImageCopy> = points
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| {
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(texel * i as u64)
+                        .image_subresource(plane_layers(vk::ImageAspectFlags::COLOR))
+                        .image_offset(vk::Offset3D {
+                            x: x as i32,
+                            y: y as i32,
+                            z: 0,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        })
+                })
+                .collect();
+            self.device.cmd_copy_image_to_buffer(
+                cmd,
+                img,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buf,
+                &regions,
+            );
+            self.device.end_command_buffer(cmd)?;
+            let cbs = [cmd];
+            self.submit(&[vk::SubmitInfo::default().command_buffers(&cbs)], fence)?;
+            self.device.wait_for_fences(&[fence], true, u64::MAX)?;
+            let ptr = self
+                .device
+                .map_memory(mem, 0, size, vk::MemoryMapFlags::empty())?
+                as *const u8;
+            let bytes = std::slice::from_raw_parts(ptr, size as usize).to_vec();
+            self.device.unmap_memory(mem);
+            Ok(bytes)
+        })();
+        // Destroying or freeing a null handle is a no-op, so this covers every exit above.
+        self.device.destroy_fence(fence, None);
+        self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+        self.device.destroy_buffer(buf, None);
+        self.device.free_memory(mem, None);
+        result
+    }
+
     /// Build a sampled VkImage over the source RGBA dmabuf (explicit per-plane layout, so
     /// multi-plane DCC modifiers import too). The Vulkan device matches the render node
     /// (see `new`), so the import runs on the GPU that produced the dmabuf -- this is what
     /// lets nvidia import its own block-linear RGBA. Cached per ring slot by the caller.
-    unsafe fn create_import(&self, rgba: &Dmabuf) -> Result<Import, Err> {
+    unsafe fn create_import(&self, rgba: &Dmabuf, copy_source: bool) -> Result<Import, Err> {
         let pd_format = rgba_vk_format(rgba.format().code).ok_or("unsupported RGBA fourcc")?;
         let modifier: u64 = rgba.format().modifier.into();
         // One layout per memory plane (main + any DCC-metadata plane). Planes share the
@@ -1964,7 +2210,11 @@ impl VulkanNv12 {
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(vk::ImageUsageFlags::SAMPLED)
+                .usage(if copy_source {
+                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
+                } else {
+                    vk::ImageUsageFlags::SAMPLED
+                })
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .push_next(&mut extmem)
                 .push_next(&mut explicit),
@@ -2108,10 +2358,8 @@ impl VulkanNv12 {
     }
 
     unsafe fn free_shared_import(&mut self) {
-        if let Some((_, (img, mem, view))) = self.shared_import.take() {
-            self.device.destroy_image_view(view, None);
-            self.device.destroy_image(img, None);
-            self.device.free_memory(mem, None);
+        if let Some((_, import)) = self.shared_import.take() {
+            self.destroy_import(import);
         }
     }
 
@@ -2121,11 +2369,15 @@ impl VulkanNv12 {
             self.outputs[idx].import = None;
             return;
         }
-        if let Some((_, (img, mem, view))) = self.outputs[idx].import.take() {
-            self.device.destroy_image_view(view, None);
-            self.device.destroy_image(img, None);
-            self.device.free_memory(mem, None);
+        if let Some((_, import)) = self.outputs[idx].import.take() {
+            self.destroy_import(import);
         }
+    }
+
+    unsafe fn destroy_import(&self, (img, mem, view): Import) {
+        self.device.destroy_image_view(view, None);
+        self.device.destroy_image(img, None);
+        self.device.free_memory(mem, None);
     }
 
     /// The just-converted NV12 export slot as a gst buffer.
@@ -2245,6 +2497,48 @@ impl Drop for VulkanNv12 {
 }
 
 // --- helpers ---
+
+/// Whether a failed copy-source import may be made again without the read-back usage
+///. Which error a driver returns for a usage it refuses is undefined, so every
+/// error counts as a refusal except running out of memory or objects: an import made after
+/// that would stream unchecked.
+fn copy_source_refused(e: &Err) -> bool {
+    !matches!(
+        e.downcast_ref::<vk::Result>().copied(),
+        Some(
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                | vk::Result::ERROR_TOO_MANY_OBJECTS
+        )
+    )
+}
+
+/// Makes up to `tries` imports until one is sound. An unsound one is held until the loop ends
+/// and then released, so each retry is made while the earlier ones are still alive. `sound`
+/// returns `None` when it cannot judge, and that import is used.
+fn first_sound<T>(
+    tries: usize,
+    mut make: impl FnMut() -> Result<T, Err>,
+    mut sound: impl FnMut(&T) -> Option<bool>,
+    release: impl FnMut(T),
+) -> Result<T, Err> {
+    let mut bad = Vec::new();
+    let result = loop {
+        let item = match make() {
+            Ok(item) => item,
+            Err(e) => break Err(e),
+        };
+        if sound(&item) != Some(false) {
+            break Ok(item);
+        }
+        bad.push(item);
+        if bad.len() >= tries {
+            break Err(format!("VulkanNv12: all {tries} RGBA imports read 0").into());
+        }
+    };
+    bad.into_iter().for_each(release);
+    result
+}
 
 /// The per-frame pipelines of the dynamic-HDR fp16 path, one per (output state, content
 /// transfer) pair the output format can carry.
@@ -3271,5 +3565,106 @@ mod conversion_tests {
         // SDR content keeps the regular BT.601 shader.
         let white = convert_solid(node, PixFmt::Nv12, [1.0; 3], FrameColor::default()).unwrap();
         assert_solid("nv12 sdr white", &white, 235, 128, 128, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `first_sound` over imports numbered 1.. whose soundness is `verdicts[n - 1]`, and
+    /// returns its result plus the event log ("make n" / "release n").
+    fn run_first_sound(verdicts: &[Option<bool>]) -> (Result<u32, String>, Vec<String>) {
+        let log = std::cell::RefCell::new(Vec::new());
+        let mut n = 0;
+        let result = first_sound(
+            IMPORT_TRIES,
+            || {
+                n += 1;
+                log.borrow_mut().push(format!("make {n}"));
+                verdicts
+                    .get(n as usize - 1)
+                    .map(|_| n)
+                    .ok_or_else(|| "no more".into())
+            },
+            |&i| verdicts[i as usize - 1],
+            |i| log.borrow_mut().push(format!("release {i}")),
+        );
+        (result.map_err(|e| e.to_string()), log.into_inner())
+    }
+
+    #[test]
+    fn a_sound_or_unjudged_import_is_used_first_time() {
+        assert_eq!(
+            run_first_sound(&[Some(true)]),
+            (Ok(1), vec!["make 1".into()])
+        );
+        assert_eq!(run_first_sound(&[None]), (Ok(1), vec!["make 1".into()]));
+    }
+
+    #[test]
+    fn a_bad_import_is_held_until_a_sound_one_exists() {
+        let (result, log) = run_first_sound(&[Some(false), Some(false), Some(true)]);
+        assert_eq!(result, Ok(3));
+        assert_eq!(
+            log,
+            ["make 1", "make 2", "make 3", "release 1", "release 2"]
+        );
+    }
+
+    #[test]
+    fn every_import_bad_is_an_error_and_releases_them_all() {
+        let (result, log) = run_first_sound(&[Some(false); IMPORT_TRIES]);
+        assert!(result.unwrap_err().contains("read 0"));
+        assert_eq!(
+            log,
+            [
+                "make 1",
+                "make 2",
+                "make 3",
+                "release 1",
+                "release 2",
+                "release 3"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unjudged_import_after_a_bad_one_is_used_and_the_bad_one_released() {
+        let (result, log) = run_first_sound(&[Some(false), None]);
+        assert_eq!(result, Ok(2));
+        assert_eq!(log, ["make 1", "make 2", "release 1"]);
+    }
+
+    #[test]
+    fn a_failed_import_releases_the_bad_ones_and_errors() {
+        let (result, log) = run_first_sound(&[Some(false)]);
+        assert_eq!(result, Err("no more".into()));
+        assert_eq!(log, ["make 1", "make 2", "release 1"]);
+    }
+
+    #[test]
+    fn only_a_refusal_falls_back_to_an_unchecked_import() {
+        // As `create_import` returns them: `?` on a Vulkan call is this `From`, which boxes
+        // the vk::Result itself.
+        let vk_err = |r: vk::Result| Err::from(r);
+        for r in [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_TOO_MANY_OBJECTS,
+        ] {
+            assert!(!copy_source_refused(&vk_err(r)), "{r:?}");
+        }
+        for r in [
+            vk::Result::ERROR_FORMAT_NOT_SUPPORTED,
+            vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+            vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+            vk::Result::ERROR_UNKNOWN,
+        ] {
+            assert!(copy_source_refused(&vk_err(r)), "{r:?}");
+        }
+        assert!(copy_source_refused(
+            &"no import-compatible memory type".into()
+        ));
     }
 }

@@ -853,6 +853,17 @@ mod tests {
         ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
     }
 
+    /// `skip!`, except that it fails when `NV12_TEST_NODE` is set: ci/harness.sh gpu sets it
+    /// once it has found a GPU, and a skip there would read as a pass.
+    macro_rules! skip_or_fail {
+        ($($a:tt)*) => {{
+            if std::env::var_os("NV12_TEST_NODE").is_some() {
+                panic!("NV12_TEST_NODE is set but the test cannot run: {}", format!($($a)*));
+            }
+            skip!($($a)*)
+        }};
+    }
+
     /// Adapted from: https://github.com/games-on-whales/smithay/blob/master/examples/buffer_test.rs#L277
     /// Produces a 2x2 grid of colored rectangles:
     /// ```
@@ -1285,6 +1296,95 @@ mod tests {
         // Anything not in the table (incl. non-RGB formats) falls through.
         assert_eq!(gst_video_format_name_to_drm_fourcc("NV12".into()), None);
         assert_eq!(gst_video_format_name_to_drm_fourcc("".into()), None);
+    }
+
+    /// Clears the whole RGBA target to `color` and waits for the GPU.
+    fn clear_target(
+        renderer: &mut GlesRenderer,
+        rgba: &mut Dmabuf,
+        w: i32,
+        h: i32,
+        color: [f32; 4],
+    ) {
+        let mut framebuffer = renderer.bind(rgba).expect("Failed to bind dmabuf");
+        let mut frame = renderer
+            .render(&mut framebuffer, (w, h).into(), Transform::Normal)
+            .expect("Failed to create render frame");
+        frame
+            .clear(color.into(), &[Rectangle::from_size((w, h).into())])
+            .expect("Render error");
+        frame
+            .finish()
+            .expect("Failed to finish render frame")
+            .wait()
+            .expect("Synchronization error");
+    }
+
+    /// The converter never uses an RGBA import that reads 0 at every texel, and once a sound
+    /// one exists it holds exactly one.
+    #[test]
+    #[ignore = "needs a GPU with Vulkan dmabuf import; run via ci/harness.sh gpu"]
+    fn nv12_converter_refuses_an_import_that_reads_nothing() {
+        test_init();
+
+        // The harness names the node it found: test that one, never another GPU on the box.
+        let render_node = match std::env::var("NV12_TEST_NODE") {
+            Ok(path) => DrmNode::from_path(&path)
+                .unwrap_or_else(|e| panic!("NV12_TEST_NODE={path}: cannot open it: {e}")),
+            Err(_) => match pick_render_node(&["nvidia", "amdgpu", "i915", "xe"]) {
+                Some(node) => node,
+                None => skip!("no supported render node"),
+            },
+        };
+        let Some(&modifier) =
+            crate::utils::vulkan_nv12::supported_nv12_modifiers(Some(render_node.minor())).first()
+        else {
+            skip_or_fail!("no NV12 export modifier on this GPU");
+        };
+        let (w, h) = (64, 64);
+        let drm_format = if modifier == 0 {
+            "NV12".to_string()
+        } else {
+            format!("NV12:{modifier:#018x}")
+        };
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(VideoFormat::DmaDrm)
+            .field("drm-format", drm_format.as_str())
+            .width(w)
+            .height(h)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let info = VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
+        let mut renderer = setup_renderer(Some(render_node));
+        let va_share = crate::utils::va_share::VaShare::default();
+        let Some(mut nv12) = GsNv12Buf::new(
+            &mut renderer,
+            render_node,
+            info,
+            PixFmt::Nv12,
+            &va_share,
+            Default::default(),
+        ) else {
+            skip_or_fail!("no NV12 converter for {drm_format} on this GPU");
+        };
+
+        clear_target(&mut renderer, &mut nv12.rgba, w, h, [0.0; 4]);
+        let err = nv12
+            .vulkan
+            .lock()
+            .unwrap()
+            .convert(&nv12.rgba, FrameColor::default())
+            .expect_err("an import reading 0 at every texel was used");
+        assert!(err.to_string().contains("read 0"), "{err}");
+
+        clear_target(&mut renderer, &mut nv12.rgba, w, h, [0.0, 0.0, 0.0, 1.0]);
+        let mut converter = nv12.vulkan.lock().unwrap();
+        converter
+            .convert(&nv12.rgba, FrameColor::default())
+            .expect("an opaque target converts");
+        assert_eq!(converter.held_imports().0, 1);
     }
 }
 
