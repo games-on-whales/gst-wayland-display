@@ -24,6 +24,7 @@ fn unanswered_display() -> WaylandDisplay {
         reply_timeout: Duration::from_millis(200),
         render_device: None,
         app_surface_commits: Default::default(),
+        renderer_degraded: Default::default(),
         tracer: None,
         devices: MaybeRecv::Rx(devices_rx),
         envs: MaybeRecv::Rx(envs_rx),

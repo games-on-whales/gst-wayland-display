@@ -1512,6 +1512,27 @@ mod tests {
     const KEY_SEMICOLON: u32 = 39;
     const KEY_Z: u32 = 44;
 
+    /// The degradation signal is a condition, not a per-failure event: repeat failures while
+    /// it is active do not re-emit, and a successful buffer clears it so the next failure does.
+    #[test]
+    fn renderer_degraded_emits_once_per_condition() {
+        use std::sync::atomic::Ordering;
+        let mut harness = TestState::new();
+        let state = harness.state();
+        let count = |state: &State| state.renderer_degraded.load(Ordering::Relaxed);
+
+        state.note_renderer_degraded("first");
+        state.note_renderer_degraded("second");
+        state.tick_renderer_degraded();
+        assert_eq!(count(state), 1);
+
+        state.clear_renderer_degraded();
+        state.tick_renderer_degraded();
+        assert_eq!(count(state), 1);
+        state.note_renderer_degraded("again");
+        assert_eq!(count(state), 2);
+    }
+
     #[test]
     fn keyboard_layout_builds_the_keymap() {
         let mut harness = TestState::new();

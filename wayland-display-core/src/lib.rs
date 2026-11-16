@@ -138,6 +138,9 @@ pub struct WaylandDisplay {
     // the compositor stopped answering.
     render_device: Option<GPUDevice>,
     app_surface_commits: Arc<AtomicU64>,
+    /// Shared count of renderer-degradation events; the element delta-samples it to post
+    /// a `wolf-renderer-degraded` bus warning.
+    renderer_degraded: Arc<AtomicU64>,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -229,6 +232,8 @@ impl WaylandDisplay {
         let compositor_vulkan_share = Arc::clone(&vulkan_share);
         let app_surface_commits = Arc::new(AtomicU64::new(0));
         let compositor_commits = Arc::clone(&app_surface_commits);
+        let renderer_degraded = Arc::new(AtomicU64::new(0));
+        let compositor_degraded = Arc::clone(&renderer_degraded);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -247,6 +252,7 @@ impl WaylandDisplay {
                     compositor_vulkan_share,
                     va_share,
                     compositor_commits,
+                    compositor_degraded,
                 )
             })) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -260,6 +266,7 @@ impl WaylandDisplay {
             reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
             render_device,
             app_surface_commits,
+            renderer_degraded,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -280,6 +287,13 @@ impl WaylandDisplay {
             .get(self.reply_timeout)?
             .iter()
             .map(|string| string.to_str().unwrap()))
+    }
+
+    /// Lifetime count of renderer-degradation events (a client buffer import failed on the
+    /// GPU renderer; re-emitted every 5 s while no client buffer has succeeded since). The
+    /// element delta-samples it in `create()` to post a `wolf-renderer-degraded` bus WARNING.
+    pub fn renderer_degraded_count(&self) -> u64 {
+        self.renderer_degraded.load(Ordering::Relaxed)
     }
 
     /// Lifetime count of new buffers committed by mapped top-level app surfaces.

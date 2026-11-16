@@ -205,13 +205,23 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         // Snapshot before Smithay's renderer handler consumes current().buffer.
         // The handler still runs before any compositor state is mutated below.
-        let attached_new_buffer = with_states(surface, |states| {
+        let (attached_new_buffer, attached_is_dmabuf) = with_states(surface, |states| {
             let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-            matches!(
-                &attrs.current().buffer,
-                Some(BufferAssignment::NewBuffer(_))
-            )
+            match &attrs.current().buffer {
+                Some(BufferAssignment::NewBuffer(buffer)) => (true, get_dmabuf(buffer).is_ok()),
+                _ => (false, false),
+            }
         });
+        // A newly-attached buffer that is NOT a dmabuf (SHM, single-pixel, ...)
+        // clears the renderer-degradation condition -- the client is actively presenting
+        // through a path independent of the (possibly-failing) GPU dmabuf import, so any
+        // earlier import failure was transient or the client already recovered via an SHM
+        // fallback. A successful dmabuf import clears the condition at its own import
+        // callback instead (handlers/dmabuf.rs, handlers/wl_drm.rs), since dmabuf import
+        // happens once per buffer creation, not once per commit of that buffer.
+        if attached_new_buffer && !attached_is_dmabuf {
+            self.clear_renderer_degraded();
+        }
         on_commit_buffer_handler::<Self>(surface);
 
         // Attribute commits from an app surface tree to its xdg-toplevel root.

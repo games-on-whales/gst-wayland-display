@@ -70,7 +70,8 @@ use smithay::{
 use std::os::fd::OwnedFd;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
@@ -204,6 +205,24 @@ pub struct State {
     /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
     /// top-level application buffer commits increment it.
     pub(crate) app_surface_commits: Arc<AtomicU64>,
+    /// Shared lifetime count of renderer-degradation *emission events* (not raw failures --
+    /// see `renderer_degraded_active`), incremented by `note_renderer_degraded` (first
+    /// failure) and `tick_renderer_degraded` (periodic re-emit while the condition stays
+    /// active). The gst element delta-samples it (via
+    /// `WaylandDisplay::renderer_degraded_count`) to post a `wolf-renderer-degraded` bus
+    /// WARNING -- tracing does not reach the gst bus, so this counter is the compositor ->
+    /// element bridge.
+    pub(crate) renderer_degraded: Arc<AtomicU64>,
+    /// Renderer-degradation CONDITION state, not a one-shot event: `Some(last_emit)` means a
+    /// client buffer import has failed and NO client buffer has succeeded since. A client
+    /// that backs off permanently after one rejected import (observed live with gamescope)
+    /// never produces another failure to re-trigger on, so a one-shot marker would
+    /// never satisfy a downstream 2-in-30s debounce and the black-screen session would
+    /// stay `running` forever. `tick_renderer_degraded` re-emits every 5s while `Some`;
+    /// `clear_renderer_degraded` resets to `None` the moment any client buffer (dmabuf or
+    /// SHM/other) is handled successfully, since that proves the client is alive and any
+    /// earlier failure was transient.
+    renderer_degraded_active: Option<Instant>,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -246,6 +265,24 @@ const HDR_IMPORT_FOURCCS: [Fourcc; 6] = [
     Fourcc::Argb2101010,
     Fourcc::Xrgb2101010,
 ];
+
+/// Test-only fault-injection hook for the renderer-degradation path. When
+/// `WOLF_DEBUG_FAIL_DMABUF_IMPORT` is `"1"` or `"true"`, every dmabuf import in
+/// `handlers/dmabuf.rs` and `handlers/wl_drm.rs` is treated as failed WITHOUT calling the
+/// real `renderer.import_dmabuf` -- deterministically exercising the
+/// `wolf-renderer-degraded` bus-warning / fail-closed path without needing a client that
+/// actually submits an unimportable buffer. Read once (mirrors `wolf_hdr_cm()` in
+/// `utils/vulkan_nv12.rs`). Unset/any-other-value == byte-identical prior behavior.
+/// NEVER set this in production.
+pub(crate) fn debug_fail_dmabuf_import() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        matches!(
+            std::env::var("WOLF_DEBUG_FAIL_DMABUF_IMPORT").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
 
 /// Add the HDR-capable dmabuf formats (fp16 / 10-bit) the GLES renderer can actually
 /// *import* (queried from `ImportDma::dmabuf_formats`, i.e. the EGL texture-import set) to
@@ -515,6 +552,8 @@ impl State {
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
             app_surface_commits: Arc::new(AtomicU64::new(0)),
+            renderer_degraded: Arc::new(AtomicU64::new(0)),
+            renderer_degraded_active: None,
             hdr_candidate_since: None,
             hdr_cm,
             stable_output_hdr: None,
@@ -643,6 +682,55 @@ impl State {
                 mastering,
                 cll,
             });
+        }
+    }
+
+    /// Enter (or refresh) the renderer-degradation CONDITION: a client buffer import failed
+    /// on the GPU renderer (`handlers/dmabuf.rs`, `handlers/wl_drm.rs`, or the
+    /// `WOLF_DEBUG_FAIL_DMABUF_IMPORT` injection hook). The FIRST failure since the
+    /// condition was last clear emits immediately (bumps `renderer_degraded` + logs); a
+    /// repeat failure while already active does not re-emit here -- `tick_renderer_degraded`
+    /// covers "still broken" via periodic re-emission, so a client retrying every frame can't
+    /// flood the log/bus, and a client that backs off after exactly one failed import (the
+    /// gamescope case: no retry, ever) still gets covered by the tick path instead of
+    /// going silent forever. See the `renderer_degraded_active` field doc for the condition
+    /// model this implements.
+    pub(crate) fn note_renderer_degraded(&mut self, detail: &str) {
+        let now = Instant::now();
+        if self.renderer_degraded_active.is_none() {
+            self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("wolf-renderer-degraded: {detail}");
+        }
+        self.renderer_degraded_active = Some(now);
+    }
+
+    /// Clear the renderer-degradation condition: a client buffer was subsequently handled
+    /// successfully (a dmabuf import succeeded -- `handlers/dmabuf.rs` / `handlers/wl_drm.rs`
+    /// -- or a non-dmabuf/SHM buffer was committed -- `handlers/compositor.rs::commit`). This
+    /// proves the client is alive and any earlier import failure(s) were transient (e.g. an
+    /// SHM fallback after a rejected dmabuf), so stop re-emitting. A client that backs off
+    /// permanently instead (never produces another buffer) never reaches this call, so the
+    /// condition -- and `tick_renderer_degraded`'s periodic re-emission -- stays active until
+    /// a downstream consumer acts on it.
+    pub(crate) fn clear_renderer_degraded(&mut self) {
+        self.renderer_degraded_active = None;
+    }
+
+    /// Re-emit the degradation marker every 5s while the condition remains active. Called
+    /// from the per-frame `render` closure in `init` (driven by the encode pipeline pulling
+    /// frames, so it runs continuously regardless of whether the offending client ever
+    /// submits another buffer -- unlike `note_renderer_degraded`, which only runs when a
+    /// client actually attempts an import). This is what turns a single rejected import into
+    /// a periodic, debounce-surviving signal for a client that backs off for good.
+    pub(crate) fn tick_renderer_degraded(&mut self) {
+        let Some(last_emit) = self.renderer_degraded_active else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= Duration::from_secs(5) {
+            self.renderer_degraded_active = Some(now);
+            self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("wolf-renderer-degraded: condition still active (periodic re-emit)");
         }
     }
 
@@ -1033,6 +1121,7 @@ pub(crate) fn init(
     vulkan_share: Arc<VulkanShare>,
     va_share: Arc<crate::utils::va_share::VaShare>,
     app_surface_commits: Arc<AtomicU64>,
+    renderer_degraded: Arc<AtomicU64>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -1066,6 +1155,7 @@ pub(crate) fn init(
     state.va_share = va_share;
     state.hdr_cm = hdr_cm;
     state.app_surface_commits = app_surface_commits;
+    state.renderer_degraded = renderer_degraded;
 
     // Wire the compositor -> element HDR-state reverse channel only under dynamic HDR;
     // off leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
@@ -1107,6 +1197,14 @@ pub(crate) fn init(
                         // it is enabled). Runs before the buffer check so transitions
                         // are observed even on frames that fail to produce a buffer.
                         state.update_hdr_state();
+                        // Periodic re-emission of an active renderer-degradation
+                        // condition. This runs every frame the encode pipeline pulls
+                        // (independent of client behavior), which is the only reliable
+                        // periodic tick available to a client that backed off after one
+                        // rejected import and never submits another buffer to re-trigger on.
+                        // No-op unless the condition is active (see `renderer_degraded_active`
+                        // doc); internally rate-limited to one emission per 5s.
+                        state.tick_renderer_degraded();
                         // apply_video_info may have been unable to set up the output buffer
                         // (e.g. a downstream Vulkan encoder that never shared its
                         // GstVulkanDevice). Fail the frame cleanly instead of letting

@@ -60,6 +60,11 @@ pub struct WaylandDisplaySrc {
     /// `caps()` falls back to the hardcoded `HDR_MASTERING` / `HDR_CLL` defaults. Driven in
     /// `create()`, read in `caps()`. Never consulted when dynamic-hdr is off.
     hdr_meta: Mutex<(Option<String>, Option<String>)>,
+    /// Last `WaylandDisplay::renderer_degraded_count()` value observed in `create()`. When the
+    /// compositor's shared counter advances past this, the element posts a
+    /// `wolf-renderer-degraded` bus WARNING (tracing does not reach the gst bus, so this
+    /// delta-sample is the bridge to a downstream fail-closed policy). Default 0.
+    renderer_degraded_seen: AtomicU64,
     /// This element's OWN Vulkan-encode device share, replacing the process-global
     /// `vulkan_share` slots so N concurrent Vulkan sessions in one process each mint, own and
     /// destroy their own `VkDevice` (an isolated failure domain). Lives for the element's whole
@@ -95,6 +100,7 @@ impl Default for WaylandDisplaySrc {
             hdr_active: AtomicBool::new(false),
             static_hdr_posted: AtomicBool::new(false),
             hdr_meta: Mutex::new((None, None)),
+            renderer_degraded_seen: AtomicU64::new(0),
             va_share: Arc::new(Default::default()),
             vulkan_share: waylanddisplaycore::utils::vulkan_share::VulkanShare::new(),
             flushing: AtomicBool::new(false),
@@ -1968,6 +1974,33 @@ impl PushSrcImpl for WaylandDisplaySrc {
         _buffer: Option<&mut gst::BufferRef>,
     ) -> Result<CreateSuccess, gst::FlowError> {
         let hdr_cm = self.settings.lock().unwrap().hdr_cm;
+        // Renderer-degradation bridge: the compositor increments a shared counter
+        // (rate-limited to <=1 per 5s) whenever a client buffer import fails on the GPU
+        // renderer. tracing does not reach the gst bus, so delta-sample the counter here and
+        // surface each new event as a bus WARNING carrying the `wolf-renderer-degraded`
+        // marker -- a downstream consumer matches this to fail a session that requires hardware
+        // rendering.
+        let degraded = self
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|state| state.display.renderer_degraded_count())
+            .unwrap_or(0);
+        if degraded
+            > self
+                .renderer_degraded_seen
+                .swap(degraded, Ordering::Relaxed)
+        {
+            gst::element_imp_warning!(
+                self,
+                gst::LibraryError::Failed,
+                ("wolf-renderer-degraded"),
+                [
+                    "wolf-renderer-degraded: a client buffer import failed on the GPU renderer; see compositor log"
+                ]
+            );
+        }
         loop {
             let subscriber = Registry::default().with(GstLayer);
             let buffer = tracing::subscriber::with_default(subscriber, || {
