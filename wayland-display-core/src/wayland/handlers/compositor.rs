@@ -16,7 +16,7 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, add_blocker, add_pre_commit_hook, with_states,
+            SurfaceAttributes, add_blocker, add_pre_commit_hook, get_parent, with_states,
         },
         dmabuf::get_dmabuf,
         drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState},
@@ -26,6 +26,7 @@ use smithay::{
 };
 
 use crate::comp::{ClientState, FocusTarget, State};
+use std::sync::atomic::Ordering;
 
 /// Order the renderer's GL context after the client's explicit-sync acquire point by
 /// inserting its fence into the context's command stream (`eglWaitSync`), so every later
@@ -202,7 +203,33 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Snapshot before Smithay's renderer handler consumes current().buffer.
+        // The handler still runs before any compositor state is mutated below.
+        let attached_new_buffer = with_states(surface, |states| {
+            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+            matches!(
+                &attrs.current().buffer,
+                Some(BufferAssignment::NewBuffer(_))
+            )
+        });
         on_commit_buffer_handler::<Self>(surface);
+
+        // Attribute commits from an app surface tree to its xdg-toplevel root.
+        // This includes a video child surface but excludes cursor/popup trees.
+        // Pending toplevels cover first commits before initial configure maps them.
+        let mut app_root = surface.clone();
+        while let Some(parent) = get_parent(&app_root) {
+            app_root = parent;
+        }
+        // Membership is read before window.on_commit() advances compositor state.
+        let is_root =
+            |w: &smithay::desktop::Window| w.wl_surface().map(|s| *s == app_root).unwrap_or(false);
+        let app_toplevel = self.space.elements().any(is_root)
+            || self.pending_windows.iter().any(is_root)
+            || self.windows_awaiting_output.iter().any(is_root);
+        if app_toplevel && attached_new_buffer {
+            self.app_surface_commits.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Color state was applied with the buffer by Smithay. Log before the window
         // and popup handlers consume current().buffer.

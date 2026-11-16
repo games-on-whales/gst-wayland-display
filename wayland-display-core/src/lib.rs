@@ -16,7 +16,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -137,6 +137,7 @@ pub struct WaylandDisplay {
     // thread would block callers (the streaming thread, under its pad stream lock) forever if
     // the compositor stopped answering.
     render_device: Option<GPUDevice>,
+    app_surface_commits: Arc<AtomicU64>,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -226,6 +227,8 @@ impl WaylandDisplay {
         // the compositor thread a clone, so producer + compositor + encoder all resolve THIS
         // element's device instead of a process-global singleton.
         let compositor_vulkan_share = Arc::clone(&vulkan_share);
+        let app_surface_commits = Arc::new(AtomicU64::new(0));
+        let compositor_commits = Arc::clone(&app_surface_commits);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -243,6 +246,7 @@ impl WaylandDisplay {
                     hdr_state_tx,
                     compositor_vulkan_share,
                     va_share,
+                    compositor_commits,
                 )
             })) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -255,6 +259,7 @@ impl WaylandDisplay {
             hdr_state_rx,
             reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
             render_device,
+            app_surface_commits,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -275,6 +280,11 @@ impl WaylandDisplay {
             .get(self.reply_timeout)?
             .iter()
             .map(|string| string.to_str().unwrap()))
+    }
+
+    /// Lifetime count of new buffers committed by mapped top-level app surfaces.
+    pub fn app_surface_commits(&self) -> u64 {
+        self.app_surface_commits.load(Ordering::Relaxed)
     }
 
     pub fn add_input_device(&self, path: impl Into<String>) {

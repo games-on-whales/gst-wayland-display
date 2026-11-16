@@ -24,6 +24,7 @@ fn get_render_device_does_not_wait_on_compositor() {
         hdr_state_rx,
         reply_timeout: crate::COMPOSITOR_REPLY_TIMEOUT,
         render_device: None,
+        app_surface_commits: Default::default(),
         tracer: None,
         devices: MaybeRecv::Rx(devices_rx),
         envs: MaybeRecv::Rx(envs_rx),

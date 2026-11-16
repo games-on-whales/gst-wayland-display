@@ -34,3 +34,14 @@ fn keyboard_layout_defaults_to_empty_and_reads_back() {
     assert_eq!(src.property::<String>("keyboard-layout"), "de");
     assert_eq!(src.property::<String>("keyboard-variant"), "nodeadkeys");
 }
+
+#[test]
+fn app_surface_commit_counter_is_read_only_and_starts_zero() {
+    let src = make_src();
+    let pspec = src
+        .find_property("app-surface-commits")
+        .expect("counter property");
+    assert!(pspec.flags().contains(gst::glib::ParamFlags::READABLE));
+    assert!(!pspec.flags().contains(gst::glib::ParamFlags::WRITABLE));
+    assert_eq!(src.property::<u64>("app-surface-commits"), 0);
+}

@@ -633,6 +633,15 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .default_value(Some(""))
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecUInt64::builder("app-surface-commits")
+                    .nick("Application surface buffer commits")
+                    .blurb(
+                        "Lifetime count of new buffers committed by the mapped fullscreen \
+                         top-level application surface; excludes cursor, popup and \
+                         configure-only commits.",
+                    )
+                    .read_only()
+                    .build(),
             ]
         });
 
@@ -905,6 +914,14 @@ impl ObjectImpl for WaylandDisplaySrc {
             }
             "keyboard-layout" => self.settings.lock().unwrap().keyboard_layout.to_value(),
             "keyboard-variant" => self.settings.lock().unwrap().keyboard_variant.to_value(),
+            "app-surface-commits" => self
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|state| state.display.app_surface_commits())
+                .unwrap_or(0)
+                .to_value(),
             _ => unreachable!(),
         }
     }

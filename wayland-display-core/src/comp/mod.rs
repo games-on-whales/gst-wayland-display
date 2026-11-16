@@ -70,6 +70,7 @@ use smithay::{
 use std::os::fd::OwnedFd;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
@@ -200,6 +201,9 @@ pub struct State {
     /// compiled on first use (`Some(None)`: the driver rejected them). See
     /// `rendering::Converted`.
     pub(crate) hdr_programs: Option<Option<rendering::HdrPrograms>>,
+    /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
+    /// top-level application buffer commits increment it.
+    pub(crate) app_surface_commits: Arc<AtomicU64>,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -510,6 +514,7 @@ impl State {
             hdr_programs: None,
             vulkan_share: VulkanShare::new(),
             va_share: Arc::new(Default::default()),
+            app_surface_commits: Arc::new(AtomicU64::new(0)),
             hdr_candidate_since: None,
             hdr_cm,
             stable_output_hdr: None,
@@ -1018,6 +1023,7 @@ pub(crate) fn apply_video_info(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn init(
     command_src: Channel<Command>,
     render: impl Into<RenderTarget>,
@@ -1026,6 +1032,7 @@ pub(crate) fn init(
     hdr_state_tx: Sender<Command>,
     vulkan_share: Arc<VulkanShare>,
     va_share: Arc<crate::utils::va_share::VaShare>,
+    app_surface_commits: Arc<AtomicU64>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -1058,6 +1065,7 @@ pub(crate) fn init(
     state.vulkan_share = vulkan_share;
     state.va_share = va_share;
     state.hdr_cm = hdr_cm;
+    state.app_surface_commits = app_surface_commits;
 
     // Wire the compositor -> element HDR-state reverse channel only under dynamic HDR;
     // off leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
