@@ -3,10 +3,12 @@ use gst::glib;
 use waylanddisplaycore::utils::allocator::cuda;
 
 pub mod utils;
+mod vulkanscale;
 mod waylandsrc;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     waylandsrc::register(plugin)?;
+    vulkanscale::register(plugin)?;
     tracing_subscriber::fmt::try_init().ok();
     #[cfg(feature = "cuda")]
     match cuda::init_cuda() {

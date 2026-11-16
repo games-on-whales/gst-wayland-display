@@ -168,7 +168,7 @@ phase_detect() {
   if command -v gst-inspect-1.0 >/dev/null; then
     echo "  encoders        :"
     local e
-    for e in vah265enc vah265lpenc nvh265enc vulkanh265enc vulkanh264enc; do
+    for e in vah265enc vah265lpenc nvh265enc vulkanh265enc vulkanh264enc vulkanav1enc vulkanscale dmabuftocuda; do
       gst-inspect-1.0 "$e" >/dev/null 2>&1 && echo "      $e"
     done
   fi
@@ -221,7 +221,11 @@ no_gpu() {
 phase_gpu() {
   if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then no_gpu; return; fi
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
+  local rel; rel="$([[ $PROFILE == release ]] && echo --release)"
   log "  GPU-gated Rust tests on $node"
+  # The vulkanscale live-resize tests need the image's GStreamer to carry
+  # vulkan-enc-output-state-on-resize.patch: without it a step back UP keeps the
+  # launch-size Vulkan video session + DPB pool and MMU-faults the GPU (Xid 31).
   NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
     sh_run "$CARGO" test --workspace --no-fail-fast $(feature_args) \
       $([[ $PROFILE == release ]] && echo --release) -- --ignored

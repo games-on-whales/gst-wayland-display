@@ -1,0 +1,49 @@
+#version 450
+
+// NV12 -> NV12 GPU scaler (8-bit).
+//
+// One invocation per DESTINATION chroma sample: it writes the 2x2 luma block and the
+// single interleaved Cb/Cr sample that share it, so a 4:2:0 frame needs exactly
+// ceil(dstW/2) x ceil(dstH/2) invocations.
+//
+// The luma and chroma planes are sampled through normalized coordinates, so the
+// filter (VK_FILTER_LINEAR for `method=bilinear`, VK_FILTER_NEAREST for `nearest`)
+// lives entirely in the sampler the host binds -- there is one shader for both
+// methods. Chroma is sampled at half resolution on both axes, which is the
+// definition of the plane, not a quality shortcut.
+//
+// The `p010_scale.comp` sibling is this file with 16-bit storage formats; keep the
+// two in step.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D srcY;   // R8_UNORM view of the source Y plane
+layout(binding = 1) uniform sampler2D srcUV;  // R8G8_UNORM view of the source UV plane
+layout(binding = 2, r8)  uniform writeonly image2D dstY;
+layout(binding = 3, rg8) uniform writeonly image2D dstUV;
+
+layout(push_constant) uniform Push { ivec2 dstSize; } pc;
+
+void main() {
+    ivec2 ch = ivec2(gl_GlobalInvocationID.xy);   // destination chroma coord
+    ivec2 p = ch * 2;                             // destination top-left luma coord
+    if (p.x >= pc.dstSize.x || p.y >= pc.dstSize.y) return;
+
+    vec2 inv = 1.0 / vec2(pc.dstSize);
+
+    // Luma: sample at the centre of each destination texel.
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            ivec2 q = p + ivec2(dx, dy);
+            if (q.x >= pc.dstSize.x || q.y >= pc.dstSize.y) continue;
+            vec2 uv = (vec2(q) + 0.5) * inv;
+            imageStore(dstY, q, vec4(texture(srcY, uv).r));
+        }
+    }
+
+    // Chroma: the destination chroma grid is half the destination luma grid, so the
+    // sample centre in luma-normalized space is the centre of the 2x2 luma block.
+    vec2 cuv = (vec2(p) + 1.0) * inv;
+    vec2 cbcr = texture(srcUV, cuv).rg;
+    imageStore(dstUV, ch, vec4(cbcr, 0.0, 0.0));
+}

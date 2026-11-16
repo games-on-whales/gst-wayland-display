@@ -7,6 +7,7 @@ pub mod va_query;
 pub mod va_share;
 pub mod video_info;
 pub mod vulkan_nv12;
+pub mod vulkan_scale;
 pub mod vulkan_share;
 
 mod target;

@@ -94,3 +94,44 @@ wayland_display_vk_queue_handle (GstVulkanQueue *queue)
 {
   return queue->queue;
 }
+
+/* Current tracked layout of a GstVulkanImageMemory. `vulkanscale` records raw
+ * barriers (it does not go through GstVulkanOperation), so it has to read the real
+ * oldLayout of an input image rather than assume one: a producer encode-src image
+ * arrives in VIDEO_ENCODE_SRC_KHR, a generic pool image in whatever the pool's
+ * initial-layout said. */
+gint
+wayland_display_vk_image_layout (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory),
+      VK_IMAGE_LAYOUT_UNDEFINED);
+  return (gint) ((GstVulkanImageMemory *) memory)->barrier.image_layout;
+}
+
+/* The VkImageCreateInfo the memory was allocated with -- `vulkanscale` reads the
+ * format (single-plane pool images view directly; multiplanar ones need per-plane
+ * views) and the usage flags. */
+guint32
+wayland_display_vk_image_format (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
+  return (guint32) ((GstVulkanImageMemory *) memory)->create_info.format;
+}
+
+guint32
+wayland_display_vk_image_usage (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
+  return (guint32) ((GstVulkanImageMemory *) memory)->create_info.usage;
+}
+
+/* Creation flags of a GstVulkanImageMemory. `vulkanscale` needs MUTABLE_FORMAT on a
+ * multiplanar input before it may create the per-plane R8/R8G8 views its shader samples;
+ * without it the view creation is undefined behaviour rather than a clean failure, so the
+ * element checks this and errors out instead. */
+guint32
+wayland_display_vk_image_flags (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
+  return (guint32) ((GstVulkanImageMemory *) memory)->create_info.flags;
+}

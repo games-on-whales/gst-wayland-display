@@ -27,6 +27,8 @@ gstreamer-allocators = { version = "0.25", package = "gstreamer-allocators", fea
 
 gst-video.workspace = true
 wayland-display-core = { path = "../wayland-display-core" }
+# vulkanscale needs the safe GstVulkanDevice handle type in its element signature.
+gstreamer-vulkan = { version = "0.25", package = "gstreamer-vulkan", features = ["v1_28"] }
 tracing.workspace = true
 once_cell.workspace = true
 tracing-subscriber = "0.3.16"
