@@ -268,12 +268,16 @@ fn intel_va_encode_to_eos() {
 
 /// The converter advertises a usable NV12 modifier set for a present GPU --
 /// the precondition for any encoder negotiating with the source.
+///
+/// AMD/Intel only: the NVIDIA proprietary driver exports no NV12 dmabuf modifiers
+/// through this path, so on an NVIDIA-only box the empty set is the known driver
+/// reality, not a regression, and the test skips.
 #[test]
-#[ignore = "needs a GPU with a Vulkan driver; run via ci/harness.sh gpu"]
+#[ignore = "needs an AMD/Intel GPU with a Vulkan driver; run via ci/harness.sh gpu"]
 fn supported_nv12_modifiers_nonempty() {
     let _gpu = init();
-    let Some(node) = any_render_node() else {
-        skip!("no render node")
+    let Some(node) = render_node_for(&["amdgpu", "radeon", "i915", "xe"]) else {
+        skip!("no AMD/Intel render node (NVIDIA exports no NV12 dmabuf modifiers here)")
     };
     let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
     let mods = waylanddisplaycore::utils::vulkan_nv12::supported_nv12_modifiers(minor);
