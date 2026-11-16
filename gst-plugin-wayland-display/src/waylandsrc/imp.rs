@@ -250,6 +250,15 @@ pub struct Settings {
     /// the default (US) keymap, as before.
     keyboard_layout: String,
     keyboard_variant: String,
+    /// App-facing render width (the `wl_output` mode clients see), decoupled from the
+    /// negotiated encode width. `0` = follow the encode size. Live-writable; see
+    /// `forward_render_size` for the "apply the pair" rule.
+    render_width: i32,
+    /// App-facing render height. `0` = follow the encode size.
+    render_height: i32,
+    /// UI scale advertised through `wp_fractional_scale_v1`. `None` = never set by the
+    /// application, so nothing is forwarded and the getter reports the 1.0 default.
+    ui_scale: Option<f64>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -639,6 +648,66 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .default_value(Some(""))
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecString::builder("render-size")
+                    .nick("Render size")
+                    .blurb(
+                        "App-facing render size as \"WxH\" (e.g. \"1280x720\"): the wl_output \
+                         mode the Wayland clients see, decoupled from the negotiated encode \
+                         size. \"0x0\" = follow the encode size. THIS IS THE ATOMIC PATH -- \
+                         width and height are applied to the compositor in a single step, so \
+                         no intermediate wrong-aspect mode ever reaches the clients. Prefer it \
+                         over render-width/render-height whenever the size can change at \
+                         runtime. Live-writable (takes effect while PLAYING) and sticky across \
+                         caps re-negotiation. A malformed value is warned about and ignored.",
+                    )
+                    .default_value(Some("0x0"))
+                    .build(),
+                glib::ParamSpecInt::builder("render-width")
+                    .nick("Render width")
+                    .blurb(
+                        "App-facing render width; 0 = follow the encode width. CONVENIENCE \
+                         ONLY (gst-launch): it stores the value but applies the pair to the \
+                         compositor only when it COMPLETES a previously incomplete pair (the \
+                         other dimension was already non-zero and this one was 0). Re-sizing \
+                         an already-applied pair through render-width/render-height does NOT \
+                         re-apply it -- that would push a half-updated WxH' mode at every \
+                         client. Use render-size (\"WxH\") for any runtime change.",
+                    )
+                    .minimum(0)
+                    .maximum(16384)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecInt::builder("render-height")
+                    .nick("Render height")
+                    .blurb(
+                        "App-facing render height; 0 = follow the encode height. CONVENIENCE \
+                         ONLY (gst-launch): it stores the value but applies the pair to the \
+                         compositor only when it COMPLETES a previously incomplete pair (the \
+                         other dimension was already non-zero and this one was 0). Re-sizing \
+                         an already-applied pair through render-width/render-height does NOT \
+                         re-apply it -- that would push a half-updated W'xH mode at every \
+                         client. Use render-size (\"WxH\") for any runtime change.",
+                    )
+                    .minimum(0)
+                    .maximum(16384)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecDouble::builder("ui-scale")
+                    .nick("UI scale")
+                    .blurb(
+                        "UI scale for the virtual display. This is the wl_output fractional \
+                         scale: the physical mode stays at the render size, so the logical \
+                         desktop clients lay out against becomes render-size / ui-scale (2.0 \
+                         on a 1280x720 render = a 640x360 logical desktop, i.e. a 2x bigger \
+                         UI). It is also advertised through wp_fractional_scale_v1 \
+                         (preferred_scale), so scale-aware clients render at the full render \
+                         density instead of being upscaled. The encode size is unaffected. \
+                         Live-writable and applied immediately.",
+                    )
+                    .minimum(1.0)
+                    .maximum(3.0)
+                    .default_value(1.0)
+                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -839,6 +908,78 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .expect("Type checked upstream")
                     .unwrap_or_default();
             }
+            "render-size" => {
+                let raw = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+                let raw = raw.unwrap_or_default();
+                match parse_render_size(&raw) {
+                    Some((width, height)) => {
+                        {
+                            let mut settings = self.settings.lock().unwrap();
+                            settings.render_width = width;
+                            settings.render_height = height;
+                        }
+                        // ATOMIC: both halves are stored, then handed over in ONE command, so
+                        // the compositor never sees a half-updated pair.
+                        if let Some(state) = self.state.lock().unwrap().as_ref() {
+                            state.display.set_render_size(width, height);
+                        }
+                    }
+                    None => {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "Ignoring malformed render-size {:?}; expected \"WxH\" \
+                             (e.g. \"1280x720\"), each dimension 0..={}",
+                            raw,
+                            MAX_RENDER_DIMENSION
+                        );
+                    }
+                }
+            }
+            "render-width" | "render-height" => {
+                let v = value.get::<i32>().expect("Type checked upstream");
+                let (was_complete, width, height) = {
+                    let mut settings = self.settings.lock().unwrap();
+                    let was_complete = settings.render_width > 0 && settings.render_height > 0;
+                    if pspec.name() == "render-width" {
+                        settings.render_width = v;
+                    } else {
+                        settings.render_height = v;
+                    }
+                    (was_complete, settings.render_width, settings.render_height)
+                };
+                // Forward ONLY a first-time completion: the pair was incomplete (at least one
+                // dimension still 0) and this set makes both non-zero. Anything else is a
+                // HALF-UPDATED pair -- e.g. re-sizing a stored 1280x720 by setting width=1920
+                // first would push an intermediate 1920x720 mode at every client (observed
+                // live on the devbox: a wrong-aspect reconfigure flash, kwin re-laying out
+                // twice). `render-size` is the atomic path for those.
+                if !was_complete && width > 0 && height > 0 {
+                    if let Some(state) = self.state.lock().unwrap().as_ref() {
+                        state.display.set_render_size(width, height);
+                    }
+                } else {
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "{} stored as {} but not applied (pair {}x{} would be half-updated); \
+                         set the render-size property (\"WxH\") to apply a size atomically",
+                        pspec.name(),
+                        v,
+                        width,
+                        height
+                    );
+                }
+            }
+            "ui-scale" => {
+                let scale = value.get::<f64>().expect("Type checked upstream");
+                self.settings.lock().unwrap().ui_scale = Some(scale);
+                if let Some(state) = self.state.lock().unwrap().as_ref() {
+                    state.display.set_ui_scale(scale);
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -920,6 +1061,22 @@ impl ObjectImpl for WaylandDisplaySrc {
             }
             "keyboard-layout" => self.settings.lock().unwrap().keyboard_layout.to_value(),
             "keyboard-variant" => self.settings.lock().unwrap().keyboard_variant.to_value(),
+            "render-size" => {
+                let settings = self.settings.lock().unwrap();
+                format!("{}x{}", settings.render_width, settings.render_height).to_value()
+            }
+            "render-width" => {
+                let settings = self.settings.lock().unwrap();
+                settings.render_width.to_value()
+            }
+            "render-height" => {
+                let settings = self.settings.lock().unwrap();
+                settings.render_height.to_value()
+            }
+            "ui-scale" => {
+                let settings = self.settings.lock().unwrap();
+                settings.ui_scale.unwrap_or(1.0).to_value()
+            }
             "app-surface-commits" => self
                 .state
                 .lock()
@@ -1234,6 +1391,31 @@ impl WaylandDisplaySrc {
         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
         self.vulkan_share
             .provide_context(self.obj().upcast_ref::<gst::Element>(), query, minor)
+    }
+
+    /// Re-send the stored render size / UI scale to the compositor right after a
+    /// `Command::VideoInfo`.
+    ///
+    /// Both values are sticky in the core, but a value set *before* the compositor thread
+    /// existed (i.e. before `start()`) has to be replayed once there is one — and the
+    /// render size must land after the encode size it is decoupled from, so the compositor
+    /// applies the mode exactly once per negotiation. A partial pair (only one dimension
+    /// set) is deliberately not forwarded; see `set_property`.
+    fn forward_display_geometry(&self) {
+        let (width, height, ui_scale) = {
+            let settings = self.settings.lock().unwrap();
+            (
+                settings.render_width,
+                settings.render_height,
+                settings.ui_scale,
+            )
+        };
+        if width > 0 && height > 0 {
+            self.send_command(Command::RenderSize { width, height });
+        }
+        if let Some(scale) = ui_scale {
+            self.send_command(Command::UiScale(scale));
+        }
     }
 }
 
@@ -1719,6 +1901,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     targets,
                 });
             self.send_command(Command::VideoInfo(Box::new(video_info)));
+            self.forward_display_geometry();
             return self.parent_set_caps(caps);
         }
 
@@ -1792,6 +1975,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         };
 
         self.send_command(Command::VideoInfo(Box::new(video_info)));
+        self.forward_display_geometry();
 
         self.parent_set_caps(caps)
     }
@@ -2057,6 +2241,30 @@ impl PushSrcImpl for WaylandDisplaySrc {
     }
 }
 
+/// Upper bound for either render dimension, matching the `render-width`/`render-height`
+/// ParamSpec maxima (the string form has no GObject-level range check of its own).
+const MAX_RENDER_DIMENSION: i32 = 16384;
+
+/// Parse the `render-size` property's `"WxH"` form (e.g. `"1280x720"`; `"0x0"` = follow the
+/// encode size). Returns `None` for anything malformed — a missing/extra `x`, a non-digit,
+/// a sign, whitespace, or a dimension above [`MAX_RENDER_DIMENSION`] — so the caller can warn
+/// and keep the previous value instead of applying a garbage mode. Only one dimension being
+/// zero is rejected too: a `"1920x0"` pair has no meaning (use `"0x0"` to follow the encode).
+fn parse_render_size(raw: &str) -> Option<(i32, i32)> {
+    let (w, h) = raw.split_once('x')?;
+    let dim = |s: &str| -> Option<i32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<i32>().ok().filter(|v| *v <= MAX_RENDER_DIMENSION)
+    };
+    let (w, h) = (dim(w)?, dim(h)?);
+    if (w == 0) != (h == 0) {
+        return None;
+    }
+    Some((w, h))
+}
+
 impl WaylandDisplaySrc {
     /// Effective HDR static metadata `(mastering-display-info, content-light-level)` of the
     /// P010 output, or `None` when it is SDR. Static `hdr` uses the defaults; under
@@ -2301,8 +2509,6 @@ fn set_p010_color(s: &mut gst::StructureRef, hdr: &Option<(String, String)>) {
     }
 }
 
-/// A `/dev/dri/*` render node backs a real `GstVaDisplay`; the `software` (llvmpipe)
-/// target and any other value do not, so VA-display sharing is skipped for them.
 /// The converter's 4:2:0 output (NV12/P010) has one chroma sample per 2x2 block, and Vulkan
 /// only creates 4:2:0 images with even extents.
 fn check_420_size(width: u32, height: u32) -> Result<(), gst::LoggableError> {

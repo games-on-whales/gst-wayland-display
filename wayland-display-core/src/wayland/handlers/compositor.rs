@@ -20,6 +20,7 @@ use smithay::{
         },
         dmabuf::get_dmabuf,
         drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState},
+        fractional_scale::with_fractional_scale,
         seat::WaylandFocus,
         shell::xdg::{SurfaceCachedState, XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
@@ -264,7 +265,14 @@ impl CompositorHandler for State {
         {
             let window = self.pending_windows.swap_remove(idx);
 
+            let ui_scale = self.ui_scale;
             let (initial_configure_sent, max_size) = with_states(surface, |states| {
+                // Announce the current UI scale alongside the initial configure: a surface
+                // that creates its `wp_fractional_scale_v1` and commits *after* a
+                // `Command::UiScale` would otherwise stay at whatever it was told at
+                // creation time.
+                with_fractional_scale(states, |fs| fs.set_preferred_scale(ui_scale));
+
                 let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap();
                 let attributes_guard = attributes.lock().unwrap();
 

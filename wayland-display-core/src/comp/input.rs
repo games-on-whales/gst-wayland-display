@@ -30,7 +30,7 @@ use smithay::{
         input::LibinputInterface,
         rustix::fs::{Mode, OFlags, open},
     },
-    utils::{Logical, Point, SERIAL_COUNTER, Serial},
+    utils::{Logical, Point, SERIAL_COUNTER, Serial, Size},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 use std::collections::{HashMap, HashSet};
@@ -1385,13 +1385,22 @@ impl State {
         tool_handle.frame(self, time);
     }
 
-    fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+    /// Clamp a LOGICAL pointer position to the output's LOGICAL extent (`mode / scale`).
+    /// `mode.size` is physical, so it must be converted first: with a UI scale of 2 the
+    /// logical extent is half the mode, and clamping against the raw mode would let the
+    /// cursor run off the desktop by a factor of the scale.
+    pub(super) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
         if let Some(output) = self.output.as_ref()
             && let Some(mode) = output.current_mode()
         {
+            let logical: Size<i32, Logical> = mode
+                .size
+                .to_f64()
+                .to_logical(output.current_scale().fractional_scale())
+                .to_i32_round();
             return (
-                pos.x.max(0.0).min((mode.size.w - 2) as f64),
-                pos.y.max(0.0).min((mode.size.h - 2) as f64),
+                pos.x.max(0.0).min((logical.w - 2) as f64),
+                pos.y.max(0.0).min((logical.h - 2) as f64),
             )
                 .into();
         }
@@ -1710,6 +1719,44 @@ mod tests {
                 Keycode::new(scancode + 8)
             );
         }
+    }
+
+    #[test]
+    fn clamp_coords_uses_the_logical_extent_not_the_physical_mode() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+        let output = Output::new(
+            "HEADLESS-1".into(),
+            PhysicalProperties {
+                make: "Virtual".into(),
+                model: "Wolf".into(),
+                serial_number: String::new(),
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+            },
+        );
+        output.create_global::<State>(&state.dh);
+        // 1000x1000 physical at UI scale 2 == a 500x500 LOGICAL desktop.
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (1000, 1000).into(),
+                refresh: 1000,
+            }),
+            None,
+            Some(smithay::output::Scale::Fractional(2.0)),
+            None,
+        );
+        state.output = Some(output);
+
+        let clamped = state.clamp_coords(Point::from((5000.0, 5000.0)));
+
+        // Clamping against the raw 1000x1000 mode would let the cursor run to ~998, i.e. off
+        // the right/bottom of a desktop that is only 500 logical pixels wide.
+        assert!(
+            clamped.x <= 500.0 && clamped.y <= 500.0,
+            "expected a clamp to the 500x500 logical extent, got {clamped:?}",
+        );
+        assert!(clamped.x > 490.0 && clamped.y > 490.0);
     }
 
     #[test]
