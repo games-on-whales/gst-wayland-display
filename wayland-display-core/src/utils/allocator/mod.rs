@@ -10,7 +10,7 @@ use crate::utils::device::gpu::GPUDevice;
 use crate::utils::vulkan_nv12::{PixFmt, VulkanNv12};
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
-use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
+use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
@@ -24,7 +24,7 @@ use smithay::reexports::gbm::Modifier;
 use smithay::reexports::rustix::fs::{SeekFrom, seek};
 use smithay::utils::{DeviceFd, Rectangle};
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 /// Whether the `WOLF_HDR_SPIKE` render diagnostic is on. Read once: it is checked every frame.
@@ -77,11 +77,296 @@ impl GsGlesbuffer {
     }
 }
 
+/// Slots the RGB dmabuf output ring starts with. Downstream routinely holds two frames (the
+/// one the display shows and the one it is about to release), so three is the floor at which
+/// the compositor never waits; one more absorbs a frame sitting in a queue.
+pub const DMA_RING_INITIAL: usize = 4;
+
+/// Hard ceiling on RGB dmabuf output slots. The ring grows towards this only when every slot
+/// is still held downstream (a filling queue); a 3840x2160 XRGB slot is ~33 MB of VRAM.
+pub const DMA_RING_MAX: usize = 8;
+
+/// How long the compositor waits for a slot when all [`DMA_RING_MAX`] are held downstream
+/// before giving up on the frame. Only a wedged consumer gets here.
+const DMA_RING_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+const DMA_RING_BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Frames a released slot sits out before the compositor renders into it again. A consumer
+/// that releases a buffer when it stops *holding* it (a `wl_buffer.release`) does not say
+/// when its GPU stopped *reading* it, and NVIDIA attaches no implicit fence to the dma-buf
+/// that would order our render after that read. Sitting out this many hand-offs keeps the
+/// reuse behind the reader on every path seen so far. `WOLF_DMA_RING_HOLDBACK` overrides
+/// (0 disables).
+const DMA_RING_HOLDBACK_DEFAULT: u64 = 2;
+
+/// One RGB dmabuf output slot: the GBM buffer the compositor renders into, and the
+/// `GstBuffer` that wraps it, built once and handed downstream every time this slot is used.
+struct DmaSlot {
+    /// Render target. Kept alive for the slot's lifetime so smithay's per-dmabuf EGLImage +
+    /// FBO cache (keyed by this `Dmabuf`) hits on every frame after the first.
+    dmabuf: Dmabuf,
+    /// The acquire tick at which this slot was first seen free after being held; `None`
+    /// while it is held (or never handed out). Drives the hold-back.
+    freed_at: Option<u64>,
+    /// The slot's cached buffer. Its memories own *duplicated* fds, so they stay valid for
+    /// as long as downstream holds them, even after the ring itself is dropped (a caps
+    /// change). Downstream never receives this buffer itself, only children that carry a
+    /// `GstParentBufferMeta` on it: the slot is free exactly when this buffer is writable
+    /// again (refcount 1).
+    parent: GstBuffer,
+}
+
+/// The RGB dmabuf output ring behind [`GsDmaBuf`]. Shared (`Arc<Mutex<_>>`) because the render
+/// loop binds one clone of the output buffer and converts another.
+struct DmaRing {
+    allocator: DmabufAllocator<GbmAllocator<DeviceFd>>,
+    gst_allocator: DmaBufAllocator,
+    fourcc: DrmFourcc,
+    modifier: DrmModifier,
+    width: u32,
+    height: u32,
+    video_info: VideoInfoDmaDrm,
+    slots: Vec<DmaSlot>,
+    /// Where the free-slot search starts next frame (round robin, so consecutive frames land
+    /// in different buffers even when several are free).
+    next: usize,
+    /// The slot bound for the frame in flight.
+    cur: Option<usize>,
+    /// Slots added beyond [`DMA_RING_INITIAL`] (logged once each).
+    grown: usize,
+    /// Acquire counter: one per frame handed out.
+    tick: u64,
+    /// Frames a released slot sits out before reuse (see [`DMA_RING_HOLDBACK_DEFAULT`]).
+    holdback: u64,
+    /// Times the ring had to reuse a slot inside its hold-back (every slot held or young).
+    holdback_misses: u64,
+}
+
+impl std::fmt::Debug for DmaRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmaRing")
+            .field("fourcc", &self.fourcc)
+            .field("modifier", &self.modifier)
+            .field("size", &(self.width, self.height))
+            .field("slots", &self.slots.len())
+            .field("cur", &self.cur)
+            .finish()
+    }
+}
+
+/// Pick the ring slot for the next frame: the first slot downstream has released, searching
+/// round robin from `next`. `None` when every slot is still held.
+#[cfg(test)]
+fn pick_free_slot(free: &[bool], next: usize) -> Option<usize> {
+    let n = free.len();
+    (0..n).map(|i| (next + i) % n).find(|&idx| free[idx])
+}
+
+/// Pick the ring slot for the next frame under a hold-back: of the free slots (`freed_at`
+/// `Some`), the one released longest ago, but only if it has sat out at least `holdback`
+/// ticks since it was first seen free. `None` when no free slot is old enough.
+fn pick_aged_slot(freed_at: &[Option<u64>], tick: u64, holdback: u64) -> Option<usize> {
+    freed_at
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, f)| f.map(|t| (idx, t)))
+        .filter(|&(_, t)| tick.saturating_sub(t) >= holdback)
+        .min_by_key(|&(_, t)| t)
+        .map(|(idx, _)| idx)
+}
+
+/// The hold-back in frames: `WOLF_DMA_RING_HOLDBACK` when set to a number, else the default.
+fn ring_holdback_from_env() -> u64 {
+    std::env::var("WOLF_DMA_RING_HOLDBACK")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DMA_RING_HOLDBACK_DEFAULT)
+}
+
+impl DmaRing {
+    fn alloc_slot(&mut self) -> Option<DmaSlot> {
+        let dmabuf = self
+            .allocator
+            .create_buffer(self.width, self.height, self.fourcc, &[self.modifier])
+            .map_err(|e| tracing::warn!("Failed to create DMA ring slot: {e}"))
+            .ok()?;
+        let parent = dmabuf_to_gst_buffer(&dmabuf, &self.video_info, &self.gst_allocator)
+            .map_err(|e| tracing::warn!("Failed to wrap DMA ring slot: {e}"))
+            .ok()?;
+        Some(DmaSlot {
+            dmabuf,
+            parent,
+            freed_at: None,
+        })
+    }
+
+    /// Refresh each slot's `freed_at` from its parent's refcount: a slot that just came back
+    /// from downstream is stamped with this tick; a held one is cleared.
+    fn observe_releases(&mut self) {
+        let tick = self.tick;
+        for slot in &mut self.slots {
+            if slot.parent.is_writable() {
+                slot.freed_at.get_or_insert(tick);
+            } else {
+                slot.freed_at = None;
+            }
+        }
+    }
+
+    /// Reserve a slot no downstream element holds and make it the frame in flight. Grows the
+    /// ring up to [`DMA_RING_MAX`] before it ever waits; never returns a held slot (handing a
+    /// slot back out while `waylandsink`'s compositor still uses it unbalances the sink's
+    /// buffer refs, and rendering into it tears the frame on screen).
+    fn acquire(&mut self) -> Result<Dmabuf, String> {
+        let started = std::time::Instant::now();
+        self.tick += 1;
+        loop {
+            self.observe_releases();
+            let freed_at: Vec<Option<u64>> = self.slots.iter().map(|s| s.freed_at).collect();
+            if let Some(idx) = pick_aged_slot(&freed_at, self.tick, self.holdback) {
+                return Ok(self.take_slot(idx));
+            }
+            let any_free = freed_at.iter().any(Option::is_some);
+            // Every free slot is still inside its hold-back: grow before reusing a young one.
+            if any_free && self.slots.len() >= DMA_RING_MAX {
+                let idx = pick_aged_slot(&freed_at, self.tick, 0).expect("a free slot");
+                self.holdback_misses += 1;
+                if self.holdback_misses.is_power_of_two() {
+                    tracing::warn!(
+                        slots = self.slots.len(),
+                        age = self.tick - freed_at[idx].unwrap_or(self.tick),
+                        misses = self.holdback_misses,
+                        "DMA ring: reusing a slot inside its hold-back (ring at its ceiling)"
+                    );
+                }
+                return Ok(self.take_slot(idx));
+            }
+            if self.slots.len() < DMA_RING_MAX {
+                let slot = self
+                    .alloc_slot()
+                    .ok_or_else(|| "DMA ring: failed to grow the ring".to_string())?;
+                self.slots.push(slot);
+                self.grown += 1;
+                let idx = self.slots.len() - 1;
+                tracing::info!(
+                    slots = self.slots.len(),
+                    "DMA ring: every slot is held downstream; grew the ring"
+                );
+                return Ok(self.take_slot(idx));
+            }
+            if started.elapsed() >= DMA_RING_BUSY_BUDGET {
+                return Err(format!(
+                    "DMA ring: all {} slots still held downstream after {:?} (consumer is not releasing buffers)",
+                    self.slots.len(),
+                    DMA_RING_BUSY_BUDGET
+                ));
+            }
+            std::thread::sleep(DMA_RING_BUSY_POLL);
+        }
+    }
+
+    /// Make `idx` the frame in flight.
+    fn take_slot(&mut self, idx: usize) -> Dmabuf {
+        self.slots[idx].freed_at = None;
+        self.next = (idx + 1) % self.slots.len();
+        self.cur = Some(idx);
+        self.slots[idx].dmabuf.clone()
+    }
+
+    /// The frame in flight as a fresh child buffer over its slot. The child shares the slot's
+    /// memories (so `waylandsink` and `kmssink`, which cache their import per `GstMemory`,
+    /// import each slot once) and carries a `GstParentBufferMeta` on the slot buffer, which
+    /// every later copy of the child propagates: the slot stays busy until the last
+    /// downstream reference is gone.
+    fn current_buffer(&self) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        let idx = self.cur.ok_or("DMA ring: no slot bound for this frame")?;
+        slot_child(&self.slots[idx].parent)
+    }
+}
+
+/// A fresh child header over a ring slot's cached `parent`: same memories, same metas, no
+/// timestamps (the source re-stamps every frame), and a `GstParentBufferMeta` holding `parent`
+/// so the slot reads as busy (`!parent.is_writable()`) until every copy of the child is gone.
+fn slot_child(parent: &GstBuffer) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+    let mut child = parent.copy();
+    let child_ref = child
+        .get_mut()
+        .ok_or("DMA ring: fresh child buffer unexpectedly shared")?;
+    child_ref.set_pts(gst::ClockTime::NONE);
+    child_ref.set_dts(gst::ClockTime::NONE);
+    child_ref.set_duration(gst::ClockTime::NONE);
+    gst::ParentBufferMeta::add(child_ref, parent);
+    Ok(child)
+}
+
+/// Wrap `dmabuf` as a `GstBuffer` of DMABuf memories (one per plane, each owning a duplicate of
+/// the plane's fd) with a `GstVideoMeta` carrying the real offsets and strides.
+fn dmabuf_to_gst_buffer(
+    dmabuf: &Dmabuf,
+    video_info: &VideoInfoDmaDrm,
+    gst_allocator: &DmaBufAllocator,
+) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+    let video_format = gst_video::dma_drm_fourcc_to_format(dmabuf.format().code as u32)
+        .unwrap_or_else(|_| {
+            tracing::debug!(
+                "Failed to convert fourcc to video format: {:?}",
+                dmabuf.format().code
+            );
+            VideoFormat::Bgrx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
+        });
+
+    // The size GStreamer expects for the format, in case the fd reports less.
+    let required_size =
+        gst_video::VideoInfo::builder(video_format, video_info.width(), video_info.height())
+            .build()?
+            .size();
+
+    let mut gst_buffer = GstBuffer::new();
+    {
+        let gst_buffer = gst_buffer.get_mut().unwrap();
+        for handle in dmabuf.handles() {
+            let actual_size = seek(handle.as_fd(), SeekFrom::End(0))? as usize;
+            let _ = seek(handle.as_fd(), SeekFrom::Start(0));
+            let allocation_size = required_size.max(actual_size);
+            let fd: OwnedFd = handle.try_clone_to_owned()?;
+            // SAFETY: `fd` is a freshly duplicated dmabuf fd whose ownership moves into the
+            // memory, which closes it when freed.
+            let memory = unsafe { gst_allocator.alloc_dmabuf(fd, allocation_size)? };
+            gst_buffer.append_memory(memory);
+        }
+
+        let offsets = dmabuf.offsets().map(|o| o as usize).collect::<Vec<_>>();
+        let strides = dmabuf.strides().map(|s| s as i32).collect::<Vec<_>>();
+        if let Err(error) = VideoMeta::add_full(
+            gst_buffer,
+            gst_video::VideoFrameFlags::empty(),
+            video_format,
+            video_info.width(),
+            video_info.height(),
+            &offsets,
+            &strides,
+        ) {
+            tracing::warn!("Failed to add video meta: {:?}", error);
+        }
+    }
+    Ok(gst_buffer)
+}
+
+/// RGB dmabuf output: the compositor renders straight into GBM buffers that downstream imports
+/// as-is (no readback, no conversion). A ring of [`DMA_RING_INITIAL`]..[`DMA_RING_MAX`] slots,
+/// each reused only once downstream released it, so a consumer in another process (weston via
+/// `waylandsink`) never reads a buffer the compositor is drawing into.
+///
+/// Sync: the render loop waits the GLES render's sync point before `to_gs_buffer` hands the
+/// frame downstream (`create_frame`), so a buffer leaves the compositor fully drawn. That CPU
+/// wait is what makes the cross-process hand-off safe on drivers that do not honour implicit
+/// dma-buf fences (NVIDIA).
 #[derive(Debug, Clone)]
 pub struct GsDmaBuf {
-    buffer: Dmabuf,
+    ring: Arc<Mutex<DmaRing>>,
+    /// The slot `bind` reserved, owned by this clone so the render target can borrow it.
+    target: Option<Dmabuf>,
     video_info: VideoInfoDmaDrm,
-    gst_allocator: DmaBufAllocator,
 }
 
 pub fn new_gbm_device(render_node: DrmNode) -> Option<GbmDevice<DeviceFd>> {
@@ -100,7 +385,7 @@ impl GsDmaBuf {
         let drm_fourcc = gst_video_format_to_drm_fourcc(&video_info)?;
         let mut drm_modifier = gst_video_format_to_drm_modifier(&video_info)?;
         tracing::info!(
-            "Creating DMA buffer - DrmFourcc: {:?}, Modifier: {:?}",
+            "Creating DMA buffer ring - DrmFourcc: {:?}, Modifier: {:?}",
             drm_fourcc,
             drm_modifier
         );
@@ -120,41 +405,88 @@ impl GsDmaBuf {
         let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
         let mut dma_allocator = DmabufAllocator(allocator);
 
-        let modifiers = [drm_modifier];
-        let mut result = dma_allocator.create_buffer(
-            video_info.width(),
-            video_info.height(),
-            drm_fourcc,
-            &modifiers,
-        );
-        if result.is_err()
-            && let Some(workaround) = workaround_modifier
-        {
+        let (w, h) = (video_info.width(), video_info.height());
+        let mut result = dma_allocator.create_buffer(w, h, drm_fourcc, &[drm_modifier]);
+        if let (Err(_), Some(workaround)) = (&result, workaround_modifier) {
             tracing::warn!(
                 "Failed to create buffer with modifier {:?}, trying workaround modifier",
                 drm_modifier
             );
             // Try the workaround modifier
             drm_modifier = workaround;
-            result = dma_allocator.create_buffer(
-                video_info.width(),
-                video_info.height(),
-                drm_fourcc,
-                &[drm_modifier],
-            );
+            result = dma_allocator.create_buffer(w, h, drm_fourcc, &[drm_modifier]);
         }
-
-        match result {
-            Ok(buffer) => Some(GsDmaBuf {
-                buffer,
-                video_info,
-                gst_allocator: DmaBufAllocator::new(),
-            }),
-            Err(_) => {
-                tracing::warn!("Failed to create DMA buffer: {}", result.unwrap_err());
-                None
+        let first = match result {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                tracing::warn!("Failed to create DMA buffer: {}", e);
+                return None;
             }
+        };
+
+        let gst_allocator = DmaBufAllocator::new();
+        let parent = dmabuf_to_gst_buffer(&first, &video_info, &gst_allocator)
+            .map_err(|e| tracing::warn!("Failed to wrap DMA buffer: {e}"))
+            .ok()?;
+        let mut ring = DmaRing {
+            allocator: dma_allocator,
+            gst_allocator,
+            fourcc: drm_fourcc,
+            // The modifier GBM actually allocated (it may resolve INVALID / a list to one).
+            modifier: first.format().modifier,
+            width: w,
+            height: h,
+            video_info: video_info.clone(),
+            slots: vec![DmaSlot {
+                dmabuf: first,
+                parent,
+                freed_at: None,
+            }],
+            next: 0,
+            cur: None,
+            grown: 0,
+            tick: 0,
+            holdback: ring_holdback_from_env(),
+            holdback_misses: 0,
+        };
+        while ring.slots.len() < DMA_RING_INITIAL {
+            let slot = ring.alloc_slot()?;
+            ring.slots.push(slot);
         }
+        tracing::info!(
+            slots = ring.slots.len(),
+            modifier = ?ring.modifier,
+            "DMA output ring ready"
+        );
+        Some(GsDmaBuf {
+            ring: Arc::new(Mutex::new(ring)),
+            target: None,
+            video_info,
+        })
+    }
+
+    /// Reserve the next free slot as this frame's render target.
+    fn acquire_target(&mut self) -> Result<&mut Dmabuf, GlesError> {
+        let dmabuf = self.ring.lock().unwrap().acquire().map_err(|e| {
+            tracing::error!("{e}");
+            GlesError::FramebufferBindingError
+        })?;
+        Ok(self.target.insert(dmabuf))
+    }
+
+    /// The frame in flight (the slot the last `bind` reserved) as a downstream buffer.
+    fn to_gst_buffer(&self) -> Result<GstBuffer, Box<dyn std::error::Error>> {
+        self.ring.lock().unwrap().current_buffer()
+    }
+
+    /// Number of slots in the ring (grows on demand up to [`DMA_RING_MAX`]).
+    pub fn ring_len(&self) -> usize {
+        self.ring.lock().unwrap().slots.len()
+    }
+
+    /// The DRM modifier every slot of the ring was allocated with.
+    pub fn modifier(&self) -> DrmModifier {
+        self.ring.lock().unwrap().modifier
     }
 }
 
@@ -508,7 +840,11 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
     fn bind(&mut self, renderer: &mut GlesRenderer) -> Result<GlesTarget<'_>, GlesError> {
         match self {
             GsBufferType::RAW(buffer) => renderer.bind(&mut buffer.buffer),
-            GsBufferType::DMA(buffer) => renderer.bind(&mut buffer.buffer),
+            // Render into whichever ring slot downstream has released.
+            GsBufferType::DMA(buffer) => {
+                let target = buffer.acquire_target()?;
+                renderer.bind(target)
+            }
             // NV12 mode renders the scene into the RGBA dmabuf; Vulkan converts it
             // to NV12 in to_gs_buffer().
             GsBufferType::NV12(buffer) => renderer.bind(&mut buffer.rgba),
@@ -557,80 +893,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
 
                 Ok(gst_buffer)
             }
-            GsBufferType::DMA(buffer) => {
-                let mut gst_buffer = GstBuffer::new();
-                {
-                    let video_format =
-                        match VideoFormat::from_fourcc(buffer.buffer.format().code as u32) {
-                            // TODO: this seems to always fail
-                            VideoFormat::Unknown => {
-                                tracing::debug!(
-                                    "Failed to convert fourcc to video format: {:?}",
-                                    buffer.buffer.format().code
-                                );
-                                VideoFormat::Bgrx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
-                            }
-                            format => format,
-                        };
-
-                    // Calculate the required size based on GStreamer's expectations
-                    let required_size = gst_video::VideoInfo::builder(
-                        video_format,
-                        buffer.video_info.width(),
-                        buffer.video_info.height(),
-                    )
-                    .build()?
-                    .size();
-
-                    let gst_buffer = gst_buffer.get_mut().unwrap();
-                    buffer.buffer.handles().for_each(|handle| {
-                        let fd = handle.as_raw_fd();
-                        let actual_size = seek(handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
-                        let _ = seek(handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
-
-                        // Use the larger of the two sizes to ensure we have enough space
-                        let allocation_size = required_size.max(actual_size);
-
-                        let memory = unsafe {
-                            buffer
-                                .gst_allocator
-                                .alloc_dmabuf_with_flags(
-                                    fd,
-                                    allocation_size,
-                                    FdMemoryFlags::DONT_CLOSE,
-                                )
-                                .expect("Failed to allocate memory")
-                        };
-                        gst_buffer.append_memory(memory);
-                    });
-
-                    let offsets = buffer
-                        .buffer
-                        .offsets()
-                        .map(|o| o as usize)
-                        .collect::<Vec<_>>();
-
-                    let strides = buffer
-                        .buffer
-                        .strides()
-                        .map(|s| s as i32)
-                        .collect::<Vec<_>>();
-
-                    let meta_result = VideoMeta::add_full(
-                        gst_buffer,
-                        gst_video::VideoFrameFlags::empty(),
-                        video_format,
-                        buffer.video_info.width(),
-                        buffer.video_info.height(),
-                        &offsets,
-                        &strides,
-                    );
-                    if let Err(error) = meta_result {
-                        tracing::warn!("Failed to add video meta: {:?}", error);
-                    }
-                }
-                Ok(gst_buffer)
-            }
+            GsBufferType::DMA(buffer) => buffer.to_gst_buffer(),
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
                 v.convert(&buffer.rgba, color)?;
@@ -695,77 +958,7 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
 
                 Ok(gst_buffer)
             }
-            GsBufferType::DMA(buffer) => {
-                let mut gst_buffer = GstBuffer::new();
-                {
-                    let video_format =
-                        gst_video::dma_drm_fourcc_to_format(buffer.buffer.format().code as u32)
-                            .unwrap_or_else(|_| {
-                                tracing::debug!(
-                                    "Failed to convert fourcc to video format: {:?}",
-                                    buffer.buffer.format().code
-                                );
-                                VideoFormat::Bgrx // TODO: Use a more appropriate fallback, can't pass DmaDRM format
-                            });
-
-                    // Calculate the required size based on GStreamer's expectations
-                    let required_size = gst_video::VideoInfo::builder(
-                        video_format,
-                        buffer.video_info.width(),
-                        buffer.video_info.height(),
-                    )
-                    .build()?
-                    .size();
-
-                    let gst_buffer = gst_buffer.get_mut().unwrap();
-                    buffer.buffer.handles().for_each(|handle| {
-                        let fd = handle.as_raw_fd();
-                        let actual_size = seek(handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
-                        let _ = seek(handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
-
-                        // Use the larger of the two sizes to ensure we have enough space
-                        let allocation_size = required_size.max(actual_size);
-
-                        let memory = unsafe {
-                            buffer
-                                .gst_allocator
-                                .alloc_dmabuf_with_flags(
-                                    fd,
-                                    allocation_size,
-                                    FdMemoryFlags::DONT_CLOSE,
-                                )
-                                .expect("Failed to allocate memory")
-                        };
-                        gst_buffer.append_memory(memory);
-                    });
-
-                    let offsets = buffer
-                        .buffer
-                        .offsets()
-                        .map(|o| o as usize)
-                        .collect::<Vec<_>>();
-
-                    let strides = buffer
-                        .buffer
-                        .strides()
-                        .map(|s| s as i32)
-                        .collect::<Vec<_>>();
-
-                    let meta_result = VideoMeta::add_full(
-                        gst_buffer,
-                        gst_video::VideoFrameFlags::empty(),
-                        video_format,
-                        buffer.video_info.width(),
-                        buffer.video_info.height(),
-                        &offsets,
-                        &strides,
-                    );
-                    if let Err(error) = meta_result {
-                        tracing::warn!("Failed to add video meta: {:?}", error);
-                    }
-                }
-                Ok(gst_buffer)
-            }
+            GsBufferType::DMA(buffer) => buffer.to_gst_buffer(),
             GsBufferType::NV12(buffer) => {
                 let mut v = buffer.vulkan.lock().unwrap();
                 v.convert(&buffer.rgba, color)?;
@@ -845,6 +1038,7 @@ mod tests {
     use super::*;
     use crate::utils::renderer::setup_renderer;
     use crate::utils::tests::{pick_render_node, test_init};
+    use smithay::backend::allocator::Format as DrmFormat;
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
 
@@ -1006,6 +1200,11 @@ mod tests {
         let gst_buffer = buffer_clone
             .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
             .expect("Failed to convert buffer");
+        // The ring slot's stride, as its VideoMeta carries it.
+        let stride = gst_buffer
+            .meta::<VideoMeta>()
+            .expect("Failed to get buffer meta")
+            .stride()[0];
         let gst_buffer_size = gst_buffer.size();
         assert!(gst_buffer_size >= 4096); // There might be padding but it should at least contain our data
 
@@ -1024,12 +1223,6 @@ mod tests {
             ((w / 2, h / 2), [255, 255, 0]), // Yellow
         ];
 
-        let stride = raw_buffer
-            .unwrap()
-            .buffer
-            .strides()
-            .next()
-            .expect("Failed to get stride");
         for ((x_start, y_start), expected_color) in regions {
             let pixel = get_pixel(
                 plane_data,
@@ -1046,6 +1239,188 @@ mod tests {
         assert_eq!(buf_meta.width(), w as u32);
         assert_eq!(buf_meta.height(), h as u32);
         assert_eq!(buf_meta.n_planes(), 1);
+    }
+
+    /// Free-slot search: round robin from `next`, skipping held slots, `None` when all held.
+    #[test]
+    fn pick_aged_slot_prefers_the_oldest_release_past_the_holdback() {
+        // Slots 1 and 3 free since ticks 5 and 2; at tick 7 with hold-back 2 both qualify,
+        // the older release (slot 3) wins.
+        assert_eq!(
+            pick_aged_slot(&[None, Some(5), None, Some(2)], 7, 2),
+            Some(3)
+        );
+        // Only slot 3 is old enough at tick 6.
+        assert_eq!(
+            pick_aged_slot(&[None, Some(5), None, Some(2)], 6, 2),
+            Some(3)
+        );
+        // Nothing has aged: slot 1 freed this tick, slot 3 one tick ago.
+        assert_eq!(pick_aged_slot(&[None, Some(6), None, Some(5)], 6, 2), None);
+        // Hold-back 0 takes any free slot, oldest first.
+        assert_eq!(
+            pick_aged_slot(&[None, Some(6), None, Some(5)], 6, 0),
+            Some(3)
+        );
+        // All held.
+        assert_eq!(pick_aged_slot(&[None, None], 9, 2), None);
+        assert_eq!(pick_aged_slot(&[], 9, 2), None);
+    }
+
+    #[test]
+    fn pick_free_slot_round_robin() {
+        assert_eq!(pick_free_slot(&[true, true, true, true], 0), Some(0));
+        assert_eq!(pick_free_slot(&[true, true, true, true], 2), Some(2));
+        assert_eq!(pick_free_slot(&[false, false, true, true], 0), Some(2));
+        // Wraps past the end.
+        assert_eq!(pick_free_slot(&[true, false, false, false], 1), Some(0));
+        assert_eq!(pick_free_slot(&[false, false, false, false], 3), None);
+        assert_eq!(pick_free_slot(&[], 0), None);
+    }
+
+    /// The reuse gate the ring relies on: a slot's cached buffer stays non-writable while ANY
+    /// copy of a child handed downstream is alive -- including the header copies BaseSrc and
+    /// queues make, and the extra ref waylandsink takes while its compositor shows the frame
+    /// -- and becomes writable again once the last one is dropped.
+    #[test]
+    fn slot_child_holds_the_slot_until_every_copy_is_gone() {
+        test_init();
+        let mut parent = GstBuffer::with_size(64).unwrap();
+        {
+            let p = parent.get_mut().unwrap();
+            p.set_pts(gst::ClockTime::from_mseconds(5));
+            VideoMeta::add(
+                p,
+                gst_video::VideoFrameFlags::empty(),
+                VideoFormat::Bgrx,
+                4,
+                4,
+            )
+            .unwrap();
+        }
+        assert!(parent.is_writable());
+
+        let child = slot_child(&parent).unwrap();
+        assert!(!parent.is_writable(), "a live child must hold the slot");
+        // Same memory, no timestamps, the video meta came along.
+        assert_eq!(
+            child.peek_memory(0).as_ptr(),
+            parent.peek_memory(0).as_ptr()
+        );
+        assert_eq!(child.pts(), None);
+        assert!(child.meta::<VideoMeta>().is_some());
+
+        // BaseSrc's make-writable on a shared child is a shallow copy: the copy must keep
+        // holding the slot after the original is gone.
+        let extra_ref = child.clone();
+        let copy = extra_ref.copy();
+        drop(child);
+        drop(extra_ref);
+        assert!(
+            !parent.is_writable(),
+            "a header copy must still hold the slot"
+        );
+        drop(copy);
+        assert!(
+            parent.is_writable(),
+            "slot must be free once every copy is gone"
+        );
+    }
+
+    /// The ring on real hardware: every frame gets a slot no downstream buffer holds, held slots
+    /// are skipped, the ring grows to [`DMA_RING_MAX`] under pressure, and a released slot is
+    /// reused. Any GBM-capable GPU (NVIDIA included), XRGB at the renderer's own modifier.
+    #[test]
+    #[ignore = "needs a gbm-capable GPU; run via ci/harness.sh gpu"]
+    fn test_dmabuf_ring() {
+        test_init();
+        let Some(render_node) = pick_render_node(&["amdgpu", "radeon", "i915", "xe", "nvidia"])
+        else {
+            skip!("no gbm-capable render node");
+        };
+        let mut renderer = setup_renderer(Some(render_node));
+        let (w, h) = (64, 32);
+        // The first XRGB8888 entry of the renderer's formats, LINEAR preferred (AMD/Intel;
+        // NVIDIA renders only block-linear).
+        let formats: Vec<DrmFormat> = <GlesRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .collect();
+        let Some(format) = formats
+            .iter()
+            .copied()
+            .filter(|f| f.code == DrmFourcc::Xrgb8888)
+            .min_by_key(|f| f.modifier != Modifier::Linear)
+        else {
+            skip!("renderer cannot render XRGB8888 dmabufs");
+        };
+        let drm_format = if format.modifier == Modifier::Linear {
+            "XR24".to_string()
+        } else {
+            format!("XR24:0x{:016x}", u64::from(format.modifier))
+        };
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(gst_video::VideoFormat::DmaDrm)
+            .field("drm-format", drm_format.as_str())
+            .height(h)
+            .width(w)
+            .framerate(gst::Fraction::new(120, 1))
+            .build();
+        let info = VideoInfoDmaDrm::from_caps(&caps).unwrap();
+        let Some(dma) = GsDmaBuf::new(render_node, info) else {
+            panic!("GsDmaBuf could not allocate {drm_format}, a format the renderer offers");
+        };
+        assert_eq!(dma.ring_len(), DMA_RING_INITIAL);
+        assert_eq!(dma.modifier(), format.modifier);
+        let mut buffer = GsBufferType::DMA(dma.clone());
+        // The render loop binds one clone and converts another; they share the ring.
+        let conv = buffer.clone();
+
+        // Hold every frame: each must land in a distinct slot, and the ring grows to the cap.
+        let mut held = Vec::new();
+        let mut fds = std::collections::HashSet::new();
+        for _ in 0..DMA_RING_MAX {
+            let mut target = buffer.bind(&mut renderer).expect("bind");
+            let gst_buffer = conv
+                .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
+                .expect("to_gs_buffer");
+            let mem = gst_buffer.peek_memory(0);
+            let fd = mem
+                .downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
+                .expect("dmabuf memory")
+                .fd();
+            assert!(fds.insert(fd), "a held slot was handed out again");
+            let meta = gst_buffer.meta::<VideoMeta>().expect("video meta");
+            assert_eq!((meta.width(), meta.height()), (w as u32, h as u32));
+            held.push(gst_buffer);
+        }
+        assert_eq!(dma.ring_len(), DMA_RING_MAX);
+
+        // Release one: the next frame must reuse exactly that slot (the rest are still held).
+        let released = held.remove(3);
+        let released_fd = released
+            .peek_memory(0)
+            .downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
+            .unwrap()
+            .fd();
+        drop(released);
+        let mut target = buffer.bind(&mut renderer).expect("bind after release");
+        let again = conv
+            .to_gs_buffer(&mut target, &mut renderer, FrameColor::default())
+            .unwrap();
+        let again_fd = again
+            .peek_memory(0)
+            .downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
+            .unwrap()
+            .fd();
+        assert_eq!(again_fd, released_fd);
+        assert_eq!(
+            dma.ring_len(),
+            DMA_RING_MAX,
+            "a free slot must not grow the ring"
+        );
     }
 
     fn get_pixel(buffer: &[u8], x: usize, y: usize, stride: usize) -> [u8; 3] {
