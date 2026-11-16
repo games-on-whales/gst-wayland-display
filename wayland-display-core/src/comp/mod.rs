@@ -145,6 +145,16 @@ pub struct State {
     /// derived from it. Clamped to [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`]. Sticky, like
     /// `render_size`.
     pub(crate) ui_scale: f64,
+    /// Extra `wl_output` modes to advertise alongside the current one, so an in-app
+    /// display/resolution menu has a list to offer. Purely advisory: the CURRENT and
+    /// PREFERRED mode are always the render size. Sticky across caps re-negotiation;
+    /// rungs above the encode size are filtered out at advertise time, not here.
+    pub(crate) mode_ladder: Vec<Size<i32, Physical>>,
+    /// The ladder modes actually pushed onto the Output, so a later ladder change can
+    /// retire the ones that are gone. Tracked separately from [`State::mode_ladder`]
+    /// because the advertised set is the *filtered* one (rungs ≤ encode) at a specific
+    /// refresh rate.
+    advertised_ladder: Vec<OutputMode>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -486,6 +496,8 @@ impl State {
             negotiated_output: None,
             render_size: None,
             ui_scale: 1.0,
+            mode_ladder: Vec::new(),
+            advertised_ladder: Vec::new(),
             last_render: None,
 
             space,
@@ -1043,6 +1055,12 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         .as_ref()
         .map(|vi| (vi.width() as i32, vi.height() as i32).into())
         .unwrap_or(size);
+
+    // Re-advertise the mode ladder against the (possibly new) encode size and refresh rate.
+    // Runs AFTER `change_current_state` / `set_preferred` so the current mode is already on
+    // the Output and can never be retired by the reconcile below.
+    advertise_mode_ladder(state, &output, refresh_mhz, encode_size);
+
     state.dtr = Some(OutputDamageTracker::new(
         encode_size,
         output.current_scale().fractional_scale(),
@@ -1057,6 +1075,105 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     remap_pointer(state, old_logical, new_size);
     announce_ui_scale(state);
     configure_toplevels(state, new_size);
+}
+
+/// Push [`State::mode_ladder`] onto the Output as additional advertised `wl_output` modes,
+/// filtered to the rungs that fit inside `encode` (per axis) and stamped with the output's
+/// current `refresh_mhz`. Rungs that are no longer wanted are retired.
+///
+/// The current mode is *not* touched: an in-app menu gets a list to choose from, while what
+/// the compositor actually composites at stays whatever [`apply_output_mode`] was called
+/// with. A rung equal to the current mode collapses into it (`Output::add_mode` dedups on
+/// size+refresh), so it is advertised exactly once, carrying the current/preferred flags.
+///
+/// Two protocol facts shape this:
+/// * `wl_output` only ever sends its full mode list at **bind** time, and there is no way to
+///   retract a mode from a client that already bound. So `delete_mode` here only stops a
+///   retired rung reaching *future* clients — within one session, a client that already saw
+///   a rung keeps seeing it. Set the ladder before the app connects.
+/// * `Output::delete_mode` clears `current_mode`/`preferred_mode` when they match, which
+///   would leave the output modeless, so those two are never retired here.
+fn advertise_mode_ladder(
+    state: &mut State,
+    output: &Output,
+    refresh_mhz: i32,
+    encode: Size<i32, Physical>,
+) {
+    let mut desired: Vec<OutputMode> = Vec::new();
+    for rung in &state.mode_ladder {
+        if rung.w <= 0 || rung.h <= 0 || rung.w > encode.w || rung.h > encode.h {
+            continue;
+        }
+        let mode = OutputMode {
+            size: *rung,
+            refresh: refresh_mhz,
+        };
+        if !desired.contains(&mode) {
+            desired.push(mode);
+        }
+    }
+
+    // Reconcile against the FULL advertised set, not just what this function put there.
+    // `Output::change_current_state` APPENDS every mode it is handed and never removes the
+    // one it replaced, so without this every render size (and every encode size) the session
+    // has ever used accumulates on the output forever. That was invisible while gwd
+    // advertised a single mode and nothing listed them; with a ladder, an in-app display menu
+    // shows the lot. Keep exactly: the ladder, the current mode, and the preferred mode
+    // (`delete_mode` clears `current_mode`/`preferred_mode` when they match, which would
+    // leave the output modeless).
+    let current = output.current_mode();
+    let preferred = output.preferred_mode();
+    for stale in output.modes() {
+        if desired.contains(&stale) || Some(stale) == current || Some(stale) == preferred {
+            continue;
+        }
+        tracing::debug!(?stale, "Retiring a stale wl_output mode");
+        output.delete_mode(stale);
+    }
+    for mode in &desired {
+        output.add_mode(*mode);
+    }
+    tracing::debug!(
+        rungs = desired.len(),
+        ?encode,
+        refresh_mhz,
+        "Advertised wl_output mode ladder"
+    );
+    state.advertised_ladder = desired;
+}
+
+/// Apply a requested mode ladder. Non-positive rungs are dropped; the value is sticky and
+/// re-advertised by [`apply_output_mode`] on every caps re-negotiation.
+///
+/// Deliberately does NOT go through [`apply_output_mode`]: the ladder adds *advertised*
+/// modes only, so the current mode, the damage tracker, the pointer and every toplevel's
+/// configure must all stay exactly where they are.
+pub(crate) fn apply_mode_ladder(state: &mut State, ladder: &[(i32, i32)]) {
+    let requested: Vec<Size<i32, Physical>> = ladder
+        .iter()
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|&(w, h)| Size::from((w, h)))
+        .collect();
+
+    // The element re-forwards the ladder after every `Command::VideoInfo`, so an unchanged
+    // value arrives routinely; there is nothing to do for one.
+    if requested == state.mode_ladder && state.output.is_some() {
+        tracing::debug!("Mode ladder unchanged; nothing to re-apply");
+        return;
+    }
+    state.mode_ladder = requested;
+
+    let Some(output) = state.output.clone() else {
+        // No output yet: `apply_video_info` will pick the stored ladder up.
+        return;
+    };
+    let refresh = output.current_mode().map(|m| m.refresh).unwrap_or(60_000);
+    let encode: Size<i32, Physical> = state
+        .video_info
+        .as_ref()
+        .map(|vi| (vi.width() as i32, vi.height() as i32).into())
+        .unwrap_or_else(|| effective_render_size(state));
+    advertise_mode_ladder(state, &output, refresh, encode);
 }
 
 /// Move the pointer from a `old`-sized logical extent into a `new`-sized one, keeping it at
@@ -1410,6 +1527,10 @@ pub(crate) fn init(
                 Event::Msg(Command::RenderSize { width, height }) => {
                     tracing::info!(width, height, "Applying requested render size");
                     apply_render_size(state, (width, height).into());
+                }
+                Event::Msg(Command::ModeLadder(ladder)) => {
+                    tracing::info!(?ladder, "Applying requested mode ladder");
+                    apply_mode_ladder(state, &ladder);
                 }
                 Event::Msg(Command::UiScale(scale)) => {
                     tracing::info!(scale, "Applying requested UI scale");

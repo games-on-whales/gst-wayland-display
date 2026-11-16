@@ -242,6 +242,9 @@ pub struct Settings {
     /// UI scale advertised through `wp_fractional_scale_v1`. `None` = never set by the
     /// application, so nothing is forwarded and the getter reports the 1.0 default.
     ui_scale: Option<f64>,
+    /// Extra `wl_output` modes to advertise, so an in-app resolution menu has a list to
+    /// offer. Empty = none (the historical behaviour). See `forward_display_geometry`.
+    mode_ladder: Vec<(i32, i32)>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -672,6 +675,23 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .maximum(3.0)
                     .default_value(1.0)
                     .build(),
+                glib::ParamSpecString::builder("mode-ladder")
+                    .nick("Mode ladder")
+                    .blurb(
+                        "Comma-separated list of EXTRA wl_output modes to advertise, e.g. \
+                         \"1920x1080,1600x900,1280x720\" (empty = none). This is what gives \
+                         an in-app display/resolution menu a list to choose from; the app \
+                         then commits a smaller fullscreen buffer, which the compositor \
+                         scales to fill the output. Purely advisory: the CURRENT and \
+                         PREFERRED mode stay the render size, and the encode size is \
+                         untouched. Rungs larger than the encode size are dropped. \
+                         Live-writable and sticky across caps re-negotiation, but note that \
+                         wl_output only sends its mode list when a client BINDS the output \
+                         -- set the ladder before the application connects. A malformed \
+                         value is warned about and ignored.",
+                    )
+                    .default_value(Some(""))
+                    .build(),
             ]
         });
 
@@ -923,6 +943,31 @@ impl ObjectImpl for WaylandDisplaySrc {
                     state.display.set_ui_scale(scale);
                 }
             }
+            "mode-ladder" => {
+                let raw = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .unwrap_or_default();
+                match parse_mode_ladder(&raw) {
+                    Some(ladder) => {
+                        self.settings.lock().unwrap().mode_ladder = ladder.clone();
+                        if let Some(state) = self.state.lock().unwrap().as_ref() {
+                            state.display.set_mode_ladder(&ladder);
+                        }
+                    }
+                    None => {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "Ignoring malformed mode-ladder {:?}; expected a comma-separated \
+                             list of \"WxH\" (e.g. \"1920x1080,1280x720\"), each dimension \
+                             1..={}, or \"\" for none",
+                            raw,
+                            MAX_RENDER_DIMENSION
+                        );
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -1017,6 +1062,16 @@ impl ObjectImpl for WaylandDisplaySrc {
             "ui-scale" => {
                 let settings = self.settings.lock().unwrap();
                 settings.ui_scale.unwrap_or(1.0).to_value()
+            }
+            "mode-ladder" => {
+                let settings = self.settings.lock().unwrap();
+                settings
+                    .mode_ladder
+                    .iter()
+                    .map(|(w, h)| format!("{w}x{h}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .to_value()
             }
             _ => unreachable!(),
         }
@@ -1335,12 +1390,13 @@ impl WaylandDisplaySrc {
     /// applies the mode exactly once per negotiation. A partial pair (only one dimension
     /// set) is deliberately not forwarded; see `set_property`.
     fn forward_display_geometry(&self) {
-        let (width, height, ui_scale) = {
+        let (width, height, ui_scale, mode_ladder) = {
             let settings = self.settings.lock().unwrap();
             (
                 settings.render_width,
                 settings.render_height,
                 settings.ui_scale,
+                settings.mode_ladder.clone(),
             )
         };
         if width > 0 && height > 0 {
@@ -1348,6 +1404,11 @@ impl WaylandDisplaySrc {
         }
         if let Some(scale) = ui_scale {
             self.send_command(Command::UiScale(scale));
+        }
+        // Re-advertising the ladder matters more than the other two: the rungs are filtered
+        // against the encode size, which is exactly what just changed.
+        if !mode_ladder.is_empty() {
+            self.send_command(Command::ModeLadder(mode_ladder));
         }
     }
 }
@@ -2413,6 +2474,25 @@ fn set_p010_color(s: &mut gst::StructureRef, hdr: &Option<(String, String)>) {
             s.remove_field("content-light-level");
         }
     }
+}
+
+/// Parse the `mode-ladder` property's `"WxH,WxH,..."` form (e.g.
+/// `"1920x1080,1600x900,1280x720"`). An empty (or whitespace-free empty) string is a valid
+/// "no ladder". Returns `None` if ANY entry is malformed — a missing/extra `x`, a non-digit,
+/// a sign, whitespace, a zero dimension (a zero-sized mode is meaningless, unlike
+/// `render-size`'s `"0x0"` reset), or a dimension above [`MAX_RENDER_DIMENSION`] — so the
+/// caller can warn and keep the previous ladder rather than advertise a garbage mode.
+/// Duplicate rungs are kept as written; the compositor dedups when advertising.
+fn parse_mode_ladder(raw: &str) -> Option<Vec<(i32, i32)>> {
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    raw.split(',')
+        .map(|entry| match parse_render_size(entry) {
+            Some((w, h)) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The converter's 4:2:0 output (NV12/P010) has one chroma sample per 2x2 block, and Vulkan

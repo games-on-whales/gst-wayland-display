@@ -137,9 +137,64 @@ fn ui_scale_round_trips() {
 }
 
 #[test]
+fn mode_ladder_defaults_to_empty() {
+    let src = make_src();
+    assert_eq!(src.property::<String>("mode-ladder"), "");
+}
+
+#[test]
+fn mode_ladder_round_trips() {
+    let src = make_src();
+    src.set_property("mode-ladder", "1920x1080,1600x900,1280x720");
+    assert_eq!(
+        src.property::<String>("mode-ladder"),
+        "1920x1080,1600x900,1280x720"
+    );
+
+    // A single rung is a ladder too, and "" clears it.
+    src.set_property("mode-ladder", "1280x720");
+    assert_eq!(src.property::<String>("mode-ladder"), "1280x720");
+    src.set_property("mode-ladder", "");
+    assert_eq!(src.property::<String>("mode-ladder"), "");
+}
+
+#[test]
+fn mode_ladder_rejects_malformed_values() {
+    let src = make_src();
+    src.set_property("mode-ladder", "1920x1080,1280x720");
+    for bad in [
+        "bogus",
+        "1920",
+        "1920x",
+        "x1080",
+        "1920x1080,",
+        ",1920x1080",
+        "1920x1080,,1280x720",
+        "1920x1080, 1280x720", // whitespace is not accepted
+        "1920x1080,-1x720",
+        "1920x1080,20000x720", // above the 16384 dimension maximum
+        "0x0",                 // a zero-sized mode is meaningless; "" is the reset
+        "1920x1080,1280x0",
+    ] {
+        src.set_property("mode-ladder", bad);
+        assert_eq!(
+            src.property::<String>("mode-ladder"),
+            "1920x1080,1280x720",
+            "malformed mode-ladder {bad:?} must be ignored, not applied"
+        );
+    }
+}
+
+#[test]
 fn properties_are_readwrite_and_not_construct_only() {
     let src = make_src();
-    for name in ["render-size", "render-width", "render-height", "ui-scale"] {
+    for name in [
+        "render-size",
+        "render-width",
+        "render-height",
+        "ui-scale",
+        "mode-ladder",
+    ] {
         let pspec = src.find_property(name).expect("property exists");
         let flags = pspec.flags();
         assert!(

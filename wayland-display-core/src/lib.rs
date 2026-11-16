@@ -48,6 +48,12 @@ pub enum Command {
     /// clients render at the full render density rather than being upscaled. The encode size
     /// is unaffected. Clamped to `[1.0, 3.0]`; non-finite values are ignored.
     UiScale(f64),
+    /// Element -> compositor: the set of additional `wl_output` modes to advertise
+    /// alongside the current one, so an in-app display/resolution menu has something to
+    /// list. Rungs larger than the encode size (per axis) are dropped; the CURRENT and
+    /// PREFERRED mode stay the render size regardless. An empty list advertises no extra
+    /// modes (the historical behaviour). Sticky across caps re-negotiation.
+    ModeLadder(Vec<(i32, i32)>),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -307,6 +313,18 @@ impl WaylandDisplay {
     /// at full density. The encode size is untouched. Clamped to `[1.0, 3.0]`.
     pub fn set_ui_scale(&self, scale: f64) {
         let _ = self.command_tx.send(Command::UiScale(scale));
+    }
+
+    /// Advertise a ladder of additional `wl_output` modes (`[(width, height), ...]`), so a
+    /// client's own display settings can offer internal resolutions to pick from. Rungs
+    /// above the encode size are dropped; the current and preferred mode remain the render
+    /// size. An empty slice advertises no extra modes. Sticky across caps re-negotiation.
+    ///
+    /// Note that the `wl_output` protocol has no way to retract a mode from a client that
+    /// has already bound the output, so a ladder is best set before clients connect (the
+    /// element forwards it again after every caps negotiation for exactly that reason).
+    pub fn set_mode_ladder(&self, ladder: &[(i32, i32)]) {
+        let _ = self.command_tx.send(Command::ModeLadder(ladder.to_vec()));
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {
