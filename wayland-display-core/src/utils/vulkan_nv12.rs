@@ -526,14 +526,19 @@ unsafe fn open_device(instance: &ash::Instance, target_minor: u32) -> Result<Ope
     instance.get_physical_device_features2(pd, &mut features);
     let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
         .sampler_ycbcr_conversion(supported_ycbcr.sampler_ycbcr_conversion != 0);
-    let device = instance.create_device(
+    // Not `instance.create_device`: it loads the table with `ash::Device::load`.
+    let mut raw_device = vk::Device::null();
+    (instance.fp_v1_0().create_device)(
         pd,
         &vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&exts)
             .push_next(&mut ycbcr),
-        None,
-    )?;
+        std::ptr::null(),
+        &mut raw_device,
+    )
+    .result()?;
+    let device = crate::utils::vulkan_share::load_device(instance, raw_device);
     Ok(OpenedDevice {
         pd,
         device,
@@ -1154,7 +1159,7 @@ impl VulkanNv12 {
         // submit to gst's own graphics queue under its submit lock.
         let entry = ash::Entry::load()?;
         let instance = ash::Instance::load(entry.static_fn(), raw.instance);
-        let device = ash::Device::load(instance.fp_v1_0(), raw.device);
+        let device = crate::utils::vulkan_share::load_device(&instance, raw.device);
         let queue = raw.gfx_vk_queue();
         let mut queue_families = vec![raw.gfx_queue_family];
         if let Some(enc) = raw

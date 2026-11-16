@@ -32,6 +32,7 @@ use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
 use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
+use std::ffi::{CStr, c_void};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// The encoder's input image usage. (0x2000, used here before, is VIDEO_ENCODE_DST: the
@@ -134,10 +135,7 @@ fn device_lost(device: &VulkanDevice) -> bool {
             entry.static_fn(),
             wayland_display_vk_instance(device.as_ptr()),
         );
-        let ash_device = ash::Device::load(
-            instance.fp_v1_0(),
-            wayland_display_vk_device(device.as_ptr()),
-        );
+        let ash_device = load_device(&instance, wayland_display_vk_device(device.as_ptr()));
         let Some(queue) = graphics_queue(device) else {
             return false;
         };
@@ -604,6 +602,43 @@ fn mint_device(target_minor: Option<u32>) -> Option<(VulkanInstance, VulkanDevic
     Some((instance, device))
 }
 
+/// Build the `ash` function table for `device`. Every `ash::Device` in this crate comes from
+/// here, never from `ash::Device::load` or `ash::Instance::create_device`.
+///
+/// Those two ask the loader for `vkGetDeviceQueue2`, and Vulkan-Loader before 1.4.345 answers
+/// that one name by walking every instance in the process under a lock that instance creation
+/// does not take. A `vkEnumeratePhysicalDevices` on another thread frees the record of each
+/// driver without a physical device mid-walk, and the lookup reads it: SIGSEGV in
+/// `loader_get_icd_and_device`. Nothing here calls `get_device_queue2`, so its
+/// slot keeps ash's panicking stub. Go back to `ash::Device::load` once no supported loader
+/// is older than 1.4.345.
+///
+/// # Safety
+/// `device` must be a live `VkDevice` created from `instance`.
+pub unsafe fn load_device(instance: &ash::Instance, device: vk::Device) -> ash::Device {
+    let get_device_proc_addr = instance.fp_v1_0().get_device_proc_addr;
+    load_device_with(
+        |name| std::mem::transmute(get_device_proc_addr(device, name.as_ptr())),
+        device,
+    )
+}
+
+unsafe fn load_device_with(
+    mut lookup: impl FnMut(&CStr) -> *const c_void,
+    device: vk::Device,
+) -> ash::Device {
+    ash::Device::load_with(
+        |name| {
+            if name == c"vkGetDeviceQueue2" {
+                std::ptr::null()
+            } else {
+                lookup(name)
+            }
+        },
+        device,
+    )
+}
+
 /// Extract the raw `VkInstance`/`VkPhysicalDevice`/`VkDevice`, gst's graphics queue and the
 /// video-encode queue family from the (shared) `GstVulkanDevice`.
 pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
@@ -1008,6 +1043,171 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table is built without asking for `vkGetDeviceQueue2` (see `load_device`). Needs
+    /// no Vulkan: the lookup is a recorder and every slot gets ash's stub.
+    #[test]
+    fn device_table_is_built_without_looking_up_get_device_queue2() {
+        let mut asked = Vec::new();
+        let _table = unsafe {
+            load_device_with(
+                |name| {
+                    asked.push(name.to_owned());
+                    std::ptr::null()
+                },
+                vk::Device::null(),
+            )
+        };
+        let asked_for = |name: &CStr| asked.iter().any(|n| n.as_c_str() == name);
+        // Its 1.0 sibling proves this is the device name list, not an empty one.
+        assert!(asked_for(c"vkGetDeviceQueue"));
+        assert!(asked_for(c"vkCreateSampler"));
+        assert!(!asked_for(c"vkGetDeviceQueue2"));
+    }
+
+    /// Guards the rule in `load_device`'s doc: a direct `ash::Device::load`/`load_with` or
+    /// `Instance::create_device` anywhere in the workspace brings the loader race back. The one
+    /// table load allowed is `load_device_with`'s own. Not caught: a type alias of
+    /// `ash::Device`, or a call split across lines.
+    #[test]
+    fn every_device_table_comes_from_load_device() {
+        // Split, or this file would match itself.
+        let banned = [
+            concat!("Device::", "load"),
+            concat!("Device>::", "load"),
+            concat!(".create_", "device("),
+            concat!(".create_", "device::"),
+            concat!("::create_", "device("),
+        ];
+        let allowed = concat!("ash::Device::", "load_with(");
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut dirs = vec![workspace.to_path_buf()];
+        let (mut scanned, mut hits) = (0, Vec::new());
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if !["target", ".git"].contains(&entry.file_name().to_str().unwrap_or("")) {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    scanned += 1;
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in source.lines().enumerate() {
+                        let code = line.split("//").next().unwrap();
+                        if banned.iter().any(|b| code.contains(b)) {
+                            hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(scanned > 20, "only {scanned} source files scanned");
+        let own = hits
+            .iter()
+            .position(|h| h.contains("utils/vulkan_share.rs:") && h.contains(allowed))
+            .expect("load_device_with no longer builds the table");
+        hits.remove(own);
+        assert!(
+            hits.is_empty(),
+            "build the device table with vulkan_share::load_device:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    /// The loader race on a real loader: one thread builds device tables while another
+    /// creates instances and enumerates their devices. On Vulkan-Loader 1.4.341 with a driver
+    /// that has no device installed, the same loop over `ash::Device::load` dies of SIGSEGV
+    /// within seconds; this one must not. Skips where no Vulkan device exists (no loader, or
+    /// no software driver such as lavapipe). It can only fail on a loader before 1.4.345
+    /// with such a driver installed, so it prints the loader version and whether it ran:
+    /// read that line (`--nocapture`) before taking a pass as proof.
+    #[test]
+    fn device_table_survives_instance_churn_on_another_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const RUN_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+        unsafe {
+            let Ok(entry) = ash::Entry::load() else {
+                eprintln!("skipped: no Vulkan loader");
+                return;
+            };
+            let loader = entry
+                .try_enumerate_instance_version()
+                .ok()
+                .flatten()
+                .unwrap_or(vk::API_VERSION_1_0);
+            let loader = format!(
+                "Vulkan loader {}.{}.{}",
+                vk::api_version_major(loader),
+                vk::api_version_minor(loader),
+                vk::api_version_patch(loader)
+            );
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+            let info = vk::InstanceCreateInfo::default().application_info(&app);
+            let Ok(instance) = entry.create_instance(&info, None) else {
+                eprintln!("skipped: no Vulkan instance ({loader})");
+                return;
+            };
+            let Some(physical) = instance
+                .enumerate_physical_devices()
+                .ok()
+                .and_then(|d| d.first().copied())
+            else {
+                eprintln!("skipped: no Vulkan physical device ({loader})");
+                instance.destroy_instance(None);
+                return;
+            };
+            let priorities = [1.0f32];
+            let queues = [vk::DeviceQueueCreateInfo::default().queue_priorities(&priorities)];
+            let mut device = vk::Device::null();
+            (instance.fp_v1_0().create_device)(
+                physical,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                std::ptr::null(),
+                &mut device,
+            )
+            .result()
+            .expect("create a device on the first physical device");
+
+            let stop = AtomicBool::new(false);
+            let (tables, instances) = std::thread::scope(|s| {
+                let churn = s.spawn(|| {
+                    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+                    let info = vk::InstanceCreateInfo::default().application_info(&app);
+                    let mut made = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(other) = entry.create_instance(&info, None) {
+                            let _ = other.enumerate_physical_devices();
+                            other.destroy_instance(None);
+                            made += 1;
+                        }
+                    }
+                    made
+                });
+                let started = std::time::Instant::now();
+                let mut tables = 0u32;
+                while started.elapsed() < RUN_FOR {
+                    let table = load_device(&instance, device);
+                    assert_ne!(table.handle(), vk::Device::null());
+                    tables += 1;
+                }
+                stop.store(true, Ordering::Relaxed);
+                (tables, churn.join().unwrap())
+            });
+            eprintln!(
+                "ran: {loader}, {tables} device tables built beside {instances} instances \
+                 created on another thread"
+            );
+            // Not `instances > 0`: the other thread may not be scheduled within the second.
+            assert!(tables > 0);
+
+            load_device(&instance, device).destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
 
     // Every producer on a GPU hands out the same device, so a consumer switched from one to
     // another (Wolf's lobbies) keeps receiving images on the device its encoder adopted.

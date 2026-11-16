@@ -237,13 +237,18 @@ fn vulkan_teardown_on(entry: &ash::Entry, node: &DrmNode) -> bool {
             let queue = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(0)
                 .queue_priorities(&priority)];
-            let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queue),
-                    None,
-                )
-                .expect("vkCreateDevice");
+            // Not `instance.create_device`: see `vulkan_share::load_device`.
+            let mut raw_device = vk::Device::null();
+            (instance.fp_v1_0().create_device)(
+                physical,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queue),
+                std::ptr::null(),
+                &mut raw_device,
+            )
+            .result()
+            .expect("vkCreateDevice");
+            let device =
+                waylanddisplaycore::utils::vulkan_share::load_device(&instance, raw_device);
             device.destroy_device(None);
         }
         instance.destroy_instance(None);
