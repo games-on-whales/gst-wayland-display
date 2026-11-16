@@ -121,6 +121,13 @@ impl WaylandDisplaySrc {
     /// queued on it, and returns its receiver.
     fn new_startup_channel(&self, settings: &Settings) -> Channel<Command> {
         let command_rx = self.new_command_channel();
+        // Before the app is launched, so its first keyboard gets this keymap.
+        if !settings.keyboard_layout.is_empty() {
+            self.send_command(Command::KeyboardLayout {
+                layout: settings.keyboard_layout.clone(),
+                variant: settings.keyboard_variant.clone(),
+            });
+        }
         for path in settings.startup_input_devices() {
             self.send_command(Command::InputDevice(path));
         }
@@ -233,6 +240,10 @@ pub struct Settings {
     /// Codec of the Vulkan encoder consuming `memory:VulkanImage` output (`h264`, `h265`,
     /// `av1`). `None` => the directly linked encoder's, else H.264 for NV12 / H.265 for P010.
     vulkan_codec: Option<String>,
+    /// XKB layout and variant for the session keymap, read at `start()`. Empty layout =
+    /// the default (US) keymap, as before.
+    keyboard_layout: String,
+    keyboard_variant: String,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -603,6 +614,25 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecString::builder("keyboard-layout")
+                    .nick("Keyboard layout")
+                    .blurb(
+                        "XKB layout of the keymap clients get (e.g. \"de\"). Empty = the \
+                         default US keymap. A layout or variant that does not compile falls \
+                         back to US with a warning. Read when the element starts.",
+                    )
+                    .default_value(Some(""))
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("keyboard-variant")
+                    .nick("Keyboard variant")
+                    .blurb(
+                        "XKB variant of keyboard-layout (e.g. \"nodeadkeys\"). Empty = the \
+                         layout's default variant. Ignored while keyboard-layout is empty.",
+                    )
+                    .default_value(Some(""))
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -782,6 +812,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                 }
                 settings.hdr = hdr;
             }
+            "keyboard-layout" => {
+                self.settings.lock().unwrap().keyboard_layout = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .unwrap_or_default();
+            }
+            "keyboard-variant" => {
+                self.settings.lock().unwrap().keyboard_variant = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .unwrap_or_default();
+            }
             _ => unreachable!(),
         }
     }
@@ -861,6 +903,8 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.hdr.to_value()
             }
+            "keyboard-layout" => self.settings.lock().unwrap().keyboard_layout.to_value(),
+            "keyboard-variant" => self.settings.lock().unwrap().keyboard_variant.to_value(),
             _ => unreachable!(),
         }
     }

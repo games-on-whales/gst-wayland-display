@@ -2,7 +2,7 @@ use super::{State, focus::FocusTarget};
 use smithay::backend::input::InputTime;
 use smithay::backend::input::Keycode;
 use smithay::backend::libinput::LibinputInputBackend;
-use smithay::input::keyboard::Keysym;
+use smithay::input::keyboard::{Keysym, KeysymHandle, XkbConfig};
 use smithay::input::tablet::tool::{
     AxisFrame as ToolAxisFrame, ButtonEvent as ToolButtonEvent, DownEvent as ToolDownEvent,
     MotionEvent as ToolMotionEvent, ProximityInEvent, ProximityOutEvent, TabletToolHandle,
@@ -21,7 +21,7 @@ use smithay::{
     },
     desktop::WindowSurfaceType,
     input::{
-        keyboard::{FilterResult, keysyms},
+        keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
     },
@@ -171,7 +171,39 @@ impl LibinputInterface for NixInterface {
     }
 }
 
+/// The Q of Ctrl+Shift+Q: the key labelled q where the layout has Latin letters (AZERTY's
+/// is on the US A key), else the key in the US Q position (`ru`, `gr`).
+fn is_close_key(handle: &KeysymHandle<'_>) -> bool {
+    const KEY_Q: u32 = 16;
+    match handle.raw_latin_sym_or_raw_current_sym() {
+        Some(sym) if sym.key_char().is_some_and(|c| c.is_ascii()) => sym == Keysym::q,
+        _ => handle.raw_code() == Keycode::new(KEY_Q + 8),
+    }
+}
+
 impl State {
+    /// Rebuild the seat's keymap from an XKB layout and variant (`"de"`, `"nodeadkeys"`).
+    /// A pair that does not compile logs a WARN and leaves the default keymap (US).
+    pub fn set_keyboard_layout(&mut self, layout: &str, variant: &str) {
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let config = XkbConfig {
+            layout,
+            variant,
+            ..XkbConfig::default()
+        };
+        if let Err(err) = keyboard.set_xkb_config(self, config) {
+            tracing::warn!(
+                layout,
+                variant,
+                ?err,
+                "Keyboard layout does not compile; using the default (US) keymap"
+            );
+            let _ = keyboard.set_xkb_config(self, XkbConfig::default());
+        } else {
+            tracing::info!(layout, variant, "Applied keyboard layout");
+        }
+    }
+
     pub fn scancode_to_keycode(&self, scancode: u32) -> Keycode {
         // see: https://github.com/rust-x-bindings/xkbcommon-rs/blob/cb449998d8a3de375d492fb7ec015b2925f38ddb/src/xkb/mod.rs#L50-L58
         Keycode::new(scancode + 8)
@@ -193,7 +225,7 @@ impl State {
                         match handle.modified_sym() {
                             Keysym::Tab => {
                                 if let Some(element) = data.space.elements().last().cloned() {
-                                    data.surpressed_keys.insert(keysyms::KEY_Tab);
+                                    data.surpressed_keys.insert(handle.raw_code().raw());
                                     let location = data.space.element_location(&element).unwrap();
                                     data.space.map_element(element.clone(), location, true);
                                     data.seat.get_keyboard().unwrap().set_focus(
@@ -204,7 +236,7 @@ impl State {
                                     return FilterResult::Intercept(());
                                 }
                             }
-                            Keysym::Q => {
+                            _ if is_close_key(&handle) => {
                                 if let Some(target) =
                                     data.seat.get_keyboard().unwrap().current_focus()
                                 {
@@ -214,7 +246,7 @@ impl State {
                                         }
                                         _ => return FilterResult::Forward,
                                     };
-                                    data.surpressed_keys.insert(keysyms::KEY_Q);
+                                    data.surpressed_keys.insert(handle.raw_code().raw());
                                     return FilterResult::Intercept(());
                                 }
                             }
@@ -222,7 +254,8 @@ impl State {
                         }
                     }
                 } else {
-                    if data.surpressed_keys.remove(&handle.modified_sym().raw()) {
+                    // By keycode: the release's keysym can differ (Shift let go first, a non-Latin layout).
+                    if data.surpressed_keys.remove(&handle.raw_code().raw()) {
                         return FilterResult::Intercept(());
                     }
                 }
@@ -1462,6 +1495,102 @@ mod tests {
         let x11_keysym = xkb_state.key_get_one_sym(x11_key_code);
 
         assert_eq!(Keysym::a, x11_keysym);
+    }
+
+    /// The first keysym the seat's current keymap gives an evdev scancode.
+    fn sym_for(state: &mut State, scancode: u32) -> Keysym {
+        let keycode = state.scancode_to_keycode(scancode);
+        let kb = state.seat.get_keyboard().unwrap();
+        kb.with_xkb_state(state, |ctx| {
+            let xkb = ctx.xkb().lock().unwrap();
+            xkb.raw_syms_for_key_in_layout(keycode, xkb.active_layout())[0]
+        })
+    }
+
+    // Evdev scancodes, from `input-event-codes.h`.
+    const KEY_Y: u32 = 21;
+    const KEY_SEMICOLON: u32 = 39;
+    const KEY_Z: u32 = 44;
+
+    #[test]
+    fn keyboard_layout_builds_the_keymap() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+        assert_eq!(sym_for(state, KEY_Y), Keysym::y);
+
+        state.set_keyboard_layout("de", "");
+        assert_eq!(sym_for(state, KEY_Y), Keysym::z);
+        assert_eq!(sym_for(state, KEY_Z), Keysym::y);
+        assert_eq!(sym_for(state, KEY_SEMICOLON), Keysym::odiaeresis);
+
+        state.set_keyboard_layout("de", "nodeadkeys");
+        let kb = state.seat.get_keyboard().unwrap();
+        let name = kb.with_xkb_state(state, |ctx| {
+            let xkb = ctx.xkb().lock().unwrap();
+            xkb.layout_name(xkb.active_layout()).to_owned()
+        });
+        assert_eq!(name, "German (no dead keys)");
+    }
+
+    #[test]
+    fn keyboard_layout_that_does_not_compile_falls_back_to_us() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+
+        for (layout, variant) in [("de", "no-such-variant"), ("no-such-layout", "")] {
+            state.set_keyboard_layout("de", "");
+            assert_eq!(sym_for(state, KEY_Y), Keysym::z);
+            state.set_keyboard_layout(layout, variant);
+            assert_eq!(sym_for(state, KEY_Y), Keysym::y, "{layout}({variant})");
+            assert_eq!(sym_for(state, KEY_SEMICOLON), Keysym::semicolon);
+        }
+    }
+
+    #[test]
+    fn close_shortcut_key_follows_the_label_or_the_us_position() {
+        const KEY_Q: u32 = 16;
+        const KEY_A: u32 = 30;
+        const CTRL_SHIFT: [u32; 2] = [29, 42];
+        let mut harness = TestState::new();
+        let state = harness.state();
+        for (layout, scancode, want) in [
+            ("us", KEY_Q, true),
+            ("de", KEY_Q, true),
+            ("fr", KEY_A, true),
+            ("fr", KEY_Q, false),
+            ("ru", KEY_Q, true),
+            ("ru", KEY_A, false),
+        ] {
+            state.set_keyboard_layout(layout, "");
+            let kb = state.seat.get_keyboard().unwrap();
+            let press = |state: &mut State, scancode: u32, key_state| {
+                let keycode = state.scancode_to_keycode(scancode);
+                kb.input::<(), _>(
+                    state,
+                    keycode,
+                    key_state,
+                    SERIAL_COUNTER.next_serial(),
+                    InputTime::from_millis(0),
+                    |_, _, _| FilterResult::Forward,
+                );
+            };
+            for m in CTRL_SHIFT {
+                press(state, m, KeyState::Pressed);
+            }
+            let keycode = state.scancode_to_keycode(scancode);
+            let got = kb.input::<bool, _>(
+                state,
+                keycode,
+                KeyState::Pressed,
+                SERIAL_COUNTER.next_serial(),
+                InputTime::from_millis(0),
+                |_, _, handle| FilterResult::Intercept(is_close_key(&handle)),
+            );
+            for k in [scancode, CTRL_SHIFT[0], CTRL_SHIFT[1]] {
+                press(state, k, KeyState::Released);
+            }
+            assert_eq!(got, Some(want), "{layout} scancode {scancode}");
+        }
     }
 
     #[test]

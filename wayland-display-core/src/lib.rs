@@ -33,6 +33,12 @@ pub use crate::utils::video_info::GstVideoInfo;
 pub enum Command {
     InputDevice(String),
     VideoInfo(Box<GstVideoInfo>),
+    /// Element -> compositor: build the keymap from this XKB layout and variant. A pair
+    /// that does not compile keeps the default (US) keymap and logs a WARN.
+    KeyboardLayout {
+        layout: String,
+        variant: String,
+    },
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
