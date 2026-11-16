@@ -1933,3 +1933,63 @@ fn va_stable_transport_keeps_one_pq_contract_across_sdr_hdr_sdr() {
     assert_eq!(fed[0].colorimetry.as_deref(), Some("bt2100-pq"));
     assert!(fed[0].mastering.is_some() && fed[0].content_light.is_some());
 }
+
+/// Element churn must be CRITICAL-free.
+///
+/// `waylanddisplaysrc` used to emit exactly one
+/// `GLib-GObject-CRITICAL: g_object_unref: assertion 'G_IS_OBJECT (object)' failed`
+/// per element lifecycle at teardown -- an unref through an already-finalized object.
+/// Two mechanisms are known and fixed (both now upstream):
+///
+///   * the CUDA context short-circuit -- `gst_cuda_ensure_element_context()` / `gst_cuda_handle_set_context()`
+///     both open with `if (*cuda_ctx) return TRUE;`, reporting success while transferring
+///     NOTHING, so a `CUDAContext` wrapper built off that short-circuit destroyed a
+///     reference it never owned. The pipeline's stored `GstContext` then outlived the
+///     finalized `GstCudaContext`, and disposing it unreffed freed memory (a CRITICAL in a
+///     short-lived churn process, a SIGSEGV in a long session).
+///   * the pool clear -- `decide_allocation()`'s `gst_clear_object(pool.as_ptr() as *mut _)`
+///     passed a `GstBufferPool *` where a `GstObject **` was expected, unreffing through
+///     the class pointer.
+///
+/// The acceptance condition is per-lifecycle, not per-frame, so this drives the
+/// full lifecycle 8 times and lets `init()`'s `log_set_always_fatal(LEVEL_CRITICAL)` turn
+/// any surviving CRITICAL into an abort. Deliberately does NOT force `memory:CUDAMemory`
+/// or a Vulkan device: the defect was path-independent (it reproduced on the plain RGBx
+/// path under bare `gst-launch-1.0`), and the CUDA context is created in `start()` whenever
+/// the plugin is built `--features cuda`, so the ordinary RGBx pipeline exercises it.
+#[test]
+#[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
+fn element_churn_is_critical_free() {
+    let _gpu = init();
+    let Some(node) = any_render_node() else {
+        skip!("no render node")
+    };
+    for cycle in 0..8 {
+        run_to_eos(&format!(
+            "waylanddisplaysrc render-node={node} num-buffers=5 ! fakesink sync=false"
+        ))
+        .unwrap_or_else(|e| panic!("churn cycle {cycle}: {e}"));
+    }
+}
+
+/// The `memory:CUDAMemory` half of the churn acceptance ("both the CUDA and RGBx paths").
+/// Skipped unless the plugin was built `--features cuda` and an nvidia node plus the
+/// `cudaconvert` element are present.
+#[test]
+#[ignore = "needs an nvidia GPU + a cuda-feature build; run via ci/harness.sh gpu"]
+fn cuda_element_churn_is_critical_free() {
+    let _gpu = init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no nvidia render node")
+    };
+    if !have("cudaconvert") {
+        skip!("no cudaconvert (not a CUDA-enabled gst build)");
+    }
+    for cycle in 0..8 {
+        run_to_eos(&format!(
+            "waylanddisplaysrc render-node={node} num-buffers=5 ! \
+             video/x-raw(memory:CUDAMemory) ! cudaconvert ! fakesink sync=false"
+        ))
+        .unwrap_or_else(|e| panic!("cuda churn cycle {cycle}: {e}"));
+    }
+}
