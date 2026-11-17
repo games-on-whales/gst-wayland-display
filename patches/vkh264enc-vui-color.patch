@@ -1,0 +1,48 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 72287ff167..c72e357e82 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -524,6 +524,34 @@ _configure_rate_control (GstVulkanH264Encoder * self,
+   }
+ }
+ 
++/* Reflect the negotiated input colorimetry into the SPS VUI colour
++ * description. This is done for every stream (BT.709 for SDR, BT.2020/PQ for
++ * HDR) - it just signals what the pixels already are. The std SPS copy path in
++ * gst_vulkan_h264_encoder_init_std_sps() forwards these fields to the Vulkan
++ * StdVideo VUI, and gst_h264_bit_writer_sps() writes them into the bitstream. */
++static void
++_set_vui_colour_description (GstVulkanH264Encoder * self, GstH264SPS * sps)
++{
++  GstH264VUIParams *vui = &sps->vui_parameters;
++  const GstVideoColorimetry *ci = &self->in_state->info.colorimetry;
++
++  sps->vui_parameters_present_flag = 1;
++  vui->video_signal_type_present_flag = 1;
++  vui->video_format = 5;        /* Unspecified */
++  vui->video_full_range_flag =
++      (ci->range == GST_VIDEO_COLOR_RANGE_0_255) ? 1 : 0;
++  vui->colour_description_present_flag = 1;
++  vui->colour_primaries = gst_video_color_primaries_to_iso (ci->primaries);
++  vui->transfer_characteristics =
++      gst_video_transfer_function_to_iso (ci->transfer);
++  vui->matrix_coefficients = gst_video_color_matrix_to_iso (ci->matrix);
++
++  GST_DEBUG_OBJECT (self, "VUI colour description: primaries=%u transfer=%u "
++      "matrix=%u full-range=%u", vui->colour_primaries,
++      vui->transfer_characteristics, vui->matrix_coefficients,
++      vui->video_full_range_flag);
++}
++
+ static gboolean
+ gst_vulkan_h264_encoder_init_std_sps (GstVulkanH264Encoder * self,
+     GstH264SPS * sps)
+@@ -977,6 +1005,8 @@ gst_vulkan_h264_encoder_update_parameters (GstVulkanH264Encoder * self,
+   GstVulkanEncoderParameters params;
+   VkVideoEncodeH264SessionParametersAddInfoKHR params_add;
+ 
++  _set_vui_colour_description (self, sps);
++
+   if (!gst_vulkan_h264_encoder_init_std_sps (self, sps))
+     return GST_FLOW_ERROR;
+   if (!gst_vulkan_h264_encoder_init_std_pps (self, pps))
