@@ -517,6 +517,26 @@ impl State {
         }
     }
 
+    /// Free this compositor's GPU objects while its renderer can still do it.
+    ///
+    /// The process keeps one EGL display per render node and never terminates it
+    /// (`utils::renderer`), and smithay does not delete a dropped buffer's EGLImage,
+    /// framebuffer or renderbuffer: it queues them for the renderer's next cleanup, which
+    /// never comes once the compositor stops. Without this each session left its render
+    /// target behind (on AMD one 1920x1080 RGBA image, 7.9 MiB, per session).
+    pub(crate) fn release_render_resources(&mut self) {
+        self.output_buffer = None;
+        self.dtr = None;
+        if let Err(err) =
+            smithay::backend::renderer::Renderer::invalidate_caches(&mut self.renderer)
+        {
+            tracing::warn!(
+                ?err,
+                "Could not free the renderer's GPU objects at shutdown"
+            );
+        }
+    }
+
     /// Release the seat's input devices before the compositor state is dropped.
     ///
     /// smithay mints one sealed `memfd:smithay-keymap` per [`Seat::add_keyboard`] and keeps it
@@ -1383,6 +1403,7 @@ pub(crate) fn init(
 
     // Close the seat's keymap memfd before `state` drops; see `State::release_seat`.
     state.release_seat();
+    state.release_render_resources();
 }
 
 #[cfg(test)]
