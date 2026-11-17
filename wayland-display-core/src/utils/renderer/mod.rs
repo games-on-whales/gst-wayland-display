@@ -148,6 +148,30 @@ fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Unregister smithay's EGL debug-log callback when the process exits.
+///
+/// The displays in [`EGL_DISPLAYS`] are never terminated, so the driver terminates them at
+/// exit (NVIDIA's libEGL calls `eglTerminate` from its exit handler), and EGL reports through
+/// the debug callback. By then `exit()` has run the exiting thread's thread-local destructors,
+/// and the callback's `tracing` event reaches a `fmt` subscriber whose thread-local buffer is
+/// gone: Rust prints a "cannot access a Thread Local Storage value during or after
+/// destruction" panic (caught by smithay, but printed) at every process exit. Registered after
+/// the first display exists, so it runs before the driver's own exit handler.
+fn silence_egl_debug_at_exit() {
+    extern "C" fn unregister() {
+        if ffi::egl::DebugMessageControlKHR::is_loaded() {
+            let attribs = [ffi::egl::NONE as ffi::egl::types::EGLAttrib];
+            unsafe { ffi::egl::DebugMessageControlKHR(None, attribs.as_ptr()) };
+        }
+    }
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        if unsafe { libc::atexit(unregister) } != 0 {
+            tracing::warn!("Couldn't register the EGL debug-callback exit handler");
+        }
+    });
+}
+
 pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     // Before the display exists: loading NVIDIA's Vulkan driver initializes it too.
     keep_vulkan_drivers_loaded();
@@ -177,6 +201,7 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             let tracked =
                 plain_display_handle(device_handle) != Some(egl.get_display_handle().handle);
             tracing::debug!(tracked, "EGL display for {render_node:?}");
+            silence_egl_debug_at_exit();
             displays.insert(render_node, (egl.clone(), tracked));
             (egl, tracked)
         }
