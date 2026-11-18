@@ -1953,10 +1953,8 @@ fn va_stable_transport_keeps_one_pq_contract_across_sdr_hdr_sdr() {
 ///
 /// The acceptance condition is per-lifecycle, not per-frame, so this drives the
 /// full lifecycle 8 times and lets `init()`'s `log_set_always_fatal(LEVEL_CRITICAL)` turn
-/// any surviving CRITICAL into an abort. Deliberately does NOT force `memory:CUDAMemory`
-/// or a Vulkan device: the defect was path-independent (it reproduced on the plain RGBx
-/// path under bare `gst-launch-1.0`), and the CUDA context is created in `start()` whenever
-/// the plugin is built `--features cuda`, so the ordinary RGBx pipeline exercises it.
+/// any surviving CRITICAL into an abort. This is the any-GPU half; it did not catch the CUDA
+/// context over-unref on NVIDIA (the `memory:CUDAMemory` test below does).
 #[test]
 #[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
 fn element_churn_is_critical_free() {
