@@ -21,6 +21,7 @@ use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex};
+use tracing::Dispatch;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 #[cfg(feature = "cuda")]
@@ -36,6 +37,32 @@ use waylanddisplaycore::{
     ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, PendingFrame,
     Sender, WaylandDisplay, channel, utils::device::PCIVendor,
 };
+
+/// One process-wide `tracing` dispatcher that routes core/smithay events into the gst log.
+///
+/// This used to be built fresh at every use site (`Registry::default().with(GstLayer)` inside
+/// `start()`, `stop()` and — critically — `create()`, i.e. ONCE PER FRAME). Each fresh
+/// subscriber is expensive in two ways that the per-frame site made pathological:
+///
+///  * `Registry::default()` allocates a `sharded_slab::Pool`, whose shard array is a
+///    `Vec<AtomicPtr>` of `MAX_SHARDS = next_pow2(MAX_THREADS - 1) = 4096` entries — a **32 KiB
+///    heap allocation** built and torn down on every buffer. At 60 fps that is ~2 MB/s of
+///    large-bin alloc/free churn on the streaming thread, interleaved with the frame buffers;
+///    classic glibc arena fragmentation (seen as unbounded RSS growth per session with
+///    no fd / thread / GstObject / VRAM correlate).
+///  * `tracing::subscriber::with_default(subscriber, ..)` builds a `Dispatch`, and
+///    `Dispatch::new` calls `tracing_core::callsite::register_dispatch`, which takes a global
+///    write lock and then **rebuilds the interest cache for every tracing callsite registered
+///    anywhere in the process** (this plugin, smithay, and the whole host application — the
+///    embedding application may register hundreds). Per frame. It also re-derives the global
+///    `LevelFilter::set_max` from this Registry, clobbering the host app's max-level hint.
+///
+/// `GstLayer` is a stateless unit struct and the Registry holds no per-element state, so one
+/// shared dispatcher is equivalent in behaviour. Built once, on first `start()`; after that
+/// `dispatcher::with_default(&GST_DISPATCH, ..)` is just a thread-local swap — no allocation,
+/// no global lock, no callsite rebuild.
+static GST_DISPATCH: LazyLock<Dispatch> =
+    LazyLock::new(|| Dispatch::new(Registry::default().with(GstLayer)));
 
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
@@ -1756,9 +1783,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         self.flushing.store(false, Ordering::Release);
 
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-        let subscriber = Registry::default().with(GstLayer);
-
-        let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
+        let Ok(mut display) = tracing::dispatcher::with_default(&GST_DISPATCH, || {
             WaylandDisplay::new_with_channel(
                 render_node.clone(),
                 command_tx,
@@ -1872,8 +1897,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
         let mut state = self.state.lock().unwrap();
         if let Some(state) = state.take() {
-            let subscriber = Registry::default().with(GstLayer);
-            tracing::subscriber::with_default(subscriber, || drop(state.display));
+            tracing::dispatcher::with_default(&GST_DISPATCH, || drop(state.display));
         }
         // Only after the display: dropping a frame the compositor still owes makes it exit, and
         // Drop must still be able to send Quit and join it.
@@ -1908,8 +1932,7 @@ impl PushSrcImpl for WaylandDisplaySrc {
     ) -> Result<CreateSuccess, gst::FlowError> {
         let hdr_cm = self.settings.lock().unwrap().hdr_cm;
         loop {
-            let subscriber = Registry::default().with(GstLayer);
-            let buffer = tracing::subscriber::with_default(subscriber, || {
+            let buffer = tracing::dispatcher::with_default(&GST_DISPATCH, || {
                 // Only the request is made under the state lock: waiting for the frame under it
                 // would stall caps queries and stop() for up to the compositor reply timeout.
                 if self.flushing.load(Ordering::Acquire) {
