@@ -1080,6 +1080,9 @@ pub(crate) fn init(
                 Event::Msg(Command::VideoInfo(video_info)) => {
                     apply_video_info(state, *video_info, &render_target, render_node);
                 }
+                Event::Msg(Command::KeyboardLayout { layout, variant }) => {
+                    state.set_keyboard_layout(&layout, &variant);
+                }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
                     state.add_input_device(&path);
