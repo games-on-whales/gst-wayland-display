@@ -1,0 +1,36 @@
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+index fec23f335..7ac413b73 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+@@ -530,4 +530,7 @@ gst_vulkan_encoder_start (GstVulkanEncoder * self,
+   GstVideoFormat format;
+   GError *query_err = NULL;
++  const VkVideoEncodeFeedbackFlagsKHR feedback_flags =
++      VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR |
++      VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR;
+ 
+   g_return_val_if_fail (GST_IS_VULKAN_ENCODER (self), FALSE);
+@@ -629,11 +632,20 @@ gst_vulkan_encoder_start (GstVulkanEncoder * self,
+   gst_object_unref (cmd_pool);
+ 
+-  /* we don't want overridden parameters in queries */
++  /* GstVulkanEncodeQueryResult holds exactly offset, bytes written and
++   * status: request only those two feedback values. Masking the driver's
++   * supported flags passes bits unknown to the headers (NVIDIA >= 595). */
++  if ((priv->caps.encoder.caps.supportedEncodeFeedbackFlags & feedback_flags)
++      != feedback_flags) {
++    g_set_error (error, GST_VULKAN_ERROR, VK_ERROR_FEATURE_NOT_PRESENT,
++        "Driver does not support required encode feedback flags "
++        "(BUFFER_OFFSET and BYTES_WRITTEN)");
++    goto failed;
++  }
++
+   /* *INDENT-OFF* */
+   query_create = (VkQueryPoolVideoEncodeFeedbackCreateInfoKHR) {
+     .sType = VK_STRUCTURE_TYPE_QUERY_POOL_VIDEO_ENCODE_FEEDBACK_CREATE_INFO_KHR,
+     .pNext = &profile->profile,
+-    .encodeFeedbackFlags = priv->caps.encoder.caps.supportedEncodeFeedbackFlags &
+-        (~VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR),
++    .encodeFeedbackFlags = feedback_flags,
+   };
+   /* *INDENT-ON* */

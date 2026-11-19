@@ -300,3 +300,18 @@ coded size and the SPS are uninitialised at that point too, so no pool can be
 built. The encoders now answer the query without a pool when they have not
 started: the producer allocates its own buffers either way. Deterministic on a
 Radeon RX 9070 and a RTX 3070; a race on hardware where the first frame wins.
+
+## vulkan-encode-feedback-flags.patch
+
+Backport of GStreamer main `cc1868370` (!11023) to 1.28, which no 1.28 release
+has. `gst_vulkan_encoder_start` created the encode feedback query pool with
+every `supportedEncodeFeedbackFlags` bit except `HAS_OVERRIDES`, but the result
+buffer holds only offset, bytes written and status (12 bytes). NVIDIA 620.70.06
+reports 0x2fb, so the driver writes at least five words past the buffer and the
+next `vulkanh264enc` / `vulkanh265enc` stop aborts with `double free or
+corruption`.
+AMD reports 0x3 (a discrete RDNA2 card ran clean with the fix path; an integrated
+Vega part also reports 0x3 and was not run). The pool now requests exactly
+`BITSTREAM_BUFFER_OFFSET | BITSTREAM_BYTES_WRITTEN`, and start fails with
+`VK_ERROR_FEATURE_NOT_PRESENT` if the driver lacks either. Drop it once the
+pinned GStreamer includes `cc1868370`.
