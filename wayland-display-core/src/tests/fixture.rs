@@ -33,6 +33,12 @@ impl Fixture {
         Self::build(hdr_cm, true)
     }
 
+    /// The render-size tests' name for [`Fixture::without_output`]: the state `State::new`
+    /// leaves behind in production, so the first `apply_video_info` creates the Output.
+    pub fn new_cold() -> Self {
+        Self::without_output()
+    }
+
     /// A fixture whose compositor has no output yet, as before the first caps
     /// negotiation.
     pub fn without_output() -> Self {
@@ -130,7 +136,15 @@ impl Fixture {
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
-        let dtr = OutputDamageTracker::from_output(output);
+        // Static, framebuffer(=encode)-sized, scale/transform off the Output -- matching
+        // `apply_output_mode`. Identical to the old `from_output` here (encode size == mode
+        // size == 320x240) until a test moves them apart, at which point the first
+        // `apply_output_mode` replaces this tracker anyway.
+        let dtr = OutputDamageTracker::new(
+            mode.size,
+            output.current_scale().fractional_scale(),
+            output.current_transform(),
+        );
 
         self.server.space.map_output(output, (0, 0));
         self.server.dtr = Some(dtr);
@@ -182,6 +196,61 @@ impl Fixture {
 
     pub fn create_window(&mut self, width: u16, height: u16) {
         self.client.create_window();
+        self.finish_window(width, height);
+    }
+
+    /// Like [`Fixture::create_window`], but the toplevel commits a `width`x`height` buffer
+    /// filled with a single opaque colour (`0xRRGGBB`) instead of the shared 320x240 gradient,
+    /// so a test can assert on the pixels the compositor produced.
+    pub fn create_solid_window(&mut self, width: u16, height: u16, rgb: u32) {
+        self.client.create_window();
+        self.round_trip();
+        self.client.setup_window_solid(width, height, rgb);
+        self.finish_solid_window();
+    }
+
+    /// [`Fixture::create_solid_window`] for a HiDPI-aware client: a `buf_w`x`buf_h` buffer
+    /// presented at a `dst_w`x`dst_h` logical size (buffer = logical x UI scale).
+    pub fn create_solid_window_hidpi(
+        &mut self,
+        buf_w: u16,
+        buf_h: u16,
+        dst_w: u16,
+        dst_h: u16,
+        rgb: u32,
+    ) {
+        self.client.create_window();
+        self.round_trip();
+        self.client
+            .setup_window_solid_dst(buf_w, buf_h, dst_w, dst_h, rgb);
+        self.finish_solid_window();
+    }
+
+    fn finish_solid_window(&mut self) {
+        self.round_trip();
+        self.round_trip();
+        for window in self.server.space.elements() {
+            window.on_commit();
+        }
+    }
+
+    /// Like [`Fixture::create_window`], but the surface also carries a
+    /// `wp_fractional_scale_v1`. Returns the surface, for
+    /// [`WaylandClient::last_preferred_scale`].
+    pub fn create_window_with_fractional_scale(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> wayland_client::protocol::wl_surface::WlSurface {
+        let surface = self.client.map_toplevel_with_fractional_scale();
+        self.finish_window(width, height);
+        surface
+    }
+
+    /// Drive an already-created surface through map: round-trip, attach a buffer + ack the
+    /// initial configure, round-trip again. Exposed so a test can interpose server-side work
+    /// (e.g. `apply_ui_scale`) while the toplevel is still in `pending_windows`.
+    pub fn finish_window(&mut self, width: u16, height: u16) {
         self.round_trip();
 
         self.client.setup_window(width, height);

@@ -33,6 +33,27 @@ pub use crate::utils::video_info::GstVideoInfo;
 pub enum Command {
     InputDevice(String),
     VideoInfo(Box<GstVideoInfo>),
+    /// Element -> compositor: set the app-facing render size (the `wl_output` mode the
+    /// Wayland clients see), decoupled from the encode size carried by
+    /// [`Command::VideoInfo`]. Sticky across caps re-negotiation. A `(0, 0)` (or any
+    /// non-positive) size means "follow the encode size" (the historical behaviour).
+    RenderSize {
+        width: i32,
+        height: i32,
+    },
+    /// Element -> compositor: set the UI scale, which **is** the `wl_output` fractional
+    /// scale. The physical mode stays at the render size; the LOGICAL size clients lay out
+    /// against becomes `render_size / scale`, which is what makes the UI bigger. The value is
+    /// also announced through `wp_fractional_scale_v1` (`preferred_scale`) so scale-aware
+    /// clients render at the full render density rather than being upscaled. The encode size
+    /// is unaffected. Clamped to `[1.0, 3.0]`; non-finite values are ignored.
+    UiScale(f64),
+    /// Element -> compositor: the set of additional `wl_output` modes to advertise
+    /// alongside the current one, so an in-app display/resolution menu has something to
+    /// list. Rungs larger than the encode size (per axis) are dropped; the CURRENT and
+    /// PREFERRED mode stay the render size regardless. An empty list advertises no extra
+    /// modes (the historical behaviour). Sticky across caps re-negotiation.
+    ModeLadder(Vec<(i32, i32)>),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -277,6 +298,33 @@ impl WaylandDisplay {
 
     pub fn set_video_info(&self, info: GstVideoInfo) {
         let _ = self.command_tx.send(Command::VideoInfo(Box::new(info)));
+    }
+
+    /// Set the app-facing render size (the `wl_output` mode clients see), independent of
+    /// the encode size. `(0, 0)` -- or any non-positive size -- resets to "follow the
+    /// encode size". The value is sticky: it survives encode-caps re-negotiation.
+    pub fn set_render_size(&self, width: i32, height: i32) {
+        let _ = self.command_tx.send(Command::RenderSize { width, height });
+    }
+
+    /// Set the UI scale — the `wl_output` fractional scale. The physical mode stays at the
+    /// render size and the logical desktop becomes `render_size / scale`, so the UI grows;
+    /// the value is also announced via `wp_fractional_scale_v1` so scale-aware clients render
+    /// at full density. The encode size is untouched. Clamped to `[1.0, 3.0]`.
+    pub fn set_ui_scale(&self, scale: f64) {
+        let _ = self.command_tx.send(Command::UiScale(scale));
+    }
+
+    /// Advertise a ladder of additional `wl_output` modes (`[(width, height), ...]`), so a
+    /// client's own display settings can offer internal resolutions to pick from. Rungs
+    /// above the encode size are dropped; the current and preferred mode remain the render
+    /// size. An empty slice advertises no extra modes. Sticky across caps re-negotiation.
+    ///
+    /// Note that the `wl_output` protocol has no way to retract a mode from a client that
+    /// has already bound the output, so a ladder is best set before clients connect (the
+    /// element forwards it again after every caps negotiation for exactly that reason).
+    pub fn set_mode_ladder(&self, ladder: &[(i32, i32)]) {
+        let _ = self.command_tx.send(Command::ModeLadder(ladder.to_vec()));
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {
