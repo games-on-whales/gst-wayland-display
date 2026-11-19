@@ -186,6 +186,15 @@ impl<T: Clone> MaybeRecv<T> {
     }
 }
 
+/// Spawn the compositor thread under its own kernel name (15 bytes at most), so a crash
+/// or a profile names it instead of whichever thread created the element.
+fn spawn_compositor(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("wayland-display".into())
+        .spawn(f)
+        .expect("failed to spawn the compositor thread")
+}
+
 impl WaylandDisplay {
     /// A display with its own command channel and Vulkan/VA shares, for callers without a gst
     /// element (the C API). Returns without waiting on the compositor thread; like the element's
@@ -225,7 +234,7 @@ impl WaylandDisplay {
         )?;
         let render_device = render_device(&render_target);
 
-        let thread_handle = std::thread::spawn(move || {
+        let thread_handle = spawn_compositor(move || {
             // The default hook has already printed the panic; this tags it as the compositor's.
             // Unwinding drops the senders above, so waiting callers get Disconnected.
             if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
