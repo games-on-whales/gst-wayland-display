@@ -2018,7 +2018,7 @@ impl WaylandDisplaySrc {
     }
 
     /// Whether the negotiated output is NV12 (dmabuf or VulkanImage): converted here to an
-    /// 8-bit BT.601 SDR stream, so it can never carry HDR. Raw RGB output is not converted
+    /// 8-bit SDR stream (BT.601 or BT.709), so it can never carry HDR. Raw RGB output is not converted
     /// here and carries each frame's transfer as `source_color` meta instead.
     fn negotiated_nv12(&self) -> bool {
         self.obj()
@@ -2168,17 +2168,24 @@ impl WaylandDisplaySrc {
     }
 }
 
-/// Colorimetry of the converter's NV12 output: the rgba_to_nv12 shader applies the BT.601
-/// limited-range matrix (bit-comparable with the GLES/VA/CUDA paths) to sRGB/BT.709 content.
-/// Without it, downstream assumes BT.709 for HD sizes and the colours shift.
-fn nv12_colorimetry() -> String {
-    gst_video::VideoColorimetry::new(
-        gst_video::VideoColorRange::Range16_235,
-        gst_video::VideoColorMatrix::Bt601,
-        gst_video::VideoTransferFunction::Bt709,
-        gst_video::VideoColorPrimaries::Bt709,
-    )
-    .to_string()
+/// Colorimetries the converter's NV12 output can carry: limited range, sRGB/BT.709 content.
+/// BT.601 comes first, so it stays the default (bit-comparable with the GLES/VA/CUDA paths);
+/// a downstream that asks for `colorimetry=bt709` gets the BT.709 matrix instead. Without
+/// the field, downstream assumes BT.709 for HD sizes and the colours shift.
+fn nv12_colorimetry() -> gst::List {
+    let limited = |matrix| {
+        gst_video::VideoColorimetry::new(
+            gst_video::VideoColorRange::Range16_235,
+            matrix,
+            gst_video::VideoTransferFunction::Bt709,
+            gst_video::VideoColorPrimaries::Bt709,
+        )
+        .to_string()
+    };
+    gst::List::new([
+        limited(gst_video::VideoColorMatrix::Bt601),
+        limited(gst_video::VideoColorMatrix::Bt709),
+    ])
 }
 
 /// Bus message posted on dynamic-hdr output transitions, with a boolean `hdr` field.
@@ -4126,5 +4133,31 @@ mod color_transport_tests {
         let sdr = BaseSrcImpl::caps(imp, None).unwrap();
         imp.hdr_active.store(true, Ordering::Relaxed);
         assert_ne!(BaseSrcImpl::caps(imp, None).unwrap(), sdr);
+    }
+}
+
+#[cfg(test)]
+mod colorimetry_tests {
+    #[test]
+    fn nv12_offers_bt601_first_then_bt709() {
+        gst::init().unwrap();
+        let list = super::nv12_colorimetry();
+        let names: Vec<String> = list.iter().map(|v| v.get().unwrap()).collect();
+        let matrix = |s: &str| s.parse::<gst_video::VideoColorimetry>().unwrap().matrix();
+        assert_eq!(matrix(&names[0]), gst_video::VideoColorMatrix::Bt601);
+        // The exact string a downstream capsfilter writes to ask for BT.709.
+        assert_eq!(names[1], "bt709");
+        let mut caps = gst_video::VideoCapsBuilder::new()
+            .format(gst_video::VideoFormat::Nv12)
+            .width(64)
+            .height(64)
+            .field("colorimetry", list)
+            .build();
+        caps.fixate();
+        let fixed = gst_video::VideoInfo::from_caps(&caps).unwrap();
+        assert_eq!(
+            fixed.colorimetry().matrix(),
+            gst_video::VideoColorMatrix::Bt601
+        );
     }
 }

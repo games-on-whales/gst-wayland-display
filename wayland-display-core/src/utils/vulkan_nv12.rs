@@ -3,7 +3,8 @@
 //! The compositor renders the scene with the (GLES) smithay renderer to an **RGBA
 //! dmabuf**; this stage imports that dmabuf into Vulkan (`VK_EXT_external_memory_dma_buf`
 //! -- *not* glupload, so none of the second-GL-context / teardown problems), runs a
-//! compute shader (`shaders/rgba_to_nv12.comp`, BT.601 limited range) into the planes
+//! compute shader (`shaders/rgba_to_nv12.comp`, BT.601 limited range, or its BT.709 sibling
+//! when the caps ask for it) into the planes
 //! of an NV12 image, and **exports an NV12 dmabuf** the downstream encoder imports
 //! zero-copy:
 //!   - AMD/Intel: `vah265enc`/`vaapi` (VAAPI imports the dmabuf directly)
@@ -66,7 +67,7 @@
 use crate::utils::color::{ContentTransfer, FrameColor};
 use ash::vk;
 use gst::Buffer as GstBuffer;
-use gst_video::{VideoFormat, VideoInfoDmaDrm, VideoMeta};
+use gst_video::{VideoColorMatrix, VideoFormat, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
 use smithay::backend::allocator::Buffer as _;
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -76,6 +77,8 @@ use std::os::fd::{AsFd, AsRawFd, IntoRawFd, RawFd};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 const RGBA_TO_NV12_SPV: &[u8] = include_bytes!("shaders/rgba_to_nv12.spv");
+/// BT.709 variant of the NV12 converter, selected when the caps ask for `colorimetry=bt709`.
+const RGBA_TO_NV12_BT709_SPV: &[u8] = include_bytes!("shaders/rgba_to_nv12_bt709.spv");
 const RGBA_TO_P010_SPV: &[u8] = include_bytes!("shaders/rgba_to_p010.spv");
 /// BT.2020 (BT.2100-PQ HDR) variant of the P010 converter: identical topology to
 /// [`RGBA_TO_P010_SPV`] but with the BT.2020 luma/chroma matrix, selected when the producer
@@ -106,6 +109,9 @@ const RGBA_HDR_TO_P010_SDR_SPV: &[u8] = include_bytes!("shaders/rgba_hdr_to_p010
 /// [`RGBA_HDR_TO_P010_SDR_SPV`]. NV12 output never goes HDR, but an HDR client can still
 /// declare PQ content on it; this tone-maps that content instead of showing it washed out.
 const RGBA_HDR_TO_NV12_SDR_SPV: &[u8] = include_bytes!("shaders/rgba_hdr_to_nv12_sdr.spv");
+/// [`RGBA_HDR_TO_NV12_SDR_SPV`] with the BT.709 output matrix.
+const RGBA_HDR_TO_NV12_SDR_BT709_SPV: &[u8] =
+    include_bytes!("shaders/rgba_hdr_to_nv12_sdr_bt709.spv");
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// NV12 export ring depth (> encoder DPB/pipeline depth so a buffer is free by reuse).
@@ -225,14 +231,16 @@ impl PixFmt {
             PixFmt::P010 => 2,
         }
     }
-    /// Pick the matching compute shader SPIR-V for a fixed (non-dynamic) output. `bt2020`
-    /// selects the BT.2020 (HDR / BT.2100-PQ) sRGB-input tone-map on the P010 path; it never
-    /// affects NV12 (8-bit SDR stays BT.601).
-    fn shader(self, bt2020: bool) -> &'static [u8] {
-        match (self, bt2020) {
+    /// Pick the matching compute shader SPIR-V for a fixed (non-dynamic) output, following
+    /// the negotiated caps' matrix. On P010, BT.2020 selects the BT.2020 (HDR / BT.2100-PQ)
+    /// sRGB-input tone-map. On NV12, BT.709 selects the BT.709 matrix; anything else gets
+    /// BT.601, the NV12 default the caps advertise first.
+    fn shader(self, matrix: VideoColorMatrix) -> &'static [u8] {
+        match (self, matrix) {
+            (PixFmt::Nv12, VideoColorMatrix::Bt709) => RGBA_TO_NV12_BT709_SPV,
             (PixFmt::Nv12, _) => RGBA_TO_NV12_SPV,
-            (PixFmt::P010, false) => RGBA_TO_P010_SPV,
-            (PixFmt::P010, true) => RGBA_TO_P010_BT2020_SPV,
+            (PixFmt::P010, VideoColorMatrix::Bt2020) => RGBA_TO_P010_BT2020_SPV,
+            (PixFmt::P010, _) => RGBA_TO_P010_SPV,
         }
     }
     /// Derive from a negotiated gst video format (anything but P010 -> NV12).
@@ -826,7 +834,7 @@ impl VulkanNv12 {
         render_node: DrmNode,
         video_info: VideoInfoDmaDrm,
         fmt: PixFmt,
-        bt2020: bool,
+        matrix: VideoColorMatrix,
         fp16_input: bool,
         va_share: &crate::utils::va_share::VaShare,
         options: ConversionOptions,
@@ -849,7 +857,7 @@ impl VulkanNv12 {
                 modifier,
                 target_minor,
                 fmt,
-                bt2020,
+                matrix,
                 fp16_input,
                 va_share,
                 options,
@@ -870,7 +878,7 @@ impl VulkanNv12 {
         export_modifier: u64,
         target_minor: u32,
         fmt: PixFmt,
-        bt2020: bool,
+        matrix: VideoColorMatrix,
         fp16_input: bool,
         va_share: &crate::utils::va_share::VaShare,
         options: ConversionOptions,
@@ -900,7 +908,7 @@ impl VulkanNv12 {
         );
         let (qfi, implicit_sync) = (opened.qfi, opened.implicit_sync);
         this.pool_return = Some((target_minor, opened));
-        this.build_compute(fmt, bt2020, fp16_input, &options, qfi)?;
+        this.build_compute(fmt, matrix, fp16_input, &options, qfi)?;
 
         // ---- NV12 export ring ----
         // Prefer the LINEAR direct path (compute writes the export image; no scratch/copy)
@@ -1003,7 +1011,7 @@ impl VulkanNv12 {
     unsafe fn build_compute(
         &mut self,
         fmt: PixFmt,
-        bt2020: bool,
+        matrix: VideoColorMatrix,
         fp16_input: bool,
         options: &ConversionOptions,
         cmd_queue_family: u32,
@@ -1032,7 +1040,7 @@ impl VulkanNv12 {
             &self.device,
             self.pipeline_layout,
             fmt,
-            bt2020,
+            matrix,
             fp16_input,
             options,
         )?;
@@ -1113,13 +1121,13 @@ impl VulkanNv12 {
         width: u32,
         height: u32,
         fmt: PixFmt,
-        bt2020: bool,
+        matrix: VideoColorMatrix,
         fp16_input: bool,
         options: ConversionOptions,
     ) -> Option<Self> {
         match unsafe {
             Self::new_on_shared_inner(
-                device_gst, raw, nv12_caps, targets, width, height, fmt, bt2020, fp16_input,
+                device_gst, raw, nv12_caps, targets, width, height, fmt, matrix, fp16_input,
                 options,
             )
         } {
@@ -1140,7 +1148,7 @@ impl VulkanNv12 {
         width: u32,
         height: u32,
         fmt: PixFmt,
-        bt2020: bool,
+        matrix: VideoColorMatrix,
         fp16_input: bool,
         options: ConversionOptions,
     ) -> Result<Self, Err> {
@@ -1185,7 +1193,7 @@ impl VulkanNv12 {
         this.encode_src = true;
         this.gst_queue = Some(raw.gfx_queue);
         this._shared_device = Some(device_gst.clone());
-        this.build_compute(fmt, bt2020, fp16_input, &options, raw.gfx_queue_family)?;
+        this.build_compute(fmt, matrix, fp16_input, &options, raw.gfx_queue_family)?;
 
         // This path CPU-waits every frame on all vendors; only NVIDIA needs the single import.
         this.share_import = this
@@ -2295,19 +2303,19 @@ impl DynamicPipelines {
 /// pipeline is the format's SDR shader and [`DynamicPipelines`] covers every other
 /// (output, content) pair, so a mid-stream bt709 <-> bt2100-pq flip or a PQ client on an
 /// NV12 stream needs no rebuild. Otherwise the single pipeline follows the negotiated caps
-/// (`bt2020`). The SDR reference white feeds specialization constant 0 of the shaders that
+/// (`matrix`). The SDR reference white feeds specialization constant 0 of the shaders that
 /// declare it.
 unsafe fn build_pipelines(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     fmt: PixFmt,
-    bt2020: bool,
+    matrix: VideoColorMatrix,
     fp16_input: bool,
     options: &ConversionOptions,
 ) -> Result<(vk::Pipeline, Option<DynamicPipelines>), Err> {
     let ref_white = options.sdr_reference_white;
     if !(options.hdr_cm && fp16_input) {
-        let pipeline = build_compute_pipeline(device, layout, fmt.shader(bt2020), ref_white)?;
+        let pipeline = build_compute_pipeline(device, layout, fmt.shader(matrix), ref_white)?;
         return Ok((pipeline, None));
     }
     let shaders: &[&[u8]] = match fmt {
@@ -2317,6 +2325,9 @@ unsafe fn build_pipelines(
             RGBA_TO_P010_BT2020_SPV,
             RGBA_PQPASS_TO_P010_SPV,
         ],
+        PixFmt::Nv12 if matrix == VideoColorMatrix::Bt709 => {
+            &[RGBA_TO_NV12_BT709_SPV, RGBA_HDR_TO_NV12_SDR_BT709_SPV]
+        }
         PixFmt::Nv12 => &[RGBA_TO_NV12_SPV, RGBA_HDR_TO_NV12_SDR_SPV],
     };
     let mut built = Vec::with_capacity(shaders.len());
@@ -3059,6 +3070,17 @@ mod conversion_tests {
         rgb: [f32; 3],
         color: FrameColor,
     ) -> Option<SolidPlanes> {
+        convert_solid_as(node, fmt, rgb, color, VideoColorMatrix::Unknown)
+    }
+
+    /// [`convert_solid`] with the negotiated caps' matrix.
+    fn convert_solid_as(
+        node: DrmNode,
+        fmt: PixFmt,
+        rgb: [f32; 3],
+        color: FrameColor,
+        matrix: VideoColorMatrix,
+    ) -> Option<SolidPlanes> {
         let src = solid_fp16(node, rgb)?;
         let drm_format = match fmt {
             PixFmt::Nv12 => "NV12",
@@ -3078,7 +3100,7 @@ mod conversion_tests {
             ..Default::default()
         };
         let va_share = crate::utils::va_share::VaShare::default();
-        let mut conv = VulkanNv12::new(node, info, fmt, false, true, &va_share, options)?;
+        let mut conv = VulkanNv12::new(node, info, fmt, matrix, true, &va_share, options)?;
         conv.convert(&src, color).expect("convert");
         let buffer = conv.to_gst_buffer().expect("output buffer");
         let mem = buffer.peek_memory(0);
@@ -3191,7 +3213,7 @@ mod conversion_tests {
                 node,
                 info.clone(),
                 PixFmt::Nv12,
-                false,
+                VideoColorMatrix::Unknown,
                 false,
                 &va_share,
                 ConversionOptions::default(),
@@ -3271,5 +3293,43 @@ mod conversion_tests {
         // SDR content keeps the regular BT.601 shader.
         let white = convert_solid(node, PixFmt::Nv12, [1.0; 3], FrameColor::default()).unwrap();
         assert_solid("nv12 sdr white", &white, 235, 128, 128, 1);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU render node in NV12_TEST_NODE; run via ci/harness.sh gpu"]
+    fn nv12_follows_the_caps_matrix_bt601_by_default() {
+        let _pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(node) = node() else {
+            skip!("NV12_TEST_NODE unset");
+        };
+        let sdr = FrameColor::default();
+        let red = |matrix| convert_solid_as(node, PixFmt::Nv12, [1.0, 0.0, 0.0], sdr, matrix);
+        let Some(bt601) = red(VideoColorMatrix::Bt601) else {
+            skip!("no fp16 render target on this node");
+        };
+        // Red, limited range: Y = 16 + 219 * Kr, Cb = 128 - 112 * Kr / (1 - Kb), Cr = 240.
+        assert_solid("nv12 bt601 red", &bt601, 81, 90, 239, 1);
+        let bt709 = red(VideoColorMatrix::Bt709).unwrap();
+        assert_solid("nv12 bt709 red", &bt709, 63, 102, 240, 1);
+        // Neither matrix moves grey.
+        let white = convert_solid_as(node, PixFmt::Nv12, [1.0; 3], sdr, VideoColorMatrix::Bt709);
+        assert_solid("nv12 bt709 white", &white.unwrap(), 235, 128, 128, 1);
+    }
+}
+
+#[cfg(test)]
+mod matrix_tests {
+    use super::*;
+
+    #[test]
+    fn the_shader_follows_the_caps_matrix() {
+        let nv12 = |m| PixFmt::Nv12.shader(m);
+        assert!(nv12(VideoColorMatrix::Bt709) == RGBA_TO_NV12_BT709_SPV);
+        for m in [VideoColorMatrix::Bt601, VideoColorMatrix::Unknown] {
+            assert!(nv12(m) == RGBA_TO_NV12_SPV, "{m:?}");
+        }
+        let p010 = |m| PixFmt::P010.shader(m);
+        assert!(p010(VideoColorMatrix::Bt2020) == RGBA_TO_P010_BT2020_SPV);
+        assert!(p010(VideoColorMatrix::Bt709) == RGBA_TO_P010_SPV);
     }
 }
