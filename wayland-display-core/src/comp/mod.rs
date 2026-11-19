@@ -21,6 +21,7 @@ use smithay::{
             Bind,
             damage::{Error as DTRError, OutputDamageTracker},
             element::memory::{MemoryBuffer, MemoryRenderBuffer},
+            utils::with_renderer_surface_state,
         },
     },
     desktop::{
@@ -32,7 +33,7 @@ use smithay::{
         },
     },
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
-    output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
+    output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, Mode, PostAction,
@@ -47,15 +48,18 @@ use smithay::{
         wayland_server::{
             Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
+            protocol::wl_surface::WlSurface,
         },
     },
     utils::{
-        Clock, DeviceFd, Logical, Monotonic, Physical, Point, SERIAL_COUNTER, Size, Transform,
+        Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, SERIAL_COUNTER, Size,
+        Transform,
     },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
+        fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
@@ -133,6 +137,16 @@ pub struct State {
     pub output: Option<Output>,
     pub video_info: Option<VideoInfo>,
     negotiated_output: Option<GstVideoInfo>,
+    /// User-requested app-facing output mode. `None` = follow the encode size
+    /// (today's behaviour). Sticky across caps re-negotiation.
+    pub(crate) render_size: Option<Size<i32, Physical>>,
+    /// UI scale — the `wl_output` fractional scale. The physical mode stays at the render
+    /// size, so the LOGICAL size (`mode / ui_scale`) is what shrinks, which is what makes the
+    /// UI bigger; it is also announced through `wp_fractional_scale_v1::preferred_scale` so
+    /// scale-aware clients render at the full render density. The encode size is never
+    /// derived from it. Clamped to [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`]. Sticky, like
+    /// `render_size`.
+    pub(crate) ui_scale: f64,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -171,6 +185,11 @@ pub struct State {
     pub shm_state: ShmState,
     viewporter_state: ViewporterState,
     tablet_manager_state: TabletManagerState,
+    /// `wp_fractional_scale_manager_v1` global. Held so the global stays alive; the
+    /// preferred scale itself is pushed from `configure_toplevels` / the
+    /// `FractionalScaleHandler`.
+    #[allow(dead_code)]
+    fractional_scale_state: FractionalScaleManagerState,
     cursor_event_count: i32,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     /// `wp_color_manager_v1` global id, present only when dynamic HDR is enabled. Gated so
@@ -317,6 +336,7 @@ impl State {
         let viewporter_state = ViewporterState::new::<State>(dh);
         let tablet_manager_state = TabletManagerState::new::<State>(dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(dh);
+        let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
 
         // Color management (staging wp_color_manager_v1). Gated behind dynamic HDR:
         // advertising it makes HDR clients enable their HDR path and tags HDR surfaces,
@@ -466,6 +486,8 @@ impl State {
             dmabuf_global,
             video_info: None,
             negotiated_output: None,
+            render_size: None,
+            ui_scale: 1.0,
             last_render: None,
 
             space,
@@ -500,6 +522,7 @@ impl State {
             shm_state,
             viewporter_state,
             tablet_manager_state,
+            fractional_scale_state,
             single_pixel_buffer_state,
             color_mgmt_global,
             frog_color_mgmt_global,
@@ -807,7 +830,6 @@ pub(crate) fn apply_video_info(
         base_info.format(),
         base_info.format().to_fourcc()
     );
-    let size: Size<i32, Physical> = (base_info.width() as i32, base_info.height() as i32).into();
     let refresh = refresh_mhz(base_info.fps());
 
     // init wayland objects
@@ -825,18 +847,10 @@ pub(crate) fn apply_video_info(
         output.create_global::<State>(&state.dh);
         output
     });
-    let mode = OutputMode { size, refresh };
-    output.change_current_state(Some(mode), None, None, None);
-    output.set_preferred(mode);
-    let dtr = OutputDamageTracker::from_output(output);
-
     if !output_already_running {
-        state.space.map_output(output, (0, 0));
+        let output = output.clone();
+        state.space.map_output(&output, (0, 0));
     }
-    state.dtr = Some(dtr);
-    let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-    state.pointer_location = position;
-    state.pointer_absolute_location = position;
     state.video_info = Some(video_info.clone().into());
 
     {
@@ -943,10 +957,351 @@ pub(crate) fn apply_video_info(
         }
     }
 
+    // The app-facing output mode is the *render* size, which is the encode size unless a
+    // render size was requested (sticky across caps re-negotiation).
+    apply_output_mode(state, effective_render_size(state), refresh);
+}
+
+/// The size the app-facing `wl_output` mode should have: the requested render size when
+/// one is set, otherwise the encode size. A requested render size is never allowed to
+/// exceed the encode size (there is nothing to scale it into).
+pub(crate) fn effective_render_size(state: &State) -> Size<i32, Physical> {
+    let enc: Option<Size<i32, Physical>> = state
+        .video_info
+        .as_ref()
+        .map(|vi| (vi.width() as i32, vi.height() as i32).into());
+    match (state.render_size, enc) {
+        (Some(r), Some(e)) => (r.w.min(e.w), r.h.min(e.h)).into(),
+        (Some(r), None) => r,
+        (None, Some(e)) => e,
+        (None, None) => (0, 0).into(),
+    }
+}
+
+/// The mode/configure half of [`apply_video_info`]: point the (already created) Output at
+/// `size` @ `refresh_mhz` with the current UI scale, rebuild the damage tracker, remap the
+/// pointer and re-send a configure to every mapped toplevel.
+///
+/// `size` is the PHYSICAL mode (the render size); the app-facing LOGICAL size is
+/// `size / ui_scale`, which is what toplevels are configured at. Compositing stays at the
+/// physical render density, so a scale-aware client's high-density buffer lands in our
+/// framebuffer 1:1 instead of being downsampled to the logical size and blown back up.
+///
+/// Kept separate from the encode-side (allocator / output-buffer) half so the app-facing
+/// mode can change without touching the encode size, and so the damage-tracker
+/// construction lives in exactly one place.
+pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, refresh_mhz: i32) {
+    let Some(output) = state.output.clone() else {
+        return;
+    };
+
+    // The LOGICAL extent before the change, for the proportional pointer remap below. Read
+    // before `change_current_state`, which updates both halves of it in place.
+    let old_logical = output.current_mode().map(|m| {
+        m.size
+            .to_f64()
+            .to_logical(output.current_scale().fractional_scale())
+            .to_i32_round()
+    });
+
+    let mode = OutputMode {
+        size,
+        refresh: refresh_mhz,
+    };
+    // The UI scale IS the output scale: it shrinks the logical size (`size / ui_scale`) while
+    // the mode -- and therefore the density everything is composited at -- stays the render
+    // size. Legacy clients see `wl_output.scale = ceil(ui_scale)`; scale-aware ones get the
+    // exact value through `wp_fractional_scale_v1` (see `announce_ui_scale`).
+    // Pass the scale only when it actually differs from what the Output already carries:
+    // `change_current_state` emits a `wl_output.scale` event for whatever it is handed, and
+    // the default path (ui_scale 1.0, Output built at `Integer(1)`) would otherwise re-send a
+    // redundant scale of 1 on every mode change. A real change -- in either direction,
+    // including back down to 1.0 -- still goes through.
+    let scale_changed = output.current_scale().fractional_scale() != state.ui_scale;
+    output.change_current_state(
+        Some(mode),
+        None,
+        scale_changed.then_some(Scale::Fractional(state.ui_scale)),
+        None,
+    );
+    output.set_preferred(mode);
+
+    // The damage tracker describes the FRAMEBUFFER, not the app-facing output mode. The
+    // framebuffer is always encode-sized (`create_frame` upscales the render-sized scene into
+    // it), while `mode.size` above is the *render* size -- so a `from_output` (Auto) tracker
+    // would size the GL viewport/projection to the render size and clip the upscaled scene.
+    // Use a Static tracker at the encode size instead. Both routes that can change either size
+    // (`apply_video_info` for encode, `apply_render_size` for render) come through here, and a
+    // freshly-built tracker has no previous state, so the next frame is full-damage either way.
+    //
+    // Only the SIZE is overridden: the scale and transform are still read off the Output, because
+    // `create_frame`'s `space_render_elements` builds its elements against
+    // `output.current_scale()` / `output.current_transform()`. The old Auto tracker kept the two
+    // in lockstep by construction; taking them from the Output here preserves that. (Both are
+    // effectively constant today -- every `change_current_state` call passes `None` for scale and
+    // transform -- but hardcoding `1.0`/`Normal` would silently desync the day one does not.)
+    let encode_size: Size<i32, Physical> = state
+        .video_info
+        .as_ref()
+        .map(|vi| (vi.width() as i32, vi.height() as i32).into())
+        .unwrap_or(size);
+
+    state.dtr = Some(OutputDamageTracker::new(
+        encode_size,
+        output.current_scale().fractional_scale(),
+        output.current_transform(),
+    ));
+
     let new_size = size
         .to_f64()
         .to_logical(output.current_scale().fractional_scale())
         .to_i32_round();
+
+    remap_pointer(state, old_logical, new_size);
+    announce_ui_scale(state);
+    configure_toplevels(state, new_size);
+}
+
+/// The aspect-preserving scale plus centring offset that maps content of size `surface`
+/// into the `configured` box it was told to fill — the fullscreen fit.
+///
+/// This is the ONE definition, shared by the two sides that must agree exactly: compositing
+/// ([`crate::comp::rendering`], which scales the window's render elements by it) and input
+/// ([`State::pointer_focus`], which maps pointer positions back through its inverse). A
+/// second, independently-derived copy of this arithmetic would silently drift the cursor
+/// away from what it points at.
+///
+/// Returns `(1.0, (0.0, 0.0))` — an exact identity — for a degenerate size or when the two
+/// already match, which is every window that fills its configure.
+///
+/// The fit is deliberately **symmetric**: content LARGER than its configure is scaled *down*
+/// by the same rule. The spec's rule is internal ≤ external, so that direction should not
+/// arise in a well-behaved session — but a client that overshoots its configure (a race
+/// around a mode change, a client that ignores the configure outright) would otherwise be
+/// cropped by the framebuffer, losing whatever fell outside. Shrinking it keeps all of it on
+/// screen and keeps the inverse used by input total. Guarding it to smaller-only would buy
+/// nothing and reintroduce that cliff.
+pub(crate) fn fullscreen_fit(
+    configured: Size<i32, Logical>,
+    surface: Size<i32, Logical>,
+) -> (f64, Point<f64, Logical>) {
+    if surface.w <= 0
+        || surface.h <= 0
+        || configured.w <= 0
+        || configured.h <= 0
+        || surface == configured
+    {
+        return (1.0, Point::from((0.0, 0.0)));
+    }
+    let scale = f64::min(
+        configured.w as f64 / surface.w as f64,
+        configured.h as f64 / surface.h as f64,
+    );
+    let offset = Point::from((
+        (configured.w as f64 - surface.w as f64 * scale) / 2.0,
+        (configured.h as f64 - surface.h as f64 * scale) / 2.0,
+    ));
+    (scale, offset)
+}
+
+/// Snap a fit's centring offset to the PHYSICAL pixel grid the renderer composites on.
+///
+/// Compositing can only place an element on whole physical pixels, so the offset is rounded
+/// there. Input inverts the same transform in logical f64, and would otherwise invert an
+/// offset up to half a physical pixel away from the one actually drawn. Both sides round
+/// here, once, so the two are the same number by construction.
+pub(crate) fn fit_offset_physical(
+    offset: Point<f64, Logical>,
+    output_scale: f64,
+) -> Point<i32, Physical> {
+    Point::from((
+        (offset.x * output_scale).round() as i32,
+        (offset.y * output_scale).round() as i32,
+    ))
+}
+
+/// [`fit_offset_physical`] converted back to logical, for the input side: the same snapped
+/// offset compositing uses, expressed in the space pointer positions live in.
+pub(crate) fn fit_offset_snapped(
+    offset: Point<f64, Logical>,
+    output_scale: f64,
+) -> Point<f64, Logical> {
+    let physical = fit_offset_physical(offset, output_scale);
+    Point::from((
+        physical.x as f64 / output_scale,
+        physical.y as f64 / output_scale,
+    ))
+}
+
+/// [`fullscreen_fit`] resolved for a mapped `window`: identity unless the window is a
+/// toplevel whose CURRENT (acked) state is `Fullscreen`.
+///
+/// The committed size is read from the toplevel's OWN surface state
+/// (`RendererSurfaceState::surface_size`), NOT from `Window::geometry()`/`bbox()`. Two
+/// reasons: the window bbox is popup-INCLUSIVE when the client sets no xdg window geometry
+/// (`SpaceElement::bbox` is `bbox_with_popups`), so the fit scale would jump every time a
+/// popup opened or closed; and the surface size is already post-`wp_viewport` (smithay's
+/// `SurfaceView::dst` is the viewport destination when one is set), so a viewporter-aware
+/// client is measured by what it actually presents — which is exactly right, and means a
+/// client whose destination already equals its configure lands on the `surface == configured`
+/// identity with no special-casing.
+///
+/// `output_logical` is the fallback configured size for a toplevel whose current state
+/// carries none.
+pub(crate) fn window_fullscreen_fit(
+    window: &Window,
+    output_logical: Size<i32, Logical>,
+) -> (f64, Point<f64, Logical>) {
+    let identity = (1.0, Point::from((0.0, 0.0)));
+    let Some(toplevel) = window.toplevel() else {
+        return identity;
+    };
+    // Only the two fields that matter, read in place: `ToplevelSurface::current_state()`
+    // would CLONE the whole `ToplevelState` (including the `Vec` inside its state set), and
+    // this runs on the input hot path -- once per mapped window per pointer event. The
+    // committed state is what the client last acked before its current commit.
+    let Some((fullscreen, configured)) = toplevel.with_committed_state(|state| {
+        state.map(|state| (state.states.contains(XdgState::Fullscreen), state.size))
+    }) else {
+        return identity;
+    };
+    if !fullscreen {
+        return identity;
+    }
+    let Some(surface_size) =
+        with_renderer_surface_state(toplevel.wl_surface(), |state| state.surface_size()).flatten()
+    else {
+        return identity;
+    };
+
+    // The scale is derived from the ROOT surface, but what gets scaled is the whole surface
+    // TREE -- and hit-testing runs against the window bbox, which is the tree too. A client
+    // whose root buffer is small while its subsurfaces cover the output (this compositor
+    // explicitly expects such clients: see "a launcher rendering via subsurfaces" in
+    // `wayland/handlers/compositor.rs`) would otherwise be blown up by the ratio between the
+    // two -- unbounded, and wrong in both compositing and input.
+    //
+    // So: only fit a window whose visible content actually fits inside its root surface.
+    // `Window::bbox()` is subsurface-inclusive and popup-EXCLUSIVE (unlike
+    // `SpaceElement::bbox`, which is `bbox_with_popups` -- using that here would make the
+    // scale jump on every popup open/close). A single-surface game has bbox == root exactly,
+    // and so do gamescope and kwin, so the intended cases are untouched; anything else bails
+    // to the identity, i.e. today's unscaled behaviour rather than a guessed scale.
+    let bbox = window.bbox();
+    if !Rectangle::from_size(surface_size).contains_rect(bbox) {
+        tracing::trace!(
+            ?bbox,
+            ?surface_size,
+            "Not fitting a fullscreen window whose content extends beyond its root surface",
+        );
+        return identity;
+    }
+    fullscreen_fit(configured.unwrap_or(output_logical), surface_size)
+}
+
+/// Move the pointer from a `old`-sized logical extent into a `new`-sized one, keeping it at
+/// the same *relative* position instead of teleporting it to the centre.
+///
+/// A mode or UI-scale change must not move the cursor out from under the user's hand; the
+/// only case that has no previous position to preserve is the very first mode (no previous
+/// extent, or a degenerate one), which centres as it always did.
+fn remap_pointer(state: &mut State, old: Option<Size<i32, Logical>>, new: Size<i32, Logical>) {
+    let pos: Point<f64, Logical> = match old {
+        Some(old) if old.w > 0 && old.h > 0 => {
+            let p = state.pointer_location;
+            (
+                p.x * new.w as f64 / old.w as f64,
+                p.y * new.h as f64 / old.h as f64,
+            )
+                .into()
+        }
+        _ => (new.w as f64 / 2.0, new.h as f64 / 2.0).into(),
+    };
+    let pos = state.clamp_coords(pos);
+    state.pointer_location = pos;
+    state.pointer_absolute_location = pos;
+}
+
+/// Push the current UI scale to `surface` through `wp_fractional_scale_v1::preferred_scale`,
+/// returning the value the surface held *before* the call.
+///
+/// That return value is the one diagnostic that matters when a nested compositor ignores a
+/// scale change: smithay's `set_preferred_scale` is **debounced** — it only puts bytes on the
+/// wire when the value differs from the stored one (`wayland/fractional_scale/mod.rs:238-245`)
+/// — so `previous == Some(scale)` means nothing was sent, however many times we called it.
+pub(crate) fn set_preferred_ui_scale(surface: &WlSurface, scale: f64) -> Option<f64> {
+    with_states(surface, |states| {
+        with_fractional_scale(states, |fs| {
+            let previous = fs.preferred_scale();
+            fs.set_preferred_scale(scale);
+            previous
+        })
+    })
+}
+
+/// Re-announce the current UI scale to every toplevel we know about — both the mapped ones
+/// (`space`) and those still waiting to ack their initial configure (`pending_windows`).
+///
+/// The `pending_windows` half matters: a toplevel sits there from its first commit until it
+/// acks (`wayland/handlers/compositor.rs`), which is exactly the window in which a
+/// session-start `Command::UiScale` arrives. Missing it would leave that client at 1.0 until
+/// some later render-size change. The initial-configure path announces the scale too, for
+/// surfaces that commit *after* the scale was set.
+pub(crate) fn announce_ui_scale(state: &State) {
+    let scale = state.ui_scale;
+    let mapped = state.space.elements().count();
+    for (i, window) in state
+        .space
+        .elements()
+        .chain(state.pending_windows.iter())
+        .enumerate()
+    {
+        if let Some(surface) = window.wl_surface() {
+            let previous = set_preferred_ui_scale(&surface, scale);
+            // Deliberately info!, not debug!: when a nested compositor ignores a scale change
+            // this line is the difference between "we never sent it" and "we sent it and the
+            // client did nothing with it", which are opposite bugs. `sent == false` means the
+            // debounce swallowed it.
+            tracing::info!(
+                scale,
+                ?previous,
+                sent = previous != Some(scale),
+                mapped = i < mapped,
+                "Announcing preferred_scale to toplevel",
+            );
+        }
+    }
+    if mapped == 0 && state.pending_windows.is_empty() {
+        tracing::info!(scale, "UI scale stored, but no toplevel exists to tell yet");
+    }
+}
+
+/// Send a configure at `new_size` to every mapped toplevel, re-size the configured but
+/// unmapped ones, and configure those that committed before the output existed.
+///
+/// Shared by [`apply_output_mode`] and [`apply_ui_scale`] (a scale change must be followed by
+/// a *non-empty* configure, which kwin needs in order to latch the new scale). Deliberately
+/// does NOT touch the pointer location: a UI-scale change must not teleport the cursor.
+/// The scale announce itself lives in [`announce_ui_scale`], which both callers run first —
+/// keeping it out of here is what lets pending (unmapped) toplevels be reached too.
+pub(crate) fn configure_toplevels(state: &mut State, new_size: Size<i32, Logical>) {
+    let output_scale = state
+        .output
+        .as_ref()
+        .map(|o| o.current_scale().fractional_scale())
+        .unwrap_or(1.0);
+    let mode_size = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.size);
+    if state.space.elements().next().is_none() {
+        tracing::info!(
+            ?new_size,
+            output_scale,
+            "No mapped toplevel to configure (nothing will change client-side)",
+        );
+    }
     for window in state.space.elements() {
         let toplevel = window.toplevel().unwrap();
         let max_size = with_states(toplevel.wl_surface(), |states| {
@@ -967,9 +1322,20 @@ pub(crate) fn apply_video_info(
         // set none. Clamp only the dimensions that have a limit, so an unset max_size gets
         // the output size rather than an empty size (a fullscreen configure at 0x0).
         let clamp = |max: i32, output: i32| if max > 0 { max.min(output) } else { output };
-        let new_size = Size::from((clamp(max_size.w, new_size.w), clamp(max_size.h, new_size.h)));
+        let configured_size =
+            Size::from((clamp(max_size.w, new_size.w), clamp(max_size.h, new_size.h)));
+        // The whole design rests on this triple: a nested compositor computes its buffer as
+        // `configured_size x preferred_scale`, so the pair below is exactly what it acts on.
+        tracing::info!(
+            ?configured_size,
+            ?new_size,
+            ?max_size,
+            ?mode_size,
+            output_scale,
+            "Configuring toplevel (logical = mode / output_scale)",
+        );
         toplevel.with_pending_state(|state| {
-            state.size = Some(new_size);
+            state.size = Some(configured_size);
             state.states.set(XdgState::Fullscreen);
             state.states.set(XdgState::Activated);
         });
@@ -1018,6 +1384,107 @@ pub(crate) fn apply_video_info(
     }
 }
 
+/// Apply a requested app-facing render size. A non-positive width or height means
+/// "follow the encode size" (`render_size = None`). The value is sticky: it is re-applied
+/// by [`apply_video_info`] on every caps re-negotiation.
+pub(crate) fn apply_render_size(state: &mut State, size: Size<i32, Physical>) {
+    let requested = if size.w > 0 && size.h > 0 {
+        Some(size)
+    } else {
+        None
+    };
+
+    // The element re-forwards the display geometry after every `Command::VideoInfo` (both
+    // set_caps arms), so an unchanged render size arrives on every caps renegotiation --
+    // including every ABR resolution step. Without this guard each one runs the mode path a
+    // SECOND time: another `change_current_state`, another damage-tracker rebuild (= a
+    // full-damage frame) and another `send_configure` to every toplevel. The mode-matches half
+    // keeps it honest: if the output has drifted from the effective size for any other reason,
+    // the re-apply still happens.
+    let mode_matches = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.size)
+        == Some(effective_render_size(state));
+    if requested == state.render_size && state.output.is_some() && mode_matches {
+        tracing::debug!(?size, "Render size unchanged; nothing to re-apply");
+        return;
+    }
+
+    state.render_size = requested;
+    if state.output.is_none() {
+        // No output yet: `apply_video_info` will pick the stored value up.
+        return;
+    }
+    let refresh = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.refresh)
+        .unwrap_or(60_000);
+    let eff = effective_render_size(state);
+    apply_output_mode(state, eff, refresh);
+}
+
+/// Lower bound for the UI scale hint (1.0 = no scaling).
+pub(crate) const UI_SCALE_MIN: f64 = 1.0;
+/// Upper bound for the UI scale hint.
+pub(crate) const UI_SCALE_MAX: f64 = 3.0;
+
+/// Apply a requested UI scale and announce it to every toplevel (mapped *and* pending)
+/// through `wp_fractional_scale_v1::preferred_scale`, followed by a configure carrying the
+/// *current* size for the mapped ones (kwin only latches a new scale on a non-empty
+/// configure -- `wayland_output.cpp:460-474`).
+///
+/// A finite out-of-range value is clamped to `[1.0, 3.0]`; a non-finite value (NaN, ±inf)
+/// is ignored entirely.
+///
+/// Intentionally does not go through [`apply_output_mode`]: the `wl_output` mode, the
+/// `wl_output` scale, the damage tracker and the pointer location must all stay put -- a
+/// scale change is a pure hint and must not teleport the cursor.
+pub(crate) fn apply_ui_scale(state: &mut State, scale: f64) {
+    // `f64::clamp` propagates NaN rather than clamping it, and a NaN scale would reach
+    // clients as `preferred_scale = 0` (the u32 cast saturates), so reject it up front.
+    // ±inf is rejected on the same path for the same "never store a nonsense scale" reason.
+    if !scale.is_finite() {
+        tracing::warn!(scale, "Ignoring non-finite UI scale");
+        return;
+    }
+    let scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+
+    // The element re-sends the UI scale after every render-size change (its 3-property apply),
+    // so an unchanged value arrives routinely. Under design 2 that is a full mode-path call --
+    // change_current_state + a fresh damage tracker + a configure to every toplevel -- so let
+    // it out early instead of driving a reconfigure storm. Only safe once an Output exists:
+    // before that the stored value still has to be picked up by the first `apply_video_info`.
+    if scale == state.ui_scale && state.output.is_some() {
+        tracing::debug!(scale, "UI scale unchanged; nothing to re-apply");
+        return;
+    }
+    state.ui_scale = scale;
+
+    if state.output.is_none() {
+        // No output yet: `apply_video_info` will pick the stored value up. Announce anyway,
+        // so a toplevel that already exists is not left on a stale scale; surfaces created
+        // later learn it through `FractionalScaleHandler::new_fractional_scale`.
+        announce_ui_scale(state);
+        return;
+    }
+    // The scale changes the output's LOGICAL size, so this goes through the mode path (which
+    // re-announces the fractional-scale hint and re-configures at the new logical size). The
+    // physical mode is unchanged, so the encode side and the composite density stay put.
+    let refresh = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.refresh)
+        .unwrap_or(60_000);
+    let eff = effective_render_size(state);
+    apply_output_mode(state, eff, refresh);
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn init(
     command_src: Channel<Command>,
     render: impl Into<RenderTarget>,
@@ -1079,6 +1546,14 @@ pub(crate) fn init(
             match event {
                 Event::Msg(Command::VideoInfo(video_info)) => {
                     apply_video_info(state, *video_info, &render_target, render_node);
+                }
+                Event::Msg(Command::RenderSize { width, height }) => {
+                    tracing::info!(width, height, "Applying requested render size");
+                    apply_render_size(state, (width, height).into());
+                }
+                Event::Msg(Command::UiScale(scale)) => {
+                    tracing::info!(scale, "Applying requested UI scale");
+                    apply_ui_scale(state, scale);
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
@@ -1476,5 +1951,56 @@ mod frame_timing_tests {
         let interval = refresh_interval(refresh_mhz(Fraction::new(60, 1))).unwrap();
         assert!((interval.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9);
         assert_eq!(refresh_interval(0), None);
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fullscreen_fit;
+    use smithay::utils::{Logical, Point, Size};
+
+    #[track_caller]
+    fn check(configured: (i32, i32), surface: (i32, i32), scale: f64, offset: (f64, f64)) {
+        let c: Size<i32, Logical> = configured.into();
+        let s: Size<i32, Logical> = surface.into();
+        let (got_scale, got_offset) = fullscreen_fit(c, s);
+        assert!(
+            (got_scale - scale).abs() < 1e-9,
+            "{c:?} <- {s:?}: expected scale {scale}, got {got_scale}",
+        );
+        let want = Point::<f64, Logical>::from(offset);
+        assert!(
+            (got_offset.x - want.x).abs() < 1e-9 && (got_offset.y - want.y).abs() < 1e-9,
+            "{c:?} <- {s:?}: expected offset {want:?}, got {got_offset:?}",
+        );
+    }
+
+    #[test]
+    fn fullscreen_fit_table() {
+        // The window fills its configure: the exact identity every unscaled session relies
+        // on -- including gamescope/KWin, whose viewport destination equals the configure.
+        check((1920, 1080), (1920, 1080), 1.0, (0.0, 0.0));
+        // Degenerate sizes are the identity too (nothing sensible to scale).
+        check((1920, 1080), (0, 0), 1.0, (0.0, 0.0));
+        check((0, 0), (960, 540), 1.0, (0.0, 0.0));
+
+        // Same aspect: fills the configure, no bars.
+        check((1920, 1080), (960, 540), 2.0, (0.0, 0.0));
+        check((1920, 1080), (1280, 720), 1.5, (0.0, 0.0));
+
+        // 4:3 into 16:9 -> width-limited by height, PILLARbox (bars left/right).
+        check((1920, 1080), (1440, 1080), 1.0, (240.0, 0.0));
+        check((1920, 1080), (640, 480), 2.25, (240.0, 0.0));
+        // Wider than the configure -> height-limited, LETTERbox (bars top/bottom).
+        check((1920, 1080), (1920, 800), 1.0, (0.0, 140.0));
+
+        // A surface LARGER than its configure is scaled DOWN by the same rule -- the fit is
+        // symmetric, which is what keeps a client that overshoots on screen.
+        check((1280, 720), (1920, 1080), 2.0 / 3.0, (0.0, 0.0));
+
+        // Non-integer scale keeps a fractional offset: the offset is only rounded where it
+        // is converted to physical pixels, so the two consumers (compositing and input)
+        // never disagree by a rounding step.
+        check((1920, 1080), (1000, 540), 1.92, (0.0, 21.6));
     }
 }

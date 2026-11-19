@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::State;
+use super::{State, effective_render_size, fit_offset_physical, window_fullscreen_fit};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
@@ -14,16 +14,18 @@ use smithay::{
         Color32F, ExportMem, ImportAll, ImportMem, Renderer,
         damage::{Error as OutputDamageTrackerError, RenderOutputResult},
         element::{
-            Element, Id, Kind, RenderElement, UnderlyingStorage,
-            memory::MemoryRenderBufferRenderElement, solid::SolidColorRenderElement,
+            AsRenderElements, Element, Id, Kind, RenderElement, UnderlyingStorage,
+            memory::MemoryRenderBufferRenderElement,
+            solid::SolidColorRenderElement,
             surface::WaylandSurfaceRenderElement,
+            utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
         },
         utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
-    desktop::space::{SpaceRenderElements, space_render_elements},
+    desktop::Window,
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     render_elements,
-    utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::compositor::with_states,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +40,8 @@ render_elements! {
     Solid=SolidColorRenderElement
 }
 
-type SpaceElement = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+/// A window's surface elements, through its fullscreen fit (see [`WindowElements`]).
+type SpaceElement = WindowElements;
 
 render_elements! {
     FrameElement<=GlesRenderer>;
@@ -332,6 +335,82 @@ impl<E: RenderElement<GlesRenderer>> RenderElement<GlesRenderer> for Converted<E
     }
 }
 
+/// [`FrameElement`]s live in RENDER space (the output's mode); this maps them into the
+/// encode-sized framebuffer with one rescale/relocate pair, so the cursor stays inside the
+/// scaled scene and what the user points at is what hit-testing (in render space) resolves.
+type ScaledFrameElement = RelocateRenderElement<RescaleRenderElement<FrameElement>>;
+
+render_elements! {
+    /// The final element list handed to the damage tracker: the scaled scene plus the
+    /// encode-space overlays (the HDR spike bars), which must NOT be scaled.
+    OutputElement<=GlesRenderer>;
+    Scene=ScaledFrameElement,
+    Overlay=CursorElement<GlesRenderer>,
+}
+
+/// One mapped window's surface tree (plus its popups), mapped from the size the client
+/// actually committed into the size it was configured at — see
+/// [`super::window_fullscreen_fit`]. The wrappers are an exact identity for every window
+/// that already fills its configure.
+type WindowElements =
+    RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>;
+
+/// One mapped window, resolved for this frame: where its elements are built and how they
+/// are mapped into its configured box. Snapshotted out of the space *before* the renderer
+/// is borrowed mutably to build the elements.
+struct FitWindow {
+    window: Window,
+    /// The window's render location, relative to the output's region (render space).
+    loc: Point<i32, Logical>,
+    /// Aspect-preserving fit scale and centring offset — see [`window_fit_physical`].
+    scale: f64,
+    offset: Point<i32, Physical>,
+}
+
+/// How to map a `render`-sized scene into an `encode`-sized framebuffer: an aspect-preserving
+/// upscale plus the centring offset that turns the leftover into symmetric letterbox/pillarbox
+/// bars (painted by the clear colour).
+///
+/// Returns `(1.0, (0,0))` -- an exact identity -- whenever the two sizes match, which is the
+/// default configuration (no render size requested). `RescaleRenderElement` at scale 1.0 with
+/// origin `(0,0)` and `RelocateRenderElement` at offset `(0,0)` are both pass-throughs on
+/// integer geometry, so the default path composites exactly as it did before.
+fn scene_transform(
+    encode: Size<i32, Physical>,
+    render: Size<i32, Physical>,
+) -> (f64, Point<i32, Physical>) {
+    if render.w <= 0 || render.h <= 0 || render == encode {
+        return (1.0, Point::from((0, 0)));
+    }
+    let scale = f64::min(
+        encode.w as f64 / render.w as f64,
+        encode.h as f64 / render.h as f64,
+    );
+    let offset = Point::from((
+        ((encode.w as f64 - render.w as f64 * scale) / 2.0).round() as i32,
+        ((encode.h as f64 - render.h as f64 * scale) / 2.0).round() as i32,
+    ));
+    (scale, offset)
+}
+
+/// [`super::window_fullscreen_fit`] for one window, with the centring offset converted from
+/// logical into the PHYSICAL pixels the render elements live in.
+///
+/// The problem the fit solves: a fullscreen toplevel that commits a surface SMALLER than its
+/// configured size — a native Wayland game whose in-menu "resolution" setting picked, say,
+/// 1280x720 on a 1920x1080 output — is composited by the space at that size at its map
+/// location, i.e. 1:1 in the top-left corner with black everywhere else. Every other
+/// compositor scales it to fill the output; gwd did not, which is what made an in-app
+/// resolution choice look broken.
+fn window_fit_physical(
+    window: &Window,
+    output_logical: Size<i32, Logical>,
+    output_scale: f64,
+) -> (f64, Point<i32, Physical>) {
+    let (scale, offset) = window_fullscreen_fit(window, output_logical);
+    (scale, fit_offset_physical(offset, output_scale))
+}
+
 /// HDR render-path spike: linear brightness levels (multiples of SDR reference white) for the
 /// synthetic test bars. The >1.0 levels are the highlights the spike is trying to carry through
 /// the fp16 render target. Shared by the bar geometry ([`hdr_spike_bars`]) and the GLES readback
@@ -621,15 +700,33 @@ impl State {
         assert!(self.video_info.is_some());
         assert!(self.output_buffer.is_some());
 
+        // The scene is composited at the output's scale (the UI scale): the output's LOGICAL
+        // size is `mode / ui_scale`, so drawing at that scale puts the scene back at the
+        // physical render size -- which is what the rescale below maps into the encode
+        // framebuffer -- and a scale-aware client's high-density buffer is sampled 1:1 rather
+        // than being squeezed into the logical size first. `space_render_elements` picks this
+        // up from the Output on its own; the cursor is built by hand, so it needs it passed
+        // in. 1.0 unless a UI scale was requested, i.e. the default path is unchanged.
+        let output_scale = self
+            .output
+            .as_ref()
+            .expect("output not set")
+            .current_scale()
+            .fractional_scale();
+
+        // The cursor lives in RENDER space (its location is `pointer_location`, which input
+        // clamps to the output's logical extent), so it is built at the same scale here and
+        // scaled below together with the client surfaces.
         let cursor_drawn =
             Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5);
-        let mut elements = if cursor_drawn {
+        let elements = if cursor_drawn {
             match &self.cursor_state {
                 CursorImageStatus::Named(_cursor_icon) => vec![CursorElement::Memory(
                     // TODO: icon?
                     MemoryRenderBufferRenderElement::from_buffer(
                         &mut self.renderer,
-                        self.pointer_location.to_physical_precise_round(1),
+                        self.pointer_location
+                            .to_physical_precise_round(output_scale),
                         &self.cursor_element,
                         None,
                         None,
@@ -659,8 +756,9 @@ impl State {
                     smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                         &mut self.renderer,
                         wl_surface,
-                        (self.pointer_location - hotspot.to_f64()).to_physical_precise_round(1),
-                        1.,
+                        (self.pointer_location - hotspot.to_f64())
+                            .to_physical_precise_round(output_scale),
+                        output_scale,
                         1.,
                         Kind::Cursor,
                     )
@@ -670,17 +768,6 @@ impl State {
         } else {
             vec![]
         };
-
-        // HDR render-path spike: prepend synthetic >1.0 brightness bars across the top of the
-        // output as the topmost elements (so client surfaces never occlude them). Gated behind
-        // WOLF_HDR_SPIKE -- unset = exactly the elements built above (no bars, no behavior change).
-        if crate::utils::allocator::hdr_spike()
-            && let Some(vi) = self.video_info.as_ref()
-        {
-            let mut bars = hdr_spike_bars(vi.width() as i32, vi.height() as i32);
-            bars.append(&mut elements);
-            elements = bars;
-        }
 
         // Dynamic HDR: the committed output state picks the frame's working space (see
         // `composition`); the converter is told what was actually composited.
@@ -724,17 +811,67 @@ impl State {
             .bind(&mut self.renderer)
             .map_err(OutputDamageTrackerError::Rendering)?;
 
-        // What smithay's `desktop::space::render_output` does (custom elements on top of the
-        // space's), with each space element converted as above.
-        let space_elements = space_render_elements(
-            &mut self.renderer,
-            [&self.space],
-            self.output.as_ref().unwrap(),
-            1.0,
-        )
-        .map_err(OutputDamageTrackerError::OutputNoMode)?;
+        // Client surfaces, in render space. Built per window (rather than via
+        // `desktop::space::space_render_elements` / `render_output`) so each window's
+        // elements can be wrapped in its OWN fit transform before the whole scene is wrapped
+        // in the render->encode one, and so they can be grouped with the cursor.
+        //
+        // The traversal mirrors `Space::render_elements_for_region`, which this replaces:
+        // z-order back-to-front from `space.elements()`, reversed so the topmost window's
+        // elements come first (render-element lists are front-to-back), each window's
+        // location taken relative to the output's region. gwd maps exactly one output at
+        // (0,0) and uses no layer-shell surfaces, so nothing else `space_render_elements`
+        // does applies here.
+        let output = self.output.clone().expect("output not set");
+        let region = self.space.output_geometry(&output);
+        let windows: Vec<FitWindow> = match region {
+            Some(region) => self
+                .space
+                .elements()
+                .rev()
+                .filter_map(|window| {
+                    let bbox = self.space.element_bbox(window)?;
+                    if !region.overlaps(bbox) {
+                        return None;
+                    }
+                    let loc = self.space.element_location(window)?
+                        - smithay::desktop::space::SpaceElement::geometry(window).loc
+                        - region.loc;
+                    let (scale, offset) = window_fit_physical(window, region.size, output_scale);
+                    Some(FitWindow {
+                        window: window.clone(),
+                        loc,
+                        scale,
+                        offset,
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let mut window_elements: Vec<WindowElements> = Vec::new();
+        for fit in windows {
+            let origin: Point<i32, Physical> = fit.loc.to_physical_precise_round(output_scale);
+            let elements = fit
+                .window
+                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                    &mut self.renderer,
+                    origin,
+                    Scale::from(output_scale),
+                    // alpha
+                    1.0,
+                );
+            window_elements.extend(elements.into_iter().map(|e| {
+                RelocateRenderElement::from_element(
+                    RescaleRenderElement::from_element(e, origin, fit.scale),
+                    fit.offset,
+                    Relocate::Relative,
+                )
+            }));
+        }
+
         frame_elements.extend(
-            space_elements
+            window_elements
                 .into_iter()
                 .map(|element| match &composition {
                     None => FrameElement::Space(element),
@@ -745,11 +882,41 @@ impl State {
                     ),
                 }),
         );
+
+        // The framebuffer is always ENCODE-sized; the scene is composited at the RENDER size and
+        // upscaled into it (aspect-preserving, centred). Both are the same size unless a render
+        // size was requested, in which case `scene_transform` is an exact identity.
+        let vi = self.video_info.as_ref().expect("video_info not set");
+        let encode_size: Size<i32, Physical> = (vi.width() as i32, vi.height() as i32).into();
+        let (scale, offset) = scene_transform(encode_size, effective_render_size(self));
+        let mut elements: Vec<OutputElement> = Vec::with_capacity(frame_elements.len());
+        // HDR render-path spike: synthetic >1.0 brightness bars across the top of the output
+        // as the topmost elements (so client surfaces never occlude them). Gated behind
+        // WOLF_HDR_SPIKE -- unset = no bars, no behavior change. They are authored in ENCODE
+        // space, so they are the one thing NOT scaled.
+        if crate::utils::allocator::hdr_spike() {
+            elements.extend(
+                hdr_spike_bars(encode_size.w, encode_size.h)
+                    .into_iter()
+                    .map(OutputElement::Overlay),
+            );
+        }
+        elements.extend(frame_elements.into_iter().map(|e| {
+            OutputElement::Scene(RelocateRenderElement::from_element(
+                RescaleRenderElement::from_element(e, Point::from((0, 0)), scale),
+                offset,
+                Relocate::Relative,
+            ))
+        }));
+
+        // The damage tracker is Static at the encode size (see `apply_output_mode`), which is
+        // what sizes the GL viewport/projection here -- the letterbox bars are this clear
+        // colour showing through where the scaled scene does not reach.
         let render_output_result = self.dtr.as_mut().unwrap().render_output(
             &mut self.renderer,
             &mut target,
             0,
-            &frame_elements,
+            &elements,
             [0.0, 0.0, 0.0, 1.0],
         )?;
 
@@ -789,5 +956,53 @@ impl State {
                 Err(OutputDamageTrackerError::Rendering(GlesError::MappingError))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scene_transform;
+    use smithay::utils::{Physical, Point, Size};
+
+    #[track_caller]
+    fn check(enc: (i32, i32), ren: (i32, i32), scale: f64, offset: (i32, i32)) {
+        let enc: Size<i32, Physical> = enc.into();
+        let ren: Size<i32, Physical> = ren.into();
+        let (got_scale, got_offset) = scene_transform(enc, ren);
+        assert!(
+            (got_scale - scale).abs() < 1e-9,
+            "{enc:?} <- {ren:?}: expected scale {scale}, got {got_scale}",
+        );
+        assert_eq!(
+            got_offset,
+            Point::<i32, Physical>::from(offset),
+            "{enc:?} <- {ren:?}: wrong centring offset",
+        );
+    }
+
+    #[test]
+    fn scene_transform_table() {
+        // Render == encode: the exact identity the default (no render size) path relies on.
+        check((1920, 1080), (1920, 1080), 1.0, (0, 0));
+        // A degenerate render size ("not known yet") is also the identity.
+        check((1920, 1080), (0, 0), 1.0, (0, 0));
+
+        // Matching aspect ratio: fills the framebuffer, no bars.
+        check((1920, 1080), (960, 540), 2.0, (0, 0));
+        check((1920, 1080), (1280, 720), 1.5, (0, 0));
+
+        // Narrower than the encode aspect -> width-limited scale, PILLARbox (bars left/right).
+        check((1920, 1080), (1280, 1080), 1.0, (320, 0));
+        // Wider than the encode aspect -> height-limited scale, LETTERbox (bars top/bottom).
+        check((1920, 1080), (1920, 800), 1.0, (0, 140));
+
+        // Non-integer scale, with a rounded offset: 1920/1000 = 1.92 is width-limited, leaving
+        // 1080 - 540*1.92 = 43.2px of vertical slack -> 21.6 rounds to a 22px top bar (and a
+        // 21px bottom one). Asymmetry of at most 1px is inherent to centring on an integer grid.
+        check((1920, 1080), (1000, 540), 1.92, (0, 22));
+
+        // Odd leftover on the limiting axis: 1920 - 1281 = 639 -> a 320px left bar and a 319px
+        // right one. Pinned deliberately; `round()` on `.5` goes away from zero.
+        check((1920, 1080), (1281, 1080), 1.0, (320, 0));
     }
 }
