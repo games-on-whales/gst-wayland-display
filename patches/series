@@ -10,3 +10,4 @@ gstreamer-va-hevc-color.patch
 gstreamer-va-hevc-hdr-sei.patch
 gstreamer-cuda-frame-color.patch
 vulkan-encode-alloc-before-start.patch
+vulkan-encode-feedback-flags.patch
